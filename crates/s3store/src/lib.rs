@@ -92,7 +92,7 @@ impl fmt::Debug for Store {
 }
 
 /// Failure from the piece store. Display text does not include the secret.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum Error {
     /// Endpoint, bucket, or credentials were rejected before any request.
     #[error("{0}")]
@@ -176,6 +176,9 @@ impl Store {
     }
 
     /// Returns an error when the bucket is missing or the endpoint cannot be reached.
+    ///
+    /// This is not a piece lookup. A 404 here stays [`Error::S3`] even when the
+    /// SDK reports `NotFound` (aws-sdk synthesizes that for an empty 404 body).
     pub async fn head_bucket(&self) -> Result<()> {
         self.client
             .head_bucket()
@@ -183,10 +186,14 @@ impl Store {
             .send()
             .await
             .map(|_| ())
-            .map_err(map_s3)
+            .map_err(|err| Error::S3(err.to_string()))
     }
 
-    /// Starts an upload. Dropping it, or [`Upload::cancel`], deletes any partial object.
+    /// Starts an upload.
+    ///
+    /// The key is replaced only when [`Upload::finish`] commits. [`Upload::cancel`]
+    /// and drop abort an in-progress multipart upload and leave any object already
+    /// stored at this key in place.
     pub fn upload(
         &self,
         satellite_id: &str,
@@ -203,7 +210,7 @@ impl Store {
             upload_id: None,
             parts: Vec::new(),
             next_part: 1,
-            done: false,
+            failed: None,
         })
     }
 
@@ -236,14 +243,10 @@ impl Store {
                 });
             }
             if range.start == range.end {
-                // Still confirm the object exists. S3 has no empty half-open range.
-                self.client
-                    .head_object()
-                    .bucket(&self.bucket)
-                    .key(&key)
-                    .send()
-                    .await
-                    .map_err(map_s3)?;
+                // S3 has no empty byte range. One GetObject byte classifies a
+                // missing key as NoSuchKey, same as a full get. HeadObject does
+                // not: s3s-fs reports a missing key as NoSuchBucket.
+                self.probe_object(&key, range.start).await?;
                 return Ok(Vec::new());
             }
         }
@@ -259,7 +262,37 @@ impl Store {
             .await
             .map_err(|err| Error::S3(err.to_string()))?
             .into_bytes();
-        Ok(bytes.to_vec())
+        // `Bytes` -> `Vec` reuses the allocation when this handle is unique.
+        Ok(Vec::from(bytes))
+    }
+
+    /// One-byte `GetObject` at `at`.
+    ///
+    /// `Ok` means the object exists (`InvalidRange` is an empty object, or `at`
+    /// is past the end). [`Error::NotFound`] is `NoSuchKey` / `NotFound` only.
+    /// `NoSuchBucket` stays [`Error::S3`] so a missing bucket is not a missing piece.
+    async fn probe_object(&self, key: &str, at: u64) -> Result<Option<HashMap<String, String>>> {
+        match self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .range(format!("bytes={at}-{at}"))
+            .send()
+            .await
+        {
+            Ok(out) => {
+                let meta = normalize_metadata(out.metadata());
+                out.body
+                    .collect()
+                    .await
+                    .map_err(|err| Error::S3(err.to_string()))?;
+                Ok(meta)
+            }
+            Err(err) if is_missing_code(err.code()) => Err(Error::NotFound),
+            Err(err) if err.code() == Some("InvalidRange") => Ok(None),
+            Err(err) => Err(map_s3(err)),
+        }
     }
 
     /// User metadata for an existing object, without the `x-amz-meta-` prefix.
@@ -272,15 +305,22 @@ impl Store {
         piece_id: &str,
     ) -> Result<Option<HashMap<String, String>>> {
         let key = object_key(&self.prefix, satellite_id, piece_id)?;
-        let out = self
+        match self
             .client
             .head_object()
             .bucket(&self.bucket)
             .key(&key)
             .send()
             .await
-            .map_err(map_s3)?;
-        Ok(normalize_metadata(out.metadata()))
+        {
+            Ok(out) => Ok(normalize_metadata(out.metadata())),
+            Err(err) if is_missing_code(err.code()) => Err(Error::NotFound),
+            // s3s-fs 0.12 HeadObject returns NoSuchBucket for a missing key.
+            // GetObject returns NoSuchKey. A bucket that is actually missing
+            // stays NoSuchBucket on GetObject, and head_bucket still reports it.
+            Err(err) if err.code() == Some("NoSuchBucket") => self.probe_object(&key, 0).await,
+            Err(err) => Err(map_s3(err)),
+        }
     }
 
     /// Deletes the object. Already-absent keys succeed.
@@ -292,7 +332,9 @@ impl Store {
 
 /// An upload that has not been committed.
 ///
-/// [`Upload::finish`] writes the object. [`Upload::cancel`] and drop abort it.
+/// [`Upload::finish`] writes the object. [`Upload::cancel`] and drop abort an
+/// in-progress multipart upload. They do not delete an object already stored
+/// at this key.
 #[must_use = "call finish or cancel"]
 pub struct Upload {
     client: aws_sdk_s3::Client,
@@ -303,13 +345,17 @@ pub struct Upload {
     upload_id: Option<String>,
     parts: Vec<CompletedPart>,
     next_part: i32,
-    done: bool,
+    // A failed part must not be completed later as a short or empty object.
+    failed: Option<Error>,
 }
 
 impl Upload {
     /// Appends bytes. A full part is uploaded only once the body grows past it,
     /// so a body of exactly [`PART_SIZE`] stays a single `PutObject`.
     pub async fn write(&mut self, mut data: &[u8]) -> Result<()> {
+        if let Some(err) = &self.failed {
+            return Err(err.clone());
+        }
         while !data.is_empty() {
             if self.buf.len() == PART_SIZE {
                 self.upload_full_part().await?;
@@ -328,20 +374,24 @@ impl Upload {
         if result.is_ok() {
             // Complete already published the object. Do not abort it on drop.
             self.upload_id = None;
-            self.done = true;
         }
         result
     }
 
-    /// Aborts the upload and deletes the object.
+    /// Aborts an in-progress multipart upload.
+    ///
+    /// An object already stored at this key stays. This upload has not committed,
+    /// so cancel does not delete the key.
     pub async fn cancel(mut self) -> Result<()> {
-        self.abort_and_delete().await?;
+        self.abort_multipart().await?;
         self.upload_id = None;
-        self.done = true;
         Ok(())
     }
 
     async fn finish_inner(&mut self) -> Result<()> {
+        if let Some(err) = &self.failed {
+            return Err(err.clone());
+        }
         if self.upload_id.is_none() {
             self.put_single().await?;
             return Ok(());
@@ -369,6 +419,7 @@ impl Upload {
     }
 
     async fn put_single(&mut self) -> Result<()> {
+        let pairs = metadata_pairs(self.metadata.as_ref())?;
         let body = ByteStream::from(std::mem::take(&mut self.buf));
         let mut req = self
             .client
@@ -376,21 +427,32 @@ impl Upload {
             .bucket(&self.bucket)
             .key(&self.key)
             .body(body);
-        req = apply_metadata(req, self.metadata.as_ref())?;
+        for (key, value) in pairs {
+            req = req.metadata(key, value);
+        }
         req.send().await.map_err(map_s3)?;
         Ok(())
     }
 
     async fn upload_full_part(&mut self) -> Result<()> {
-        self.ensure_multipart().await?;
+        if let Some(err) = &self.failed {
+            return Err(err.clone());
+        }
+        if let Err(err) = self.ensure_multipart().await {
+            self.failed = Some(err.clone());
+            return Err(err);
+        }
         let part_number = self.next_part;
-        self.next_part += 1;
-        let body = ByteStream::from(std::mem::take(&mut self.buf));
-        let upload_id = self
-            .upload_id
-            .clone()
-            .ok_or(Error::S3("multipart upload id missing".into()))?;
-        let out = self
+        let body = ByteStream::from(self.buf.clone());
+        let upload_id = match self.upload_id.clone() {
+            Some(upload_id) => upload_id,
+            None => {
+                let err = Error::S3("multipart upload id missing".into());
+                self.failed = Some(err.clone());
+                return Err(err);
+            }
+        };
+        let out = match self
             .client
             .upload_part()
             .bucket(&self.bucket)
@@ -400,12 +462,28 @@ impl Upload {
             .body(body)
             .send()
             .await
-            .map_err(map_s3)?;
-        let mut part = CompletedPart::builder().part_number(part_number);
-        if let Some(etag) = out.e_tag() {
-            part = part.e_tag(etag);
-        }
-        self.parts.push(part.build());
+        {
+            Ok(out) => out,
+            Err(err) => {
+                let err = map_s3(err);
+                self.failed = Some(err.clone());
+                return Err(err);
+            }
+        };
+        // CompleteMultipartUpload on AWS rejects a part that has no ETag.
+        let Some(etag) = out.e_tag() else {
+            let err = Error::S3("upload part response is missing an etag".into());
+            self.failed = Some(err.clone());
+            return Err(err);
+        };
+        self.parts.push(
+            CompletedPart::builder()
+                .part_number(part_number)
+                .e_tag(etag)
+                .build(),
+        );
+        self.next_part += 1;
+        self.buf.clear();
         Ok(())
     }
 
@@ -413,12 +491,15 @@ impl Upload {
         if self.upload_id.is_some() {
             return Ok(());
         }
+        let pairs = metadata_pairs(self.metadata.as_ref())?;
         let mut req = self
             .client
             .create_multipart_upload()
             .bucket(&self.bucket)
             .key(&self.key);
-        req = apply_metadata(req, self.metadata.as_ref())?;
+        for (key, value) in pairs {
+            req = req.metadata(key, value);
+        }
         let out = req.send().await.map_err(map_s3)?;
         self.upload_id = Some(
             out.upload_id
@@ -427,33 +508,30 @@ impl Upload {
         Ok(())
     }
 
-    async fn abort_and_delete(&mut self) -> Result<()> {
-        if let Some(upload_id) = self.upload_id.clone() {
-            match self
-                .client
-                .abort_multipart_upload()
-                .bucket(&self.bucket)
-                .key(&self.key)
-                .upload_id(upload_id)
-                .send()
-                .await
-            {
-                Ok(_) => {}
-                Err(err) if is_missing_code(err.code()) || err.code() == Some("NoSuchUpload") => {}
-                Err(err) => return Err(Error::S3(err.to_string())),
-            }
+    async fn abort_multipart(&mut self) -> Result<()> {
+        let Some(upload_id) = self.upload_id.clone() else {
+            return Ok(());
+        };
+        match self
+            .client
+            .abort_multipart_upload()
+            .bucket(&self.bucket)
+            .key(&self.key)
+            .upload_id(upload_id)
+            .send()
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(err) if is_missing_code(err.code()) || err.code() == Some("NoSuchUpload") => Ok(()),
+            Err(err) => Err(Error::S3(err.to_string())),
         }
-        delete_object(&self.client, &self.bucket, &self.key).await
     }
 }
 
 impl Drop for Upload {
     fn drop(&mut self) {
-        if self.done {
-            return;
-        }
-        // No async Drop. Parts are invisible until complete, but they stay
-        // allocated until abort. Best-effort when a runtime is still running.
+        // Only abort this upload id. DeleteObject from Drop can run after a
+        // later put of the same key and remove that committed object.
         let Some(upload_id) = self.upload_id.clone() else {
             return;
         };
@@ -469,46 +547,24 @@ impl Drop for Upload {
                     .upload_id(upload_id)
                     .send()
                     .await;
-                let _ = client.delete_object().bucket(bucket).key(key).send().await;
             });
         }
     }
 }
 
-fn apply_metadata<B>(mut req: B, metadata: Option<&HashMap<String, String>>) -> Result<B>
-where
-    B: MetadataBuilder,
-{
+fn metadata_pairs(metadata: Option<&HashMap<String, String>>) -> Result<Vec<(String, String)>> {
     let Some(metadata) = metadata else {
-        return Ok(req);
+        return Ok(Vec::new());
     };
+    let mut pairs = Vec::with_capacity(metadata.len());
     for (key, value) in metadata {
         let key = normalize_meta_key(key);
         if key.is_empty() {
             return Err(Error::InvalidKey("metadata key is empty".into()));
         }
-        req = req.with_metadata(key, value.clone());
+        pairs.push((key, value.clone()));
     }
-    Ok(req)
-}
-
-/// Fluent builders that accept one user-metadata pair. Avoids naming both SDK builder types.
-trait MetadataBuilder {
-    fn with_metadata(self, key: String, value: String) -> Self;
-}
-
-impl MetadataBuilder for aws_sdk_s3::operation::put_object::builders::PutObjectFluentBuilder {
-    fn with_metadata(self, key: String, value: String) -> Self {
-        self.metadata(key, value)
-    }
-}
-
-impl MetadataBuilder
-    for aws_sdk_s3::operation::create_multipart_upload::builders::CreateMultipartUploadFluentBuilder
-{
-    fn with_metadata(self, key: String, value: String) -> Self {
-        self.metadata(key, value)
-    }
+    Ok(pairs)
 }
 
 fn normalize_metadata(meta: Option<&HashMap<String, String>>) -> Option<HashMap<String, String>> {

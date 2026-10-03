@@ -13,11 +13,9 @@ thiserror.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
-hyper = { version = "1", features = ["server", "http1"] }
-hyper-util = { version = "0.1", features = ["server-auto", "http1", "http2", "tokio"] }
+hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
 s3s = "0.12"
 s3s-fs = "0.12"
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] }
 
 [lints]
 workspace = true

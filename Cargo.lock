@@ -1811,7 +1811,6 @@ name = "s3store"
 version = "0.1.0"
 dependencies = [
  "aws-sdk-s3",
- "hyper 1.11.1",
  "hyper-util",
  "s3s",
  "s3s-fs",
