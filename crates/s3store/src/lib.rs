@@ -466,6 +466,19 @@ impl Store {
         self.index.exists_live(satellite_id, piece_id)
     }
 
+    /// Live piece ids for one satellite created strictly before `before`.
+    ///
+    /// Does not read the bucket. `writing` and `trash` are not included, and a
+    /// row created at `before` stays out of the list.
+    pub fn live_created_before(
+        &self,
+        satellite_id: &str,
+        before: SystemTime,
+    ) -> Result<Vec<String>> {
+        check_id("satellite id", satellite_id)?;
+        self.index.live_before(satellite_id, before)
+    }
+
     /// The index row, including `writing` and `trash`. `Ok(None)` when absent.
     pub fn info(&self, satellite_id: &str, piece_id: &str) -> Result<Option<PieceInfo>> {
         check_piece(satellite_id, piece_id)?;

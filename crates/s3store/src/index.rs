@@ -352,6 +352,31 @@ impl Index {
         })
     }
 
+    /// Live piece ids for one satellite created strictly before `before`.
+    ///
+    /// `writing` and `trash` are omitted. A row whose `created_at` equals the
+    /// cutoff stays: the filter was built at that instant and does not list it.
+    pub(crate) fn live_before(
+        &self,
+        satellite_id: &str,
+        before: SystemTime,
+    ) -> Result<Vec<String>> {
+        let before = system_to_millis(before)?;
+        self.with(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT piece_id FROM pieces
+                 WHERE satellite = ?1 AND state = 'live' AND created_at < ?2",
+            )?;
+            let rows =
+                stmt.query_map(params![satellite_id, before], |row| row.get::<_, String>(0))?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+    }
+
     /// Marks a live row trash. Already-trash is false and does not move `trashed_at`.
     pub(crate) fn trash(&self, satellite_id: &str, piece_id: &str, at: SystemTime) -> Result<bool> {
         let at = system_to_millis(at)?;
@@ -618,6 +643,19 @@ mod tests {
         assert!(!index.exists_live("sat", "piece").unwrap());
         index.mark_live("sat", "piece").unwrap();
         assert!(index.exists_live("sat", "piece").unwrap());
+        assert!(index.live_before("sat", created).unwrap().is_empty());
+        assert_eq!(
+            index
+                .live_before("sat", created + Duration::from_secs(1))
+                .unwrap(),
+            vec!["piece".to_owned()]
+        );
+        assert!(
+            index
+                .live_before("other", created + Duration::from_secs(1))
+                .unwrap()
+                .is_empty()
+        );
         let got = index.get("sat", "piece").unwrap().unwrap();
         assert_eq!(got.state, PieceState::Live);
         assert_eq!(got.created, created);

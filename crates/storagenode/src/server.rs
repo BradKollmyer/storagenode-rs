@@ -17,7 +17,8 @@ use s3store::{HashAlgorithm, PieceBody, PieceMeta, PieceState, Store, Upload};
 use storj_proto::orders::{Order, OrderLimit, PieceAction, PieceHash};
 use storj_proto::piecestore::{
     ExistsRequest, ExistsResponse, PieceDownloadRequest, PieceDownloadResponse, PieceUploadRequest,
-    PieceUploadResponse, StorageMethod, piece_download_response, piece_upload_request,
+    PieceUploadResponse, RetainRequest, RetainResponse, StorageMethod, piece_download_response,
+    piece_upload_request,
 };
 use storj_proto::rpc::{PIECESTORE_DOWNLOAD, PIECESTORE_UPLOAD};
 use storj_rpc::frame::{Kind, Packet};
@@ -33,6 +34,12 @@ use tokio::net::{TcpListener, TcpStream};
 ///
 /// `storj-proto` exports upload and download only.
 pub const PIECESTORE_EXISTS: &str = "/piecestore.Piecestore/Exists";
+
+/// DRPC path for `piecestore.Piecestore/Retain`.
+pub const PIECESTORE_RETAIN: &str = "/piecestore.Piecestore/Retain";
+
+/// DRPC path for `piecestore.Piecestore/RetainBig`.
+pub const PIECESTORE_RETAIN_BIG: &str = "/piecestore.Piecestore/RetainBig";
 
 /// Order creation further than this from now is rejected (`OrderLimitGracePeriod`).
 /// Piece expiration and order expiration compare the timestamp to now.
@@ -178,6 +185,8 @@ impl Node {
             PIECESTORE_UPLOAD => self.upload(out).await,
             PIECESTORE_DOWNLOAD => self.download(out).await,
             PIECESTORE_EXISTS => self.exists(out, peer).await,
+            PIECESTORE_RETAIN => self.retain(out, peer).await,
+            PIECESTORE_RETAIN_BIG => self.retain_big(out, peer).await,
             _ => Err(Fail::proto(RPC_UNIMPLEMENTED, "unknown rpc")),
         }
     }
@@ -565,6 +574,103 @@ impl Node {
         Ok(())
     }
 
+    async fn retain<T>(&self, out: &mut Out<T>, peer: Option<NodeId>) -> Result<(), Fail>
+    where
+        T: AsyncRead + AsyncWrite + Unpin,
+    {
+        let peer = self.trusted_satellite(peer)?;
+        let Some(bytes) = out.recv().await? else {
+            return Err(Fail::proto(RPC_INVALID_ARGUMENT, "missing retain request"));
+        };
+        let req = RetainRequest::decode(bytes.as_slice())
+            .map_err(|err| Fail::proto(RPC_INVALID_ARGUMENT, err.to_string()))?;
+        self.apply_retain(peer, &req).await?;
+        reply_retain(out).await
+    }
+
+    async fn retain_big<T>(&self, out: &mut Out<T>, peer: Option<NodeId>) -> Result<(), Fail>
+    where
+        T: AsyncRead + AsyncWrite + Unpin,
+    {
+        let peer = self.trusted_satellite(peer)?;
+        // Same assembly as `RetainRequestFromStream`: chunks concatenate, and
+        // the message that carries the hash ends the stream.
+        let mut creation_date = None;
+        let mut filter = Vec::new();
+        loop {
+            let Some(bytes) = out.recv().await? else {
+                return Err(Fail::proto(
+                    RPC_INVALID_ARGUMENT,
+                    "retain closed before the hash",
+                ));
+            };
+            let req = RetainRequest::decode(bytes.as_slice())
+                .map_err(|err| Fail::proto(RPC_INVALID_ARGUMENT, err.to_string()))?;
+            if creation_date.is_none() {
+                creation_date = req.creation_date;
+            }
+            filter.extend_from_slice(&req.filter);
+            if req.hash.is_empty() {
+                continue;
+            }
+            let req = RetainRequest {
+                creation_date,
+                filter,
+                hash_algorithm: req.hash_algorithm,
+                hash: req.hash,
+            };
+            self.apply_retain(peer, &req).await?;
+            return reply_retain(out).await;
+        }
+    }
+
+    /// Trashes this satellite's live rows created before `creation_date` when
+    /// the filter does not contain them. The object stays; the 7-day chore
+    /// deletes trash.
+    async fn apply_retain(&self, peer: NodeId, req: &RetainRequest) -> Result<(), Fail> {
+        check_retain_hash(req.hash_algorithm, &req.filter, &req.hash)?;
+        let created_before = req
+            .creation_date
+            .as_ref()
+            .and_then(timestamp_to_system)
+            .ok_or_else(|| Fail::proto(RPC_INVALID_ARGUMENT, "missing creation date"))?;
+        let filter = crate::bloom::Filter::from_bytes(&req.filter)
+            .map_err(|err| Fail::proto(RPC_INVALID_ARGUMENT, err.to_string()))?;
+        let sat = peer.to_string();
+        let pieces = self
+            .store
+            .live_created_before(&sat, created_before)
+            .map_err(store_err)?;
+        let now = SystemTime::now();
+        for piece_id in pieces {
+            let raw = decode_piece_id(&piece_id)?;
+            if filter.contains(&raw) {
+                continue;
+            }
+            match self.store.trash(&sat, &piece_id, now).await {
+                Ok(()) => {}
+                // Gone, or no longer live, between the list and the flag.
+                Err(s3store::Error::NotFound) => {}
+                Err(err) => return Err(store_err(err)),
+            }
+        }
+        Ok(())
+    }
+
+    fn trusted_satellite(&self, peer: Option<NodeId>) -> Result<NodeId, Fail> {
+        // Same check as Exists: the TLS client is the satellite, not a field.
+        let Some(peer) = peer else {
+            return Err(Fail::proto(RPC_UNAUTHENTICATED, "missing peer identity"));
+        };
+        if !self.satellites.contains_key(&peer) {
+            return Err(Fail::proto(
+                RPC_PERMISSION_DENIED,
+                "retain called with untrusted id",
+            ));
+        }
+        Ok(peer)
+    }
+
     fn check_limit(&self, limit: &OrderLimit, upload: bool) -> Result<(), Fail> {
         let allowed = if upload {
             limit.action == PieceAction::Put as i32 || limit.action == PieceAction::PutRepair as i32
@@ -923,6 +1029,51 @@ fn encode_hex(bytes: &[u8]) -> String {
     out
 }
 
+fn decode_piece_id(hex_id: &str) -> Result<[u8; 32], Fail> {
+    if hex_id.len() != 64 {
+        return Err(Fail::proto(RPC_INTERNAL, "piece id is not 32 bytes"));
+    }
+    let bytes = hex_id.as_bytes();
+    let mut out = [0u8; 32];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let hi = hex_nibble(bytes[i * 2])?;
+        let lo = hex_nibble(bytes[i * 2 + 1])?;
+        *slot = (hi << 4) | lo;
+    }
+    Ok(out)
+}
+
+fn hex_nibble(byte: u8) -> Result<u8, Fail> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(Fail::proto(RPC_INTERNAL, "piece id is not hex")),
+    }
+}
+
+/// Empty hash is the legacy unary retain. A present hash is the filter bytes.
+fn check_retain_hash(algo: i32, filter: &[u8], hash: &[u8]) -> Result<(), Fail> {
+    if hash.is_empty() {
+        return Ok(());
+    }
+    let mut hasher = PieceHashAlgo::from_i32(algo).hasher();
+    hasher.update(filter);
+    if hasher.finalize().as_slice() != hash {
+        return Err(Fail::proto(RPC_INTERNAL, "hash mismatch"));
+    }
+    Ok(())
+}
+
+async fn reply_retain<T>(out: &mut Out<T>) -> Result<(), Fail>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    out.message(&RetainResponse {}.encode_to_vec()).await?;
+    out.close().await?;
+    Ok(())
+}
+
 fn timestamp_to_system(ts: &prost_types::Timestamp) -> Option<SystemTime> {
     if !(0..1_000_000_000).contains(&ts.nanos) {
         return None;
@@ -985,8 +1136,8 @@ fn serial_deadline(limit: &OrderLimit, now: SystemTime) -> SystemTime {
 #[cfg(test)]
 mod tests {
     use super::{
-        GO_ZERO_TIME_UNIX, Node, PIECESTORE_EXISTS, TrustedSatellite, creation_ok, encode_hex,
-        expired, system_to_timestamp,
+        GO_ZERO_TIME_UNIX, Node, PIECESTORE_EXISTS, PIECESTORE_RETAIN, PIECESTORE_RETAIN_BIG,
+        TrustedSatellite, creation_ok, encode_hex, expired, system_to_timestamp,
     };
     use std::net::SocketAddr;
     use std::path::{Path, PathBuf};
@@ -1005,7 +1156,7 @@ mod tests {
     use storj_proto::orders::{Order, OrderLimit, PieceAction};
     use storj_proto::piecestore::{
         ExistsRequest, ExistsResponse, PieceDownloadRequest, PieceDownloadResponse,
-        PieceUploadRequest, StorageMethod, piece_download_request,
+        PieceUploadRequest, RetainRequest, RetainResponse, StorageMethod, piece_download_request,
     };
     use storj_proto::rpc::{PIECESTORE_DOWNLOAD, PIECESTORE_UPLOAD};
     use storj_rpc::{Conn, Identity, client_config, write_tls_mux_prefix};
@@ -1016,6 +1167,7 @@ mod tests {
     use tokio::net::{TcpListener, TcpStream};
 
     use crate::Config;
+    use crate::bloom::Filter;
 
     static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
     static SERIAL: AtomicU64 = AtomicU64::new(1);
@@ -1815,6 +1967,240 @@ mod tests {
             }],
             listen: "127.0.0.1:0".parse().unwrap(),
         }
+    }
+
+    #[tokio::test]
+    async fn retain_trashes_pieces_the_filter_rejects() {
+        let satellite = Identity::generate().unwrap();
+        let other = Identity::generate().unwrap();
+        let uplink = Identity::generate().unwrap();
+        let harness = Harness::start(std::slice::from_ref(&satellite)).await;
+        let sat = satellite.node_id().to_string();
+        let other_id = other.node_id().to_string();
+        let cutoff = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let old = cutoff - Duration::from_secs(60);
+        // seed 0, one hash, 8-byte table: 0x01 is in the set and 0x02 is not.
+        let keep_id = [0x01; 32];
+        let drop_id = [0x02; 32];
+        let fresh_id = [0x33; 32];
+        let other_piece = [0x44; 32];
+        let boundary_id = [0x55; 32];
+        let already_id = [0x66; 32];
+        let later_id = [0x77; 32];
+        let mut filter = Filter::new(0, 1, 8).unwrap();
+        filter.add(&keep_id);
+        assert!(filter.contains(&keep_id));
+        assert!(!filter.contains(&drop_id));
+
+        put_piece_at(&harness.node.store, &sat, &keep_id, old, b"keep").await;
+        put_piece_at(&harness.node.store, &sat, &drop_id, old, b"drop-me").await;
+        put_piece_at(&harness.node.store, &sat, &fresh_id, cutoff, b"fresh").await;
+        put_piece_at(&harness.node.store, &sat, &boundary_id, cutoff, b"edge").await;
+        put_piece_at(&harness.node.store, &other_id, &other_piece, old, b"other").await;
+        put_piece_at(&harness.node.store, &sat, &already_id, old, b"gone").await;
+        let trashed_at = old + Duration::from_secs(5);
+        harness
+            .node
+            .store
+            .trash(&sat, &encode_hex(&already_id), trashed_at)
+            .await
+            .unwrap();
+
+        let mut stranger = harness.conn(&uplink).await;
+        let denied = stranger
+            .invoke(
+                PIECESTORE_RETAIN,
+                &retain_message(&filter, cutoff, PieceHashAlgo::Sha256, true).encode_to_vec(),
+            )
+            .await
+            .expect_err("uplink is not a satellite");
+        assert!(denied.to_string().contains("untrusted"), "{denied}");
+        assert_eq!(piece_state(&harness, &sat, &drop_id), PieceState::Live);
+
+        let mut bad = retain_message(&filter, cutoff, PieceHashAlgo::Sha256, true);
+        bad.filter[0] = 9;
+        let mut hasher = PieceHashAlgo::Sha256.hasher();
+        hasher.update(&bad.filter);
+        bad.hash = hasher.finalize();
+        let err = invoke_retain(&harness, &satellite, &bad)
+            .await
+            .expect_err("bad version");
+        assert!(err.to_string().contains("unsupported version"), "{err}");
+
+        let mut mismatch = retain_message(&filter, cutoff, PieceHashAlgo::Sha256, true);
+        mismatch.hash = vec![0; 32];
+        let err = invoke_retain(&harness, &satellite, &mismatch)
+            .await
+            .expect_err("hash");
+        assert!(err.to_string().contains("hash mismatch"), "{err}");
+        assert_eq!(piece_state(&harness, &sat, &drop_id), PieceState::Live);
+
+        let ok = retain_message(&filter, cutoff, PieceHashAlgo::Sha256, true);
+        let response = RetainResponse::decode(
+            invoke_retain(&harness, &satellite, &ok)
+                .await
+                .expect("retain")
+                .as_slice(),
+        )
+        .unwrap();
+        assert_eq!(response, RetainResponse {});
+        assert_eq!(piece_state(&harness, &sat, &keep_id), PieceState::Live);
+        assert_eq!(piece_state(&harness, &sat, &drop_id), PieceState::Trash);
+        assert_eq!(piece_state(&harness, &sat, &fresh_id), PieceState::Live);
+        assert_eq!(piece_state(&harness, &sat, &boundary_id), PieceState::Live);
+        assert_eq!(
+            piece_state(&harness, &other_id, &other_piece),
+            PieceState::Live
+        );
+        let already = harness
+            .node
+            .store
+            .info(&sat, &encode_hex(&already_id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(already.state, PieceState::Trash);
+        assert_eq!(already.trashed_at, Some(trashed_at));
+        let downloaded = harness
+            .node
+            .store
+            .download(&sat, &encode_hex(&drop_id), None)
+            .await
+            .unwrap();
+        assert_eq!(downloaded.bytes, b"drop-me");
+        assert!(downloaded.restored_from_trash);
+        assert!(
+            !harness
+                .node
+                .store
+                .exists(&sat, &encode_hex(&drop_id))
+                .unwrap()
+        );
+
+        put_piece_at(&harness.node.store, &sat, &later_id, old, b"later").await;
+        let err = retain_big(&harness, &satellite, &filter, cutoff, true)
+            .await
+            .expect_err("bad retain big hash");
+        assert!(err.to_string().contains("hash mismatch"), "{err}");
+        assert_eq!(piece_state(&harness, &sat, &later_id), PieceState::Live);
+
+        let response = RetainResponse::decode(
+            retain_big(&harness, &satellite, &filter, cutoff, false)
+                .await
+                .expect("retain big")
+                .as_slice(),
+        )
+        .unwrap();
+        assert_eq!(response, RetainResponse {});
+        assert_eq!(piece_state(&harness, &sat, &later_id), PieceState::Trash);
+        assert_eq!(piece_state(&harness, &sat, &keep_id), PieceState::Live);
+        let later = harness
+            .node
+            .store
+            .download(&sat, &encode_hex(&later_id), None)
+            .await
+            .unwrap();
+        assert_eq!(later.bytes, b"later");
+        assert!(later.restored_from_trash);
+    }
+
+    async fn put_piece_at(
+        store: &Store,
+        satellite: &str,
+        piece_id: &[u8; 32],
+        created: SystemTime,
+        body: &[u8],
+    ) {
+        let meta = s3store::PieceMeta {
+            hash: [0xab; 32],
+            algorithm: HashAlgorithm::Sha256,
+            created,
+            expires: None,
+            order_limit: b"limit".to_vec(),
+            hash_signature: b"sig".to_vec(),
+            hash_timestamp: None,
+        };
+        store
+            .put_piece(satellite, &encode_hex(piece_id), body, meta)
+            .await
+            .expect("put");
+    }
+
+    fn piece_state(harness: &Harness, satellite: &str, piece_id: &[u8; 32]) -> PieceState {
+        harness
+            .node
+            .store
+            .info(satellite, &encode_hex(piece_id))
+            .unwrap()
+            .expect("row")
+            .state
+    }
+
+    async fn invoke_retain(
+        harness: &Harness,
+        peer: &Identity,
+        request: &RetainRequest,
+    ) -> Result<Vec<u8>, storj_rpc::Error> {
+        // One RPC per connection. A failed retain closes the TLS session.
+        let mut conn = harness.conn(peer).await;
+        conn.invoke(PIECESTORE_RETAIN, &request.encode_to_vec())
+            .await
+    }
+
+    fn retain_message(
+        filter: &Filter,
+        created_before: SystemTime,
+        algo: PieceHashAlgo,
+        with_hash: bool,
+    ) -> RetainRequest {
+        let bytes = filter.to_bytes();
+        let hash = if with_hash {
+            let mut hasher = algo.hasher();
+            hasher.update(&bytes);
+            hasher.finalize()
+        } else {
+            Vec::new()
+        };
+        RetainRequest {
+            creation_date: Some(system_to_timestamp(created_before)),
+            filter: bytes,
+            hash_algorithm: algo.to_i32(),
+            hash,
+        }
+    }
+
+    async fn retain_big(
+        harness: &Harness,
+        peer: &Identity,
+        filter: &Filter,
+        created_before: SystemTime,
+        bad_hash: bool,
+    ) -> Result<Vec<u8>, storj_rpc::Error> {
+        let bytes = filter.to_bytes();
+        let mid = bytes.len() / 2;
+        let mut hasher = PieceHashAlgo::Blake3.hasher();
+        hasher.update(&bytes);
+        let mut hash = hasher.finalize();
+        if bad_hash {
+            hash[0] ^= 0xff;
+        }
+        let mut conn = harness.conn(peer).await;
+        let mut stream = conn.open_stream(PIECESTORE_RETAIN_BIG).await?;
+        let first = RetainRequest {
+            creation_date: Some(system_to_timestamp(created_before)),
+            filter: bytes[..mid].to_vec(),
+            hash_algorithm: 0,
+            hash: Vec::new(),
+        };
+        conn.send_msg(&mut stream, &first.encode_to_vec()).await?;
+        let second = RetainRequest {
+            creation_date: None,
+            filter: bytes[mid..].to_vec(),
+            hash_algorithm: PieceHashAlgo::Blake3.to_i32(),
+            hash,
+        };
+        conn.send_msg(&mut stream, &second.encode_to_vec()).await?;
+        conn.close_send(&mut stream).await?;
+        conn.recv_msg(&stream).await
     }
 
     async fn first_download(

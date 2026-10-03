@@ -1,17 +1,20 @@
 //! Storage node process: identity on the volume, DRPC over TLS, pieces in S3.
 //!
-//! This crate serves `Upload`, `Download`, and `Exists`. Noise, QUIC, retain,
-//! settlement, and check-in are not in this binary yet.
+//! This crate serves `Upload`, `Download`, `Exists`, `Retain`, and `RetainBig`.
+//! Noise, QUIC, settlement, and check-in are not in this binary yet.
 
 #![deny(clippy::undocumented_unsafe_blocks)]
 
+mod bloom;
 mod config;
 mod identity;
 mod server;
 
 pub use config::Config;
 pub use identity::{IDENTITY_PEM, load_or_create};
-pub use server::{Node, PIECESTORE_EXISTS, TrustedSatellite};
+pub use server::{
+    Node, PIECESTORE_EXISTS, PIECESTORE_RETAIN, PIECESTORE_RETAIN_BIG, TrustedSatellite,
+};
 
 use std::path::Path;
 use std::sync::Arc;
