@@ -13,7 +13,7 @@ RUN --mount=type=cache,target=/root/.npm npm ci
 COPY storj/web/storagenode/ ./
 RUN --mount=type=cache,target=/root/.npm npm run build
 
-FROM rust:1.88-bookworm AS rust
+FROM rust:1.91.1-bookworm AS rust
 
 WORKDIR /src
 COPY storj-uplink /src/storj-uplink

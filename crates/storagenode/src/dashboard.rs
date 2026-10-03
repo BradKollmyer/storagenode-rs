@@ -30,9 +30,8 @@ const ZERO_TIME: &str = "0001-01-01T00:00:00Z";
 /// Built Vue files. The image copies `dist/` here. A missing directory is a 404.
 pub(crate) const UI_DIR: &str = "/usr/share/storagenode/ui";
 
-const NOTIFICATIONS_LIST: &str = concat!(
-    r#"{ "page": { "notifications": [], "pageCount": 0 }, "unreadCount": 0, "totalCount": 0 }"#,
-);
+const NOTIFICATIONS_LIST: &str =
+    r#"{ "page": { "notifications": [], "pageCount": 0 }, "unreadCount": 0, "totalCount": 0 }"#;
 
 /// JSON and static files for one running node.
 pub(crate) struct Dashboard {

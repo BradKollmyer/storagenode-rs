@@ -15,7 +15,7 @@ Read [PLAN.md](PLAN.md) for what the node does. This file is how, and the traps.
 
 Parent `/Volumes/SSD/repos/storj` is not a git repo. `storj-uplink` is `github.com/BradKollmyer/storj-uplink` (DCO, GitHub PRs). `storj` and `uplink` review on Gerrit.
 
-`storj-uplink` style: edition 2024, `rust-version` 1.88, `MIT OR Apache-2.0`, workspace `crates/*` excluding fuzz. Copy `.cargo/config.toml` (aarch64 `aes_armv8` / `polyval_armv8`) if this workspace pulls `aes-gcm`. Docker Rust stage `rust:1.88-bookworm`.
+`storj-uplink` style: edition 2024, `MIT OR Apache-2.0`, workspace `crates/*` excluding fuzz. `rust-version` is 1.91.1. Copy `.cargo/config.toml` (aarch64 `aes_armv8` / `polyval_armv8`) if this workspace pulls `aes-gcm`. Docker Rust stage `rust:1.91.1-bookworm`.
 
 Path deps from `crates/storagenode/Cargo.toml` (`crates/s3store` does not need them):
 

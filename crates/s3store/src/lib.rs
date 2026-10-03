@@ -710,10 +710,10 @@ impl Store {
         }
         let mut failed: Option<Error> = None;
         for piece_id in self.index.piece_ids(satellite_id)? {
-            if let Err(err) = self.delete(satellite_id, &piece_id).await {
-                if failed.is_none() {
-                    failed = Some(err);
-                }
+            if let Err(err) = self.delete(satellite_id, &piece_id).await
+                && failed.is_none()
+            {
+                failed = Some(err);
             }
         }
         let prefix = satellite_list_prefix(&self.prefix, satellite_id)?;
@@ -738,10 +738,10 @@ impl Store {
                 if sat != satellite_id {
                     continue;
                 }
-                if let Err(err) = self.delete(satellite_id, &piece_id).await {
-                    if failed.is_none() {
-                        failed = Some(err);
-                    }
+                if let Err(err) = self.delete(satellite_id, &piece_id).await
+                    && failed.is_none()
+                {
+                    failed = Some(err);
                 }
             }
             if !page.truncated {
