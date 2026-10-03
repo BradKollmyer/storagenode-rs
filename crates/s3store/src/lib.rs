@@ -673,20 +673,38 @@ impl Store {
 
     /// Deletes expired pieces, then trash whose `trashed_at` is at least
     /// [`TRASH_KEEP`] before `now`. Each delete removes the object and the row.
+    ///
+    /// One failed delete does not stop the rest. The first error is returned
+    /// after every due piece has been tried, and that piece is due again on
+    /// the next run.
     pub async fn run_chore(&self, now: SystemTime) -> Result<()> {
+        let mut failed: Option<Error> = None;
         for (satellite_id, piece_id) in self.index.expired(now)? {
             let _guard = self.commit.lock().await;
-            if self.index.is_expired(&satellite_id, &piece_id, now)? {
-                self.delete_stored(&satellite_id, &piece_id).await?;
+            let deleted = match self.index.is_expired(&satellite_id, &piece_id, now) {
+                Ok(true) => self.delete_stored(&satellite_id, &piece_id).await,
+                Ok(false) => Ok(()),
+                Err(err) => Err(err),
+            };
+            if let Err(err) = deleted {
+                failed.get_or_insert(err);
             }
         }
         for (satellite_id, piece_id) in self.index.trash_due(now)? {
             let _guard = self.commit.lock().await;
-            if self.index.is_trash_due(&satellite_id, &piece_id, now)? {
-                self.delete_stored(&satellite_id, &piece_id).await?;
+            let deleted = match self.index.is_trash_due(&satellite_id, &piece_id, now) {
+                Ok(true) => self.delete_stored(&satellite_id, &piece_id).await,
+                Ok(false) => Ok(()),
+                Err(err) => Err(err),
+            };
+            if let Err(err) = deleted {
+                failed.get_or_insert(err);
             }
         }
-        Ok(())
+        match failed {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
     }
 
     /// Deletes this satellite's objects and index rows.

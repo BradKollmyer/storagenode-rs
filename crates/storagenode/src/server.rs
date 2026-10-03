@@ -62,6 +62,10 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 /// is built from a database snapshot, and the two clocks are not the same.
 const RETAIN_MAX_TIME_SKEW: Duration = Duration::from_secs(72 * 60 * 60);
 
+/// Go `collector.Config.Interval`. Expired pieces and old trash are deleted
+/// this often.
+const CHORE_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
 /// Pause after a failed `accept`, so a full descriptor table is not a busy loop.
 const ACCEPT_RETRY: Duration = Duration::from_millis(250);
 
@@ -1056,6 +1060,18 @@ impl Node {
                 now,
             )
             .await;
+    }
+
+    /// Once an hour, delete expired pieces and trash older than seven days.
+    ///
+    /// Without this, both stay in the bucket and expired rows stay in `used`.
+    pub(crate) async fn serve_chore(self: Arc<Self>) {
+        loop {
+            if let Err(err) = self.store.run_chore(SystemTime::now()).await {
+                eprintln!("storagenode: piece chore: {err}");
+            }
+            tokio::time::sleep(CHORE_INTERVAL).await;
+        }
     }
 
     /// Once an hour, after a delay of up to 30 seconds, settle closed hours.
