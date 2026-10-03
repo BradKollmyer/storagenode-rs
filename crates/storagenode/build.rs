@@ -9,9 +9,15 @@
 //! keeps using `storj_proto`. `gracefulexit.proto` imports orders and
 //! metainfo; those packages stay on `storj_proto`. `heldamount.proto` and
 //! `nodestats.proto` are not in the uplink pin.
+//!
+//! Also records the commit this binary is built from, for the version sent
+//! at check-in: `STORAGENODE_COMMIT` and `STORAGENODE_COMMIT_UNIX`. Both come
+//! from the environment when set (the image build has no `.git`), otherwise
+//! from `git`, otherwise they are empty and 0.
 
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 fn main() -> io::Result<()> {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").map_err(io::Error::other)?);
@@ -71,6 +77,18 @@ fn main() -> io::Result<()> {
         uplink.join("noise.proto").display()
     );
 
+    let (commit, commit_unix) = build_commit(&manifest);
+    println!("cargo:rustc-env=STORAGENODE_COMMIT={commit}");
+    println!("cargo:rustc-env=STORAGENODE_COMMIT_UNIX={commit_unix}");
+    println!("cargo:rerun-if-env-changed=STORAGENODE_COMMIT");
+    println!("cargo:rerun-if-env-changed=STORAGENODE_COMMIT_UNIX");
+    // The reflog grows on every commit and checkout. A path that does not
+    // exist would rerun this script on every build.
+    let reflog = manifest.join("../../.git/logs/HEAD");
+    if reflog.is_file() {
+        println!("cargo:rerun-if-changed={}", reflog.display());
+    }
+
     let protoc = protoc_bin_vendored::protoc_bin_path().map_err(io::Error::other)?;
     let protoc_include = protoc_bin_vendored::include_path().map_err(io::Error::other)?;
     let mut config = prost_build::Config::new();
@@ -91,4 +109,34 @@ fn main() -> io::Result<()> {
         &[local, uplink, protoc_include],
     )?;
     Ok(())
+}
+
+/// Commit hash and its committer time in unix seconds.
+fn build_commit(manifest: &Path) -> (String, u64) {
+    let from_env = |key: &str| std::env::var(key).ok().filter(|value| !value.is_empty());
+    if let Some(commit) = from_env("STORAGENODE_COMMIT") {
+        let unix = from_env("STORAGENODE_COMMIT_UNIX")
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or(0);
+        return (commit.trim().to_owned(), unix);
+    }
+    let git = Command::new("git")
+        .arg("-C")
+        .arg(manifest)
+        .args(["log", "-1", "--format=%H %ct"])
+        .output();
+    let Ok(output) = git else {
+        return (String::new(), 0);
+    };
+    if !output.status.success() {
+        return (String::new(), 0);
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut parts = text.split_whitespace();
+    let commit = parts.next().unwrap_or_default().to_owned();
+    let unix = parts
+        .next()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    (commit, unix)
 }
