@@ -94,9 +94,12 @@ async fn delete_finished(node: &Node) -> Result<(), String> {
     Ok(())
 }
 
-/// Deletes pieces for a stored receipt, then marks that delete finished.
+/// Deletes pieces for a stored receipt.
 ///
 /// The receipt is already committed. A delete error leaves it in place.
+/// [`Store::delete_satellite`] sets `pieces_deleted` while it still holds
+/// `commit` and the index is empty. This marks again so a retry after that
+/// write is a no-op rather than another dial.
 pub(crate) async fn delete_pieces(store: &Store, satellite_id: &str) -> Result<(), String> {
     store
         .delete_satellite(satellite_id)
@@ -795,6 +798,56 @@ mod tests {
         let row = node.piece_store().exit_row(&sat).unwrap().unwrap();
         assert_eq!(row.message, receipt);
         assert!(row.pieces_deleted);
+    }
+
+    #[tokio::test]
+    async fn finish_after_exit_completed_does_not_publish() {
+        let bucket = Bucket::start().await;
+        let satellite = Identity::generate().unwrap();
+        let other = Identity::generate().unwrap();
+        let sat = satellite.node_id().to_string();
+        let other_id = other.node_id().to_string();
+        put(&bucket.store, &sat, "live", b"abcd").await;
+        bucket.store.begin_exit(&sat).unwrap();
+        put(&bucket.store, &sat, "during", b"ef").await;
+        bucket.store.complete_exit(&sat, b"receipt").unwrap();
+        assert!(!bucket.store.exit_row(&sat).unwrap().unwrap().pieces_deleted);
+        let still = bucket.store.download(&sat, "during", None).await.unwrap();
+        assert_eq!(still.bytes, b"ef");
+
+        let err = bucket
+            .store
+            .put_piece(&sat, "late", b"zzzz", meta())
+            .await
+            .expect_err("completed exit");
+        assert!(err.to_string().contains("completed"), "{err}");
+        assert!(bucket.store.info(&sat, "late").unwrap().is_none());
+        assert!(matches!(
+            bucket.store.get(&sat, "late", None).await,
+            Err(s3store::Error::NotFound)
+        ));
+
+        bucket.store.delete_satellite(&sat).await.unwrap();
+        let row = bucket.store.exit_row(&sat).unwrap().unwrap();
+        assert_eq!(row.message, b"receipt");
+        assert!(row.pieces_deleted);
+        assert!(bucket.store.info(&sat, "live").unwrap().is_none());
+        assert!(bucket.store.info(&sat, "during").unwrap().is_none());
+        let err = bucket
+            .store
+            .put_piece(&sat, "later", b"nope", meta())
+            .await
+            .expect_err("still completed");
+        assert!(err.to_string().contains("completed"), "{err}");
+        assert!(bucket.store.info(&sat, "later").unwrap().is_none());
+
+        put(&bucket.store, &other_id, "kept", b"hello").await;
+        let kept = bucket
+            .store
+            .download(&other_id, "kept", None)
+            .await
+            .unwrap();
+        assert_eq!(kept.bytes, b"hello");
     }
 
     #[tokio::test]

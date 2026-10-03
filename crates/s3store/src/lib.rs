@@ -618,6 +618,9 @@ impl Store {
     /// an error and deletes nothing. Trash and live rows both go. Another
     /// satellite's keys are not listed. One object error does not put a
     /// deleted row back and does not stop the rest of this satellite.
+    ///
+    /// `pieces_deleted` is set only while `commit` is held and no index row
+    /// remains. A finish waiting on that lock cannot publish after the flag.
     pub async fn delete_satellite(&self, satellite_id: &str) -> Result<()> {
         check_id("satellite id", satellite_id)?;
         match self.index.exit_row(satellite_id)? {
@@ -630,7 +633,7 @@ impl Store {
         }
         let mut failed: Option<Error> = None;
         for piece_id in self.index.piece_ids(satellite_id)? {
-            if let Err(err) = self.delete_exit_piece(satellite_id, &piece_id).await {
+            if let Err(err) = self.delete(satellite_id, &piece_id).await {
                 if failed.is_none() {
                     failed = Some(err);
                 }
@@ -658,7 +661,7 @@ impl Store {
                 if sat != satellite_id {
                     continue;
                 }
-                if let Err(err) = self.delete_exit_piece(satellite_id, &piece_id).await {
+                if let Err(err) = self.delete(satellite_id, &piece_id).await {
                     if failed.is_none() {
                         failed = Some(err);
                     }
@@ -667,26 +670,43 @@ impl Store {
             if !page.truncated {
                 break;
             }
+            // A stalled page must not look like a finished delete.
             let Some(last) = page.objects.last() else {
+                if failed.is_none() {
+                    failed = Some(Error::S3("object list did not advance".into()));
+                }
                 break;
             };
             if start_after.as_deref() == Some(last.key.as_str()) {
+                if failed.is_none() {
+                    failed = Some(Error::S3("object list did not advance".into()));
+                }
                 break;
             }
             start_after = Some(last.key.clone());
         }
+        // Hold commit across the last deletes and the empty read. Dropping it
+        // in between lets a waiting finish publish a piece the flag would hide.
+        let _guard = self.commit.lock().await;
+        loop {
+            let ids = self.index.piece_ids(satellite_id)?;
+            if ids.is_empty() {
+                if failed.is_none() {
+                    self.index.mark_exit_deleted(satellite_id)?;
+                }
+                break;
+            }
+            for piece_id in &ids {
+                if let Err(err) = self.delete_stored(satellite_id, piece_id).await {
+                    return Err(failed.unwrap_or(err));
+                }
+            }
+        }
+        drop(_guard);
         match failed {
             Some(err) => Err(err),
             None => Ok(()),
         }
-    }
-
-    /// Object and row, while this task holds the commit lock the next writer needs.
-    async fn delete_exit_piece(&self, satellite_id: &str, piece_id: &str) -> Result<()> {
-        let _guard = self.commit.lock().await;
-        let key = object_key(&self.prefix, satellite_id, piece_id)?;
-        delete_object(&self.client, &self.bucket, &key).await?;
-        self.index.delete(satellite_id, piece_id)
     }
 
     /// Starts an upload.
@@ -1073,10 +1093,14 @@ impl Upload {
     /// A piece upload inserts `writing` first. The row stays `writing` when
     /// this returns after the put and before `live` is recorded, including
     /// when the process dies in that window. The object is then not served.
+    /// A satellite whose graceful exit is already completed is not reserved
+    /// and not marked live: the delete holds this same lock until the index
+    /// is empty.
     pub async fn finish(mut self) -> Result<()> {
         let commit = Arc::clone(&self.commit);
         let guard = commit.lock().await;
         let result = async {
+            self.reject_completed_exit()?;
             self.reserve_piece()?;
             if let Err(err) = self.finish_inner().await {
                 // The put did not succeed. Restore the previous row. A crash
@@ -1252,6 +1276,22 @@ impl Upload {
             Err(err) if is_missing_code(err.code()) || err.code() == Some("NoSuchUpload") => Ok(()),
             Err(err) => Err(Error::S3(err.to_string())),
         }
+    }
+
+    fn reject_completed_exit(&self) -> Result<()> {
+        let Some(piece) = &self.piece else {
+            return Ok(());
+        };
+        if matches!(
+            self.index.exit_row(&piece.satellite_id)?,
+            Some(row) if row.status == ExitStatus::Completed
+        ) {
+            return Err(Error::Index(format!(
+                "graceful exit for {} is completed",
+                piece.satellite_id
+            )));
+        }
+        Ok(())
     }
 
     fn reserve_piece(&mut self) -> Result<()> {
