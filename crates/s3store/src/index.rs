@@ -131,8 +131,6 @@ CREATE TABLE IF NOT EXISTS satellite_stats (
     audit_score REAL NOT NULL,
     suspension_score REAL NOT NULL,
     online_score REAL NOT NULL,
-    uptime_score REAL NOT NULL,
-    audit_history_score REAL NOT NULL,
     disqualified_at INTEGER,
     suspended_at INTEGER,
     vetted_at INTEGER,
@@ -496,10 +494,6 @@ pub struct SatelliteStats {
     pub suspension_score: f64,
     /// `online_score`.
     pub online_score: f64,
-    /// `uptime_check.reputation_score`. Not the Vue suspension field.
-    pub uptime_score: f64,
-    /// `audit_history.score`. Not the Vue audit field.
-    pub audit_history_score: f64,
     /// `disqualified`, when set.
     pub disqualified_at: Option<SystemTime>,
     /// `suspended`, when set.
@@ -1385,15 +1379,13 @@ impl Index {
         self.with(|conn| {
             conn.execute(
                 "INSERT INTO satellite_stats (
-                    satellite, audit_score, suspension_score, online_score, uptime_score,
-                    audit_history_score, disqualified_at, suspended_at, vetted_at, joined_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                    satellite, audit_score, suspension_score, online_score,
+                    disqualified_at, suspended_at, vetted_at, joined_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                  ON CONFLICT(satellite) DO UPDATE SET
                     audit_score = excluded.audit_score,
                     suspension_score = excluded.suspension_score,
                     online_score = excluded.online_score,
-                    uptime_score = excluded.uptime_score,
-                    audit_history_score = excluded.audit_history_score,
                     disqualified_at = excluded.disqualified_at,
                     suspended_at = excluded.suspended_at,
                     vetted_at = excluded.vetted_at,
@@ -1403,8 +1395,6 @@ impl Index {
                     row.audit_score,
                     row.suspension_score,
                     row.online_score,
-                    row.uptime_score,
-                    row.audit_history_score,
                     disqualified,
                     suspended,
                     vetted,
@@ -1419,8 +1409,8 @@ impl Index {
     pub(crate) fn satellite_stats(&self) -> Result<Vec<SatelliteStats>> {
         self.with(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT satellite, audit_score, suspension_score, online_score, uptime_score,
-                        audit_history_score, disqualified_at, suspended_at, vetted_at, joined_at
+                "SELECT satellite, audit_score, suspension_score, online_score,
+                        disqualified_at, suspended_at, vetted_at, joined_at
                  FROM satellite_stats
                  ORDER BY satellite",
             )?;
@@ -1430,12 +1420,10 @@ impl Index {
                     audit_score: row.get(1)?,
                     suspension_score: row.get(2)?,
                     online_score: row.get(3)?,
-                    uptime_score: row.get(4)?,
-                    audit_history_score: row.get(5)?,
-                    disqualified_at: row.get(6)?,
-                    suspended_at: row.get(7)?,
-                    vetted_at: row.get(8)?,
-                    joined_at: row.get(9)?,
+                    disqualified_at: row.get(4)?,
+                    suspended_at: row.get(5)?,
+                    vetted_at: row.get(6)?,
+                    joined_at: row.get(7)?,
                 })
             })?;
             let mut out = Vec::new();
@@ -1808,8 +1796,6 @@ struct StatsStored {
     audit_score: f64,
     suspension_score: f64,
     online_score: f64,
-    uptime_score: f64,
-    audit_history_score: f64,
     disqualified_at: Option<i64>,
     suspended_at: Option<i64>,
     vetted_at: Option<i64>,
@@ -1823,8 +1809,6 @@ impl StatsStored {
             audit_score: self.audit_score,
             suspension_score: self.suspension_score,
             online_score: self.online_score,
-            uptime_score: self.uptime_score,
-            audit_history_score: self.audit_history_score,
             disqualified_at: opt_system(self.disqualified_at)?,
             suspended_at: opt_system(self.suspended_at)?,
             vetted_at: opt_system(self.vetted_at)?,
@@ -1893,6 +1877,7 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         conn.execute("ALTER TABLE pieces ADD COLUMN hash_ts_nanos INTEGER", [])?;
     }
     drop_checkin_reputation(conn)?;
+    drop_unread_stat_scores(conn)?;
     Ok(())
 }
 
@@ -1911,6 +1896,25 @@ fn drop_checkin_reputation(conn: &Connection) -> rusqlite::Result<()> {
     }
     if names.iter().any(|name| name == "vetted_at") {
         conn.execute("ALTER TABLE checkins DROP COLUMN vetted_at", [])?;
+    }
+    Ok(())
+}
+
+/// The first payout poll stored two scores no route reads.
+fn drop_unread_stat_scores(conn: &Connection) -> rusqlite::Result<()> {
+    let names = {
+        let mut stmt = conn.prepare("PRAGMA table_info(satellite_stats)")?;
+        stmt.query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    if names.iter().any(|name| name == "uptime_score") {
+        conn.execute("ALTER TABLE satellite_stats DROP COLUMN uptime_score", [])?;
+    }
+    if names.iter().any(|name| name == "audit_history_score") {
+        conn.execute(
+            "ALTER TABLE satellite_stats DROP COLUMN audit_history_score",
+            [],
+        )?;
     }
     Ok(())
 }
@@ -2205,6 +2209,49 @@ mod tests {
         assert!(!names.iter().any(|name| name == "disqualified_at"));
         assert!(!names.iter().any(|name| name == "suspended_at"));
         assert!(!names.iter().any(|name| name == "vetted_at"));
+    }
+
+    #[test]
+    fn open_drops_unread_stat_scores() {
+        let (_dir, path) = temp_db();
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE satellite_stats (
+                satellite TEXT PRIMARY KEY,
+                audit_score REAL NOT NULL,
+                suspension_score REAL NOT NULL,
+                online_score REAL NOT NULL,
+                uptime_score REAL NOT NULL,
+                audit_history_score REAL NOT NULL,
+                disqualified_at INTEGER,
+                suspended_at INTEGER,
+                vetted_at INTEGER,
+                joined_at INTEGER
+            );
+            INSERT INTO satellite_stats (
+                satellite, audit_score, suspension_score, online_score,
+                uptime_score, audit_history_score
+            ) VALUES ('sat', 0.98, 0.97, 0.995, 0.5, 0.91);",
+        )
+        .unwrap();
+        drop(conn);
+        let index = Index::open(&path).unwrap();
+        let rows = index.satellite_stats().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].audit_score, 0.98);
+        assert_eq!(rows[0].suspension_score, 0.97);
+        assert_eq!(rows[0].online_score, 0.995);
+        drop(index);
+        let conn = Connection::open(&path).unwrap();
+        let mut stmt = conn.prepare("PRAGMA table_info(satellite_stats)").unwrap();
+        let names = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(!names.iter().any(|name| name == "uptime_score"));
+        assert!(!names.iter().any(|name| name == "audit_history_score"));
+        assert!(names.iter().any(|name| name == "joined_at"));
     }
 
     /// Tiny temp dir that deletes itself. Avoids a dev-dependency for one test.

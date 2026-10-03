@@ -39,6 +39,9 @@ pub(crate) const DAILY_STORAGE_USAGE: &str = "/nodestats.NodeStats/DailyStorageU
 /// `/nodestats.NodeStats/PricingModel`.
 pub(crate) const PRICING_MODEL: &str = "/nodestats.NodeStats/PricingModel";
 
+/// `rpcstatus.OutOfRange`. A closed month with no paystub or payment uses this.
+const OUT_OF_RANGE: u64 = 11;
+
 /// Go reputation chore interval. Paystubs in Go wait longer; one loop is enough.
 const INTERVAL: Duration = Duration::from_secs(4 * 60 * 60);
 
@@ -126,21 +129,29 @@ async fn fetch_paystubs(
         &crate::heldamount::GetAllPaystubsRequest {},
         timeout,
     )
-    .await?;
+    .await
+    .map_err(rpc_message)?;
     for stub in all.paystub {
         store_paystub(node, &id, stub)?;
     }
-    let one: crate::heldamount::GetHeldAmountResponse = invoke(
+    // Closed months are what paystubs exist for. The current month is OutOfRange.
+    let closed = Timestamp::from(month_start(previous_month(SystemTime::now())));
+    let one = match invoke(
         node,
         id,
         address,
         GET_PAY_STUB,
         &crate::heldamount::GetHeldAmountRequest {
-            period: Some(timestamp_at(month_start(SystemTime::now()))),
+            period: Some(closed),
         },
         timeout,
     )
-    .await?;
+    .await
+    {
+        Ok(one) => one,
+        Err(RpcFail::MissingPeriod(_)) => return Ok(()),
+        Err(err) => return Err(rpc_message(err)),
+    };
     store_paystub(node, &id, one)
 }
 
@@ -193,21 +204,28 @@ async fn fetch_payments(
         &crate::heldamount::GetAllPaymentsRequest {},
         timeout,
     )
-    .await?;
+    .await
+    .map_err(rpc_message)?;
     for payment in all.payment {
         store_payment(node, &id, payment)?;
     }
-    let one: crate::heldamount::GetPaymentResponse = invoke(
+    let closed = Timestamp::from(month_start(previous_month(SystemTime::now())));
+    let one = match invoke(
         node,
         id,
         address,
         GET_PAYMENT,
         &crate::heldamount::GetPaymentRequest {
-            period: Some(timestamp_at(month_start(SystemTime::now()))),
+            period: Some(closed),
         },
         timeout,
     )
-    .await?;
+    .await
+    {
+        Ok(one) => one,
+        Err(RpcFail::MissingPeriod(_)) => return Ok(()),
+        Err(err) => return Err(rpc_message(err)),
+    };
     store_payment(node, &id, one)
 }
 
@@ -245,9 +263,9 @@ async fn fetch_stats(
         &crate::nodestats::GetStatsRequest {},
         timeout,
     )
-    .await?;
+    .await
+    .map_err(rpc_message)?;
     let audit = resp.audit_check.as_ref();
-    let uptime = resp.uptime_check.as_ref();
     let row = SatelliteStats {
         satellite_id: id.to_string(),
         // Vue `Score` multiplies by 100. These are the 0–1 fractions Go stores.
@@ -256,12 +274,6 @@ async fn fetch_stats(
             .map(|stats| stats.unknown_reputation_score)
             .unwrap_or(0.0),
         online_score: resp.online_score,
-        uptime_score: uptime.map(|stats| stats.reputation_score).unwrap_or(0.0),
-        audit_history_score: resp
-            .audit_history
-            .as_ref()
-            .map(|history| history.score)
-            .unwrap_or(0.0),
         disqualified_at: opt_time(resp.disqualified),
         suspended_at: opt_time(resp.suspended),
         vetted_at: opt_time(resp.vetted_at),
@@ -286,12 +298,13 @@ async fn fetch_daily_storage(
         address,
         DAILY_STORAGE_USAGE,
         &crate::nodestats::DailyStorageUsageRequest {
-            from: Some(timestamp_at(start)),
-            to: Some(timestamp_at(end)),
+            from: Some(Timestamp::from(start)),
+            to: Some(Timestamp::from(end)),
         },
         timeout,
     )
-    .await?;
+    .await
+    .map_err(rpc_message)?;
     Ok(())
 }
 
@@ -309,7 +322,8 @@ async fn fetch_pricing(
         &crate::nodestats::PricingModelRequest {},
         timeout,
     )
-    .await?;
+    .await
+    .map_err(rpc_message)?;
     let row = PricingRow {
         egress_bandwidth: resp.egress_bandwidth_price,
         repair_bandwidth: resp.repair_bandwidth_price,
@@ -321,6 +335,18 @@ async fn fetch_pricing(
         .map_err(|err| err.to_string())
 }
 
+enum RpcFail {
+    /// `rpcstatus.OutOfRange`. Go stores nothing for that period.
+    MissingPeriod(String),
+    Other(String),
+}
+
+fn rpc_message(err: RpcFail) -> String {
+    match err {
+        RpcFail::MissingPeriod(message) | RpcFail::Other(message) => message,
+    }
+}
+
 async fn invoke<R: Message + Default>(
     node: &Node,
     id: NodeId,
@@ -328,9 +354,9 @@ async fn invoke<R: Message + Default>(
     path: &str,
     request: &impl Message,
     timeout: Duration,
-) -> Result<R, String> {
+) -> Result<R, RpcFail> {
     let bytes = dial(node, id, address, path, &request.encode_to_vec(), timeout).await?;
-    R::decode(bytes.as_slice()).map_err(|err| err.to_string())
+    R::decode(bytes.as_slice()).map_err(|err| RpcFail::Other(err.to_string()))
 }
 
 async fn dial(
@@ -340,7 +366,7 @@ async fn dial(
     path: &str,
     request: &[u8],
     timeout: Duration,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, RpcFail> {
     let rpc = async {
         let transport = transport::dial(
             node.identity(),
@@ -351,15 +377,21 @@ async fn dial(
             None,
         )
         .await
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| RpcFail::Other(err.to_string()))?;
         let mut conn = Conn::new(transport);
-        conn.invoke(path, request)
-            .await
-            .map_err(|err| err.to_string())
+        conn.invoke(path, request).await.map_err(|err| match err {
+            storj_rpc::Error::Remote {
+                code: OUT_OF_RANGE,
+                message,
+            } => RpcFail::MissingPeriod(format!(
+                "DRPC remote error (code {OUT_OF_RANGE}): {message}"
+            )),
+            other => RpcFail::Other(other.to_string()),
+        })
     };
     match tokio::time::timeout(timeout, rpc).await {
         Ok(result) => result,
-        Err(_) => Err(format!("{path} timed out")),
+        Err(_) => Err(RpcFail::Other(format!("{path} timed out"))),
     }
 }
 
@@ -549,7 +581,7 @@ fn month_start(now: SystemTime) -> SystemTime {
     let Some(dt) = utc(now) else {
         return UNIX_EPOCH;
     };
-    unix_time(month_begin_dt(dt).unix_timestamp())
+    SystemTime::from(month_begin_dt(dt))
 }
 
 /// An instant in the previous UTC month, so the bandwidth counter selects it.
@@ -560,7 +592,7 @@ pub(crate) fn previous_month(now: SystemTime) -> SystemTime {
     let prev = month_begin_dt(dt)
         .checked_sub(time::Duration::days(1))
         .unwrap_or_else(|| month_begin_dt(dt));
-    unix_time(prev.unix_timestamp())
+    SystemTime::from(prev)
 }
 
 fn month_bounds(now: SystemTime) -> (SystemTime, SystemTime) {
@@ -568,26 +600,9 @@ fn month_bounds(now: SystemTime) -> (SystemTime, SystemTime) {
         return (UNIX_EPOCH, UNIX_EPOCH);
     };
     (
-        unix_time(month_begin_dt(dt).unix_timestamp()),
-        unix_time(month_end_dt(dt).unix_timestamp()),
+        SystemTime::from(month_begin_dt(dt)),
+        SystemTime::from(month_end_dt(dt)),
     )
-}
-
-fn unix_time(secs: i64) -> SystemTime {
-    if secs < 0 {
-        return UNIX_EPOCH;
-    }
-    UNIX_EPOCH + Duration::from_secs(u64::try_from(secs).unwrap_or(u64::MAX))
-}
-
-fn timestamp_at(time: SystemTime) -> Timestamp {
-    let Ok(elapsed) = time.duration_since(UNIX_EPOCH) else {
-        return Timestamp::default();
-    };
-    Timestamp {
-        seconds: i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX),
-        nanos: i32::try_from(elapsed.subsec_nanos()).unwrap_or(0),
-    }
 }
 
 fn period_of(ts: Option<&Timestamp>) -> Result<String, String> {
@@ -832,6 +847,9 @@ mod tests {
                 PRICING_MODEL,
             ]
         );
+        let requests = script.requests.lock().expect("requests").clone();
+        assert_previous_month(&requests, GET_PAY_STUB);
+        assert_previous_month(&requests, GET_PAYMENT);
 
         let (status, body) = dash
             .handle("GET", &format!("/api/sno/estimated-payout?id={live_id}"))
@@ -967,6 +985,20 @@ mod tests {
         assert_eq!(row["vettedAt"], vetted);
         assert!(row["disqualified"].is_null());
 
+        script.missing.store(true, Ordering::Relaxed);
+        let err = poll(&fixture.node, Duration::from_secs(5))
+            .await
+            .expect_err("dead satellite");
+        assert!(err.contains(&dead_node), "{err}");
+        assert!(
+            !err.contains(&live_id),
+            "a missing closed month is not a poll failure: {err}"
+        );
+        let stubs = fixture.node.piece_store().paystubs().expect("stubs");
+        assert_eq!(stubs.len(), 1);
+        assert_eq!(stubs[0].usage_get, 42);
+        script.missing.store(false, Ordering::Relaxed);
+
         script.fail.store(true, Ordering::Relaxed);
         let err = poll(&fixture.node, Duration::from_secs(5))
             .await
@@ -1019,6 +1051,28 @@ mod tests {
         assert_eq!(pricing.egress_bandwidth, 20);
     }
 
+    fn assert_previous_month(requests: &[(String, Vec<u8>)], path: &str) {
+        let (_, bytes) = requests
+            .iter()
+            .find(|(got, _)| got == path)
+            .unwrap_or_else(|| panic!("no request for {path}"));
+        let seconds = if path == GET_PAY_STUB {
+            crate::heldamount::GetHeldAmountRequest::decode(bytes.as_slice())
+                .expect("paystub request")
+                .period
+                .expect("period")
+                .seconds
+        } else {
+            crate::heldamount::GetPaymentRequest::decode(bytes.as_slice())
+                .expect("payment request")
+                .period
+                .expect("period")
+                .seconds
+        };
+        let expected = Timestamp::from(month_start(previous_month(SystemTime::now())));
+        assert_eq!(seconds, expected.seconds, "{path}");
+    }
+
     fn assert_month_zeros(body: &[u8]) {
         let payout: serde_json::Value = serde_json::from_slice(body).expect("json");
         for month in ["currentMonth", "previousMonth"] {
@@ -1046,7 +1100,7 @@ mod tests {
     fn ts(year: i32, month: u8, day: u8) -> SystemTime {
         let date = time::Date::from_calendar_date(year, time::Month::try_from(month).unwrap(), day)
             .unwrap();
-        unix_time(date.midnight().assume_utc().unix_timestamp())
+        SystemTime::from(date.midnight().assume_utc())
     }
 
     fn operator() -> Operator {
@@ -1142,7 +1196,9 @@ mod tests {
 
     struct Script {
         paths: Mutex<Vec<String>>,
+        requests: Mutex<Vec<(String, Vec<u8>)>>,
         fail: AtomicBool,
+        missing: AtomicBool,
         quic: AtomicBool,
     }
 
@@ -1150,7 +1206,9 @@ mod tests {
         fn default() -> Self {
             Self {
                 paths: Mutex::new(Vec::new()),
+                requests: Mutex::new(Vec::new()),
                 fail: AtomicBool::new(false),
+                missing: AtomicBool::new(false),
                 quic: AtomicBool::new(false),
             }
         }
@@ -1223,10 +1281,30 @@ mod tests {
                 continue;
             }
             match pkt.kind {
-                Kind::MESSAGE | Kind::CLOSE_SEND | Kind::CLOSE => break,
+                Kind::MESSAGE => {
+                    script
+                        .requests
+                        .lock()
+                        .expect("requests")
+                        .push((path.clone(), pkt.data));
+                    break;
+                }
+                Kind::CLOSE_SEND | Kind::CLOSE => break,
                 Kind::ERROR => return Err("client error".into()),
                 _ => {}
             }
+        }
+        if script.missing.load(Ordering::Relaxed) && (path == GET_PAY_STUB || path == GET_PAYMENT) {
+            conn.write_packet(&Packet {
+                stream_id: invoke.stream_id,
+                message_id: 1,
+                kind: Kind::ERROR,
+                control: false,
+                data: storj_rpc::marshal_error(OUT_OF_RANGE, "no paystub for period"),
+            })
+            .await
+            .map_err(|err| err.to_string())?;
+            return Ok(());
         }
         if script.fail.load(Ordering::Relaxed) {
             return Err("satellite down".into());
@@ -1255,7 +1333,7 @@ mod tests {
     }
 
     fn response_for(path: &str, quic: bool) -> Result<Vec<u8>, String> {
-        let period = timestamp_at(month_start(SystemTime::now()));
+        let period = Timestamp::from(month_start(SystemTime::now()));
         let created = Timestamp {
             seconds: 1_700_000_000,
             nanos: 0,
