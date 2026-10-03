@@ -116,10 +116,77 @@ pub struct Store {
     allocated_bytes: u64,
     /// One startup at a time. A second caller waits, then sees the marker.
     startup: tokio::sync::Mutex<()>,
-    /// Held across a piece commit, including the object put, and across each
-    /// chore delete. GC must not delete an object this commit just replaced,
-    /// and a download must not drop a row this commit just published.
-    commit: Arc<tokio::sync::Mutex<()>>,
+    /// A key's lock is held across a piece commit, including the object put,
+    /// and across each chore delete. GC must not delete an object this commit
+    /// just replaced, and a download must not drop a row this commit just
+    /// published.
+    commit: Arc<CommitLocks>,
+}
+
+/// One commit lock per object key, and a store-wide gate.
+///
+/// A commit, a chore delete, and a trash flag hold their key and share the
+/// gate, so pieces with different keys do not wait for each other's S3
+/// request. [`Store::delete_satellite`] and [`Store::restore_trash`] change
+/// many rows at once. They take the gate exclusively, which waits for every
+/// key holder and admits no new one.
+struct CommitLocks {
+    gate: Arc<tokio::sync::RwLock<()>>,
+    /// Keys that are held or waited for. An idle key has no entry.
+    keys: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+impl CommitLocks {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            gate: Arc::new(tokio::sync::RwLock::new(())),
+            keys: std::sync::Mutex::new(HashMap::new()),
+        })
+    }
+
+    fn keys(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<tokio::sync::Mutex<()>>>> {
+        self.keys.lock().unwrap_or_else(|err| err.into_inner())
+    }
+
+    /// The gate first, then the key. No holder of a key waits for the gate.
+    async fn key(self: &Arc<Self>, key: &str) -> KeyGuard {
+        let gate = Arc::clone(&self.gate).read_owned().await;
+        let slot = Arc::clone(self.keys().entry(key.to_owned()).or_default());
+        let held = slot.lock_owned().await;
+        KeyGuard {
+            locks: Arc::clone(self),
+            key: key.to_owned(),
+            held: Some(held),
+            _gate: gate,
+        }
+    }
+
+    /// Every key at once.
+    async fn all(&self) -> tokio::sync::RwLockWriteGuard<'_, ()> {
+        self.gate.write().await
+    }
+}
+
+struct KeyGuard {
+    locks: Arc<CommitLocks>,
+    key: String,
+    held: Option<tokio::sync::OwnedMutexGuard<()>>,
+    _gate: tokio::sync::OwnedRwLockReadGuard<()>,
+}
+
+impl Drop for KeyGuard {
+    fn drop(&mut self) {
+        let mut keys = self.locks.keys();
+        // Unlock under the map lock. A waiter cloned the slot under the same
+        // lock, so a count of one means nobody holds or waits for this key.
+        drop(self.held.take());
+        if keys
+            .get(&self.key)
+            .is_some_and(|slot| Arc::strong_count(slot) == 1)
+        {
+            keys.remove(&self.key);
+        }
+    }
 }
 
 impl fmt::Debug for Store {
@@ -263,7 +330,7 @@ impl Store {
             index,
             allocated_bytes: config.allocated_bytes,
             startup: tokio::sync::Mutex::new(()),
-            commit: Arc::new(tokio::sync::Mutex::new(())),
+            commit: CommitLocks::new(),
         })
     }
 
@@ -415,7 +482,7 @@ impl Store {
     /// metadata file name fits in `NAME_MAX`.
     pub fn stage(&self, stage_id: &str) -> Result<Upload> {
         let key = stage_key(&self.prefix, stage_id)?;
-        Ok(self.begin(key, None))
+        Ok(self.begin(key, None, false))
     }
 
     /// Copies a finished staging object onto the piece key, then deletes only
@@ -423,8 +490,8 @@ impl Store {
     ///
     /// Metadata is attached when the piece upload is created, which is after
     /// the caller has the uplink hash. The copy uses [`Upload::write`]. It
-    /// does not build one `Vec` of the piece. The piece commit lock stays
-    /// inside [`Upload::finish`]. This function does not delete the piece key
+    /// does not build one `Vec` of the piece. The piece key's commit lock
+    /// stays inside [`Upload::finish`]. This function does not delete the piece key
     /// and does not roll back the row after that lock is released. Once the
     /// piece commit has succeeded, a staging `DeleteObject` error is ignored.
     pub async fn commit_staged_piece(
@@ -459,8 +526,8 @@ impl Store {
         // The piece is live once `finish` returns. The spill delete is
         // best-effort so a `DeleteObject` error still lets the caller send
         // the node-signed hash. The key is the staging object. A failed
-        // `finish` already restored its own writing row while it held
-        // `commit`, and that error is the one returned below.
+        // `finish` already restored its own writing row while it held the
+        // piece key's lock, and that error is the one returned below.
         let _ = delete_object(&self.client, &self.bucket, &stage_key).await;
         copied
     }
@@ -555,8 +622,7 @@ impl Store {
     ///
     /// Already-trash succeeds and leaves the original `trashed_at` in place.
     pub async fn trash(&self, satellite_id: &str, piece_id: &str, at: SystemTime) -> Result<()> {
-        check_piece(satellite_id, piece_id)?;
-        let _guard = self.commit.lock().await;
+        let _guard = self.lock_piece(satellite_id, piece_id).await?;
         if self.index.trash(satellite_id, piece_id, at)? {
             return Ok(());
         }
@@ -572,8 +638,7 @@ impl Store {
     /// The piecestore download calls this once the object has opened: a
     /// piece somebody still reads was trashed by mistake.
     pub async fn restore_piece(&self, satellite_id: &str, piece_id: &str) -> Result<bool> {
-        check_piece(satellite_id, piece_id)?;
-        let _guard = self.commit.lock().await;
+        let _guard = self.lock_piece(satellite_id, piece_id).await?;
         self.index.restore_piece(satellite_id, piece_id)
     }
 
@@ -581,7 +646,9 @@ impl Store {
     /// deleted by the chore are gone, so they are not restored.
     pub async fn restore_trash(&self, satellite_id: &str) -> Result<u64> {
         check_id("satellite id", satellite_id)?;
-        let _guard = self.commit.lock().await;
+        // Every trash row of the satellite. A chore delete that has checked
+        // one of them must finish before the row can turn live under it.
+        let _guard = self.commit.all().await;
         self.index.restore_trash(satellite_id)
     }
 
@@ -692,7 +759,7 @@ impl Store {
     pub async fn run_chore(&self, now: SystemTime) -> Result<()> {
         let mut failed: Option<Error> = None;
         for (satellite_id, piece_id) in self.index.expired(now)? {
-            let _guard = self.commit.lock().await;
+            let _guard = self.lock_piece(&satellite_id, &piece_id).await?;
             let deleted = match self.index.is_expired(&satellite_id, &piece_id, now) {
                 Ok(true) => self.delete_stored(&satellite_id, &piece_id).await,
                 Ok(false) => Ok(()),
@@ -703,7 +770,7 @@ impl Store {
             }
         }
         for (satellite_id, piece_id) in self.index.trash_due(now)? {
-            let _guard = self.commit.lock().await;
+            let _guard = self.lock_piece(&satellite_id, &piece_id).await?;
             let deleted = match self.index.is_trash_due(&satellite_id, &piece_id, now) {
                 Ok(true) => self.delete_stored(&satellite_id, &piece_id).await,
                 Ok(false) => Ok(()),
@@ -726,8 +793,9 @@ impl Store {
     /// satellite's keys are not listed. One object error does not put a
     /// deleted row back and does not stop the rest of this satellite.
     ///
-    /// `pieces_deleted` is set only while `commit` is held and no index row
-    /// remains. A finish waiting on that lock cannot publish after the flag.
+    /// `pieces_deleted` is set only while every commit lock is held and no
+    /// index row remains. A finish waiting on its lock cannot publish after
+    /// the flag.
     pub async fn delete_satellite(&self, satellite_id: &str) -> Result<()> {
         check_id("satellite id", satellite_id)?;
         match self.index.exit_row(satellite_id)? {
@@ -792,9 +860,10 @@ impl Store {
             }
             start_after = Some(last.key.clone());
         }
-        // Hold commit across the last deletes and the empty read. Dropping it
-        // in between lets a waiting finish publish a piece the flag would hide.
-        let _guard = self.commit.lock().await;
+        // Hold every commit lock across the last deletes and the empty read.
+        // Dropping them in between lets a waiting finish publish a piece the
+        // flag would hide.
+        let _guard = self.commit.all().await;
         loop {
             let ids = self.index.piece_ids(satellite_id)?;
             if ids.is_empty() {
@@ -828,10 +897,17 @@ impl Store {
         metadata: Option<HashMap<String, String>>,
     ) -> Result<Upload> {
         let key = object_key(&self.prefix, satellite_id, piece_id)?;
-        Ok(self.begin(key, metadata))
+        Ok(self.begin(key, metadata, true))
     }
 
-    fn begin(&self, key: String, metadata: Option<HashMap<String, String>>) -> Upload {
+    /// `locks_key` is false only for a staging key. Its id belongs to one
+    /// upload and it has no index row, so nothing else can commit or delete it.
+    fn begin(
+        &self,
+        key: String,
+        metadata: Option<HashMap<String, String>>,
+        locks_key: bool,
+    ) -> Upload {
         Upload {
             client: self.client.clone(),
             bucket: self.bucket.clone(),
@@ -844,11 +920,17 @@ impl Store {
             failed: None,
             index: self.index.clone(),
             commit: Arc::clone(&self.commit),
+            locks_key,
             piece: None,
         }
     }
 
-    /// `finish` holds `commit` across the put and the live upsert. Recheck
+    async fn lock_piece(&self, satellite_id: &str, piece_id: &str) -> Result<KeyGuard> {
+        let key = object_key(&self.prefix, satellite_id, piece_id)?;
+        Ok(self.commit.key(&key).await)
+    }
+
+    /// `finish` holds the key's lock across the put and the live upsert. Recheck
     /// under that lock so a missing object cannot drop a row a later put
     /// just published. Always returns [`Error::NotFound`] when the head
     /// succeeds or reports absence. A head error is returned instead.
@@ -858,7 +940,7 @@ impl Store {
         piece_id: &str,
         info: &PieceInfo,
     ) -> Result<()> {
-        let _guard = self.commit.lock().await;
+        let _guard = self.lock_piece(satellite_id, piece_id).await?;
         let still_same = self.index.get(satellite_id, piece_id)?.as_ref() == Some(info);
         // A head error is not absence. Return it and leave the row.
         let absent = if still_same {
@@ -1015,7 +1097,7 @@ impl Store {
 
     /// Deletes the object and the index row. Already-absent keys succeed.
     pub async fn delete(&self, satellite_id: &str, piece_id: &str) -> Result<()> {
-        let _guard = self.commit.lock().await;
+        let _guard = self.lock_piece(satellite_id, piece_id).await?;
         self.delete_stored(satellite_id, piece_id).await
     }
 
@@ -1153,7 +1235,8 @@ pub struct Upload {
     // A failed part must not be completed later as a short or empty object.
     failed: Option<Error>,
     index: index::Index,
-    commit: Arc<tokio::sync::Mutex<()>>,
+    commit: Arc<CommitLocks>,
+    locks_key: bool,
     piece: Option<PieceAttempt>,
 }
 
@@ -1201,11 +1284,17 @@ impl Upload {
     /// this returns after the put and before `live` is recorded, including
     /// when the process dies in that window. The object is then not served.
     /// A satellite whose graceful exit is already completed is not reserved
-    /// and not marked live: the delete holds this same lock until the index
+    /// and not marked live: the delete holds every key's lock until the index
     /// is empty.
+    ///
+    /// Only this key is locked. Another piece's put does not wait for this
+    /// one, and a staging key is not locked at all.
     pub async fn finish(mut self) -> Result<()> {
-        let commit = Arc::clone(&self.commit);
-        let guard = commit.lock().await;
+        let guard = if self.locks_key {
+            Some(self.commit.key(&self.key).await)
+        } else {
+            None
+        };
         let result = async {
             self.reject_completed_exit()?;
             self.reserve_piece()?;
@@ -1875,6 +1964,42 @@ fn check_id(what: &str, value: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn commit_locks_are_per_key_and_the_gate_waits_for_all() {
+        let short = std::time::Duration::from_millis(50);
+        let locks = CommitLocks::new();
+        let a = locks.key("pieces/sat/a").await;
+        // Another key does not wait. The same key and the gate do.
+        let b = tokio::time::timeout(short, locks.key("pieces/sat/b"))
+            .await
+            .expect("a different key is free");
+        assert!(
+            tokio::time::timeout(short, locks.key("pieces/sat/a"))
+                .await
+                .is_err()
+        );
+        assert!(tokio::time::timeout(short, locks.all()).await.is_err());
+        drop(a);
+        assert!(tokio::time::timeout(short, locks.all()).await.is_err());
+        drop(b);
+        assert!(locks.keys().is_empty(), "idle keys leave the map");
+
+        let all = tokio::time::timeout(short, locks.all())
+            .await
+            .expect("no key is held");
+        assert!(
+            tokio::time::timeout(short, locks.key("pieces/sat/a"))
+                .await
+                .is_err()
+        );
+        drop(all);
+        let again = tokio::time::timeout(short, locks.key("pieces/sat/a"))
+            .await
+            .expect("the gate is open again");
+        drop(again);
+        assert!(locks.keys().is_empty());
+    }
 
     #[test]
     fn path_style_unless_the_host_is_amazonaws() {
