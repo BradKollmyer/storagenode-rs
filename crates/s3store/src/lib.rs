@@ -358,9 +358,12 @@ impl Store {
     /// Rebuild inserts a live row for every object whose user metadata has the
     /// piece fields. Trash is not on the object, so every rebuilt row is live.
     /// A missing bucket fails this call and leaves the marker unset.
+    ///
+    /// Staging objects a crashed process left behind are deleted first.
     pub async fn startup(&self) -> Result<()> {
         let _guard = self.startup.lock().await;
         self.head_bucket().await?;
+        self.sweep_staging().await?;
         if self.index.rebuild_done()? {
             return Ok(());
         }
@@ -476,13 +479,76 @@ impl Store {
 
     /// Spill key for an upload whose hash is not known yet.
     ///
-    /// The object is not an index row. [`Upload::finish`] writes it.
-    /// [`Self::commit_staged_piece`] copies it onto the piece key.
+    /// The object is not an index row. [`Self::publish_staged`] turns the
+    /// upload into a piece. A body that never left the buffer is not written
+    /// to this key at all.
     /// `stage_id` is one path segment. The object key stays short so the
     /// metadata file name fits in `NAME_MAX`.
     pub fn stage(&self, stage_id: &str) -> Result<Upload> {
         let key = stage_key(&self.prefix, stage_id)?;
         Ok(self.begin(key, None, false))
+    }
+
+    /// Publishes a staging upload as a piece once the uplink hash is known.
+    ///
+    /// A body of at most [`PART_SIZE`] bytes is still in the upload's buffer:
+    /// nothing has gone to S3 yet. It is put on the piece key directly, with
+    /// its metadata, in one request. The staging key is never written.
+    ///
+    /// A larger body already has parts on the staging key. That upload is
+    /// finished and [`Self::commit_staged_piece`] copies it.
+    pub async fn publish_staged(
+        &self,
+        mut staging: Upload,
+        stage_id: &str,
+        satellite_id: &str,
+        piece_id: &str,
+        meta: PieceMeta,
+    ) -> Result<()> {
+        if staging.upload_id.is_some() || staging.failed.is_some() {
+            staging.finish().await?;
+            return self
+                .commit_staged_piece(satellite_id, piece_id, stage_id, meta)
+                .await;
+        }
+        let mut upload = self.upload_piece(satellite_id, piece_id, meta)?;
+        upload.buf = std::mem::take(&mut staging.buf);
+        // No multipart upload was started, so there is nothing to abort.
+        drop(staging);
+        upload.finish().await
+    }
+
+    /// Deletes staging objects left by a process that died mid-upload.
+    ///
+    /// Only [`Self::startup`] calls this, before the node accepts an upload,
+    /// so no staging key is in use.
+    async fn sweep_staging(&self) -> Result<()> {
+        let prefix = format!("{}.s", list_prefix(&self.prefix));
+        let mut start_after: Option<String> = None;
+        loop {
+            let page = self.list_page(&prefix, start_after.as_deref()).await?;
+            for object in &page.objects {
+                // `{prefix}/.s{id}` is one segment. Leave anything below it.
+                let is_stage = object
+                    .key
+                    .strip_prefix(&prefix)
+                    .is_some_and(|rest| !rest.contains('/'));
+                if is_stage {
+                    delete_object(&self.client, &self.bucket, &object.key).await?;
+                }
+            }
+            if !page.truncated {
+                break;
+            }
+            let Some(last) = page.objects.last() else {
+                break;
+            };
+            if start_after.as_deref() == Some(last.key.as_str()) {
+                break;
+            }
+            start_after = Some(last.key.clone());
+        }
+        Ok(())
     }
 
     /// Copies a finished staging object onto the piece key, then deletes only

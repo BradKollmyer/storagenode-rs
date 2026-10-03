@@ -873,6 +873,83 @@ async fn unfinished_database_rebuilds_after_restart() {
     assert!(!download.restored_from_trash);
 }
 
+fn stage_object(s3: &TestS3, stage_id: &str) -> PathBuf {
+    s3.root
+        .path()
+        .join(BUCKET)
+        .join("pieces")
+        .join(format!(".s{stage_id}"))
+}
+
+async fn read_piece(s3: &TestS3, satellite: &str, piece: &str) -> Vec<u8> {
+    let mut body = s3
+        .store
+        .open_download(satellite, piece, None)
+        .await
+        .expect("open");
+    let mut got = Vec::new();
+    while let Some(chunk) = body.next().await.expect("chunk") {
+        got.extend_from_slice(&chunk);
+    }
+    got
+}
+
+#[tokio::test]
+async fn buffered_stage_is_published_without_a_staging_object() {
+    let s3 = TestS3::start().await;
+    let meta = piece_meta(None, 0x45);
+    let mut stage = s3.store.stage("stage-2").expect("stage");
+    let body = vec![7u8; PART_SIZE];
+    stage.write(&body).await.expect("buffer");
+    assert!(!stage_object(&s3, "stage-2").exists());
+    s3.store
+        .publish_staged(stage, "stage-2", "sat-s", "small", meta.clone())
+        .await
+        .expect("publish");
+    // One PutObject on the piece key. The staging key was never written.
+    assert!(!stage_object(&s3, "stage-2").exists());
+    assert_eq!(read_piece(&s3, "sat-s", "small").await, body);
+    let info = s3.store.info("sat-s", "small").expect("info").expect("row");
+    assert_eq!(info.state, PieceState::Live);
+    assert_eq!(info.size, body.len() as u64);
+    assert_eq!(info.hash, meta.hash);
+}
+
+#[tokio::test]
+async fn multipart_stage_is_copied_and_its_staging_object_deleted() {
+    let s3 = TestS3::start().await;
+    let meta = piece_meta(None, 0x46);
+    let mut stage = s3.store.stage("stage-3").expect("stage");
+    let body = vec![9u8; PART_SIZE + 1];
+    stage.write(&body[..PART_SIZE]).await.expect("first part");
+    stage.write(&body[PART_SIZE..]).await.expect("second part");
+    s3.store
+        .publish_staged(stage, "stage-3", "sat-s", "large", meta)
+        .await
+        .expect("publish");
+    assert!(!stage_object(&s3, "stage-3").exists());
+    assert_eq!(read_piece(&s3, "sat-s", "large").await, body);
+    let info = s3.store.info("sat-s", "large").expect("info").expect("row");
+    assert_eq!(info.size, body.len() as u64);
+}
+
+#[tokio::test]
+async fn startup_deletes_staging_objects_a_crash_left_behind() {
+    let s3 = TestS3::start().await;
+    s3.store
+        .put_piece("sat-s", "kept", b"piece", piece_meta(None, 0x47))
+        .await
+        .expect("put");
+    let mut stage = s3.store.stage("stage-4").expect("stage");
+    stage.write(b"orphan").await.expect("spill");
+    stage.finish().await.expect("finish spill");
+    assert!(stage_object(&s3, "stage-4").exists());
+
+    s3.store.startup().await.expect("startup");
+    assert!(!stage_object(&s3, "stage-4").exists());
+    assert_eq!(read_piece(&s3, "sat-s", "kept").await, b"piece");
+}
+
 #[tokio::test]
 async fn staged_upload_commits_the_piece_key_after_the_spill() {
     let s3 = TestS3::start().await;

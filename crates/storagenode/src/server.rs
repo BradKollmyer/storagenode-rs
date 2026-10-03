@@ -487,7 +487,8 @@ impl Node {
                 }
                 let (spill, _) = staging.as_mut().expect("staging was opened for this chunk");
                 // Hash and spill each chunk. The uplink hash arrives later, so
-                // this is not the piece key yet.
+                // this is not the piece key yet. Up to one part stays in
+                // memory and reaches S3 once, on the piece key.
                 hasher.update(&chunk.data);
                 spill.write(&chunk.data).await.map_err(store_err)?;
                 staged = next_len;
@@ -579,9 +580,8 @@ impl Node {
             let Some((staging, stage_id)) = staging else {
                 return Err(Fail::proto(RPC_INTERNAL, "missing staged piece"));
             };
-            staging.finish().await.map_err(store_err)?;
             self.store
-                .commit_staged_piece(&sat, &piece, &stage_id, meta)
+                .publish_staged(staging, &stage_id, &sat, &piece, meta)
                 .await
                 .map_err(store_err)?;
         }
