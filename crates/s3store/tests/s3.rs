@@ -516,6 +516,8 @@ fn piece_meta(expires: Option<SystemTime>, hash_byte: u8) -> PieceMeta {
         created: UNIX_EPOCH + Duration::from_secs(1_700_000_000),
         expires,
         order_limit: b"order-limit-bytes".to_vec(),
+        hash_signature: b"sig".to_vec(),
+        hash_timestamp: Some((1_700_000_000, 123_456_789)),
     }
 }
 
@@ -797,6 +799,8 @@ async fn rebuild_from_object_metadata() {
     assert_eq!(info.hash, [0xab; 32]);
     assert_eq!(info.algorithm, HashAlgorithm::Blake3);
     assert_eq!(info.order_limit, b"order-limit-bytes");
+    assert_eq!(info.hash_signature, b"sig");
+    assert_eq!(info.hash_timestamp, Some((1_700_000_000, 123_456_789)));
     assert_eq!(info.size, u64::try_from(body.len()).unwrap());
     assert_eq!(info.created, created);
     assert_eq!(info.expires, Some(expires));
@@ -867,4 +871,31 @@ async fn unfinished_database_rebuilds_after_restart() {
     let download = store.download("sat-i", "piece", None).await.expect("bytes");
     assert_eq!(download.bytes, body);
     assert!(!download.restored_from_trash);
+}
+
+#[tokio::test]
+async fn staged_upload_commits_the_piece_key_after_the_spill() {
+    let s3 = TestS3::start().await;
+    let meta = piece_meta(None, 0x44);
+    let mut stage = s3.store.stage("stage-1").expect("stage");
+    let body = b"streamed-piece-bytes";
+    stage.write(body).await.expect("spill");
+    stage.finish().await.expect("finish spill");
+    s3.store
+        .commit_staged_piece("sat-s", "piece", "stage-1", meta.clone())
+        .await
+        .expect("commit");
+    let mut body_stream = s3
+        .store
+        .open_download("sat-s", "piece", None)
+        .await
+        .expect("open");
+    let mut got = Vec::new();
+    while let Some(chunk) = body_stream.next().await.expect("chunk") {
+        got.extend_from_slice(&chunk);
+    }
+    assert_eq!(got, body);
+    let info = s3.store.info("sat-s", "piece").expect("info").expect("row");
+    assert_eq!(info.hash_signature, meta.hash_signature);
+    assert_eq!(info.hash_timestamp, meta.hash_timestamp);
 }

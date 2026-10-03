@@ -27,6 +27,9 @@ CREATE TABLE IF NOT EXISTS pieces (
     piece_hash BLOB NOT NULL,
     hash_algorithm TEXT NOT NULL,
     order_limit BLOB NOT NULL,
+    hash_signature BLOB NOT NULL,
+    hash_ts_seconds INTEGER,
+    hash_ts_nanos INTEGER,
     created_at INTEGER NOT NULL,
     expires_at INTEGER,
     trashed_at INTEGER,
@@ -110,6 +113,13 @@ pub struct PieceMeta {
     pub expires: Option<SystemTime>,
     /// Encoded order limit (the bytes that are base64 on the object).
     pub order_limit: Vec<u8>,
+    /// Uplink `PieceHash` signature. Repair reads this back unchanged.
+    pub hash_signature: Vec<u8>,
+    /// Original protobuf timestamp (`seconds`, `nanos`), not [`Self::created`].
+    ///
+    /// `None` when the uplink hash omitted the field. Milliseconds in
+    /// `created` are not this value.
+    pub hash_timestamp: Option<(i64, i32)>,
 }
 
 /// One index row.
@@ -127,6 +137,10 @@ pub struct PieceInfo {
     pub algorithm: HashAlgorithm,
     /// Encoded order limit.
     pub order_limit: Vec<u8>,
+    /// Uplink `PieceHash` signature.
+    pub hash_signature: Vec<u8>,
+    /// Original protobuf timestamp (`seconds`, `nanos`).
+    pub hash_timestamp: Option<(i64, i32)>,
     /// Creation time, truncated to milliseconds.
     pub created: SystemTime,
     /// Expiry, truncated to milliseconds.
@@ -152,6 +166,8 @@ impl PieceInfo {
             hash: meta.hash,
             algorithm: meta.algorithm,
             order_limit: meta.order_limit.clone(),
+            hash_signature: meta.hash_signature.clone(),
+            hash_timestamp: meta.hash_timestamp,
             created: meta.created,
             expires: meta.expires,
             trashed_at: None,
@@ -199,6 +215,9 @@ impl Index {
         conn.busy_timeout(Duration::from_millis(250))
             .map_err(db_err)?;
         conn.execute_batch(SCHEMA).map_err(db_err)?;
+        // A database created before the hash signature columns still opens.
+        // New files already have the columns from SCHEMA.
+        migrate(&conn).map_err(db_err)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -230,13 +249,17 @@ impl Index {
             conn.execute(
                 "INSERT INTO pieces (
                     satellite, piece_id, size, piece_hash, hash_algorithm, order_limit,
+                    hash_signature, hash_ts_seconds, hash_ts_nanos,
                     created_at, expires_at, trashed_at, state
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
                 ON CONFLICT(satellite, piece_id) DO UPDATE SET
                     size = excluded.size,
                     piece_hash = excluded.piece_hash,
                     hash_algorithm = excluded.hash_algorithm,
                     order_limit = excluded.order_limit,
+                    hash_signature = excluded.hash_signature,
+                    hash_ts_seconds = excluded.hash_ts_seconds,
+                    hash_ts_nanos = excluded.hash_ts_nanos,
                     created_at = excluded.created_at,
                     expires_at = excluded.expires_at,
                     trashed_at = excluded.trashed_at,
@@ -248,6 +271,9 @@ impl Index {
                     info.hash.as_slice(),
                     info.algorithm.as_str(),
                     info.order_limit,
+                    info.hash_signature,
+                    info.hash_timestamp.map(|stamp| stamp.0),
+                    info.hash_timestamp.map(|stamp| stamp.1),
                     created,
                     expires,
                     trashed,
@@ -286,6 +312,7 @@ impl Index {
         let raw = self.with(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT size, piece_hash, hash_algorithm, order_limit,
+                        hash_signature, hash_ts_seconds, hash_ts_nanos,
                         created_at, expires_at, trashed_at, state
                  FROM pieces WHERE satellite = ?1 AND piece_id = ?2",
             )?;
@@ -295,10 +322,13 @@ impl Index {
                     hash: row.get(1)?,
                     algorithm: row.get(2)?,
                     order_limit: row.get(3)?,
-                    created_at: row.get(4)?,
-                    expires_at: row.get(5)?,
-                    trashed_at: row.get(6)?,
-                    state: row.get(7)?,
+                    hash_signature: row.get(4)?,
+                    hash_ts_seconds: row.get(5)?,
+                    hash_ts_nanos: row.get(6)?,
+                    created_at: row.get(7)?,
+                    expires_at: row.get(8)?,
+                    trashed_at: row.get(9)?,
+                    state: row.get(10)?,
                 })
             })
             .optional()
@@ -456,6 +486,9 @@ struct RawRow {
     hash: Vec<u8>,
     algorithm: String,
     order_limit: Vec<u8>,
+    hash_signature: Vec<u8>,
+    hash_ts_seconds: Option<i64>,
+    hash_ts_nanos: Option<i32>,
     created_at: i64,
     expires_at: Option<i64>,
     trashed_at: Option<i64>,
@@ -472,6 +505,15 @@ impl RawRow {
             .map_err(|_| Error::Index("piece hash is not 32 bytes".into()))?;
         let algorithm = HashAlgorithm::parse(&self.algorithm)
             .ok_or_else(|| Error::Index(format!("unknown hash algorithm {}", self.algorithm)))?;
+        let hash_timestamp = match (self.hash_ts_seconds, self.hash_ts_nanos) {
+            (None, None) => None,
+            (Some(seconds), Some(nanos)) => Some((seconds, nanos)),
+            _ => {
+                return Err(Error::Index(
+                    "piece hash timestamp is missing seconds or nanos".into(),
+                ));
+            }
+        };
         Ok(PieceInfo {
             satellite_id: satellite_id.to_owned(),
             piece_id: piece_id.to_owned(),
@@ -479,6 +521,8 @@ impl RawRow {
             hash,
             algorithm,
             order_limit: self.order_limit,
+            hash_signature: self.hash_signature,
+            hash_timestamp,
             created: millis_to_system(self.created_at)?,
             expires: self.expires_at.map(millis_to_system).transpose()?,
             trashed_at: self.trashed_at.map(millis_to_system).transpose()?,
@@ -489,6 +533,27 @@ impl RawRow {
 
 fn db_err(err: rusqlite::Error) -> Error {
     Error::Index(err.to_string())
+}
+
+/// Adds the uplink-hash columns when `pieces.db` predates them.
+fn migrate(conn: &Connection) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(pieces)")?;
+    let names = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if !names.iter().any(|name| name == "hash_signature") {
+        conn.execute(
+            "ALTER TABLE pieces ADD COLUMN hash_signature BLOB NOT NULL DEFAULT X''",
+            [],
+        )?;
+    }
+    if !names.iter().any(|name| name == "hash_ts_seconds") {
+        conn.execute("ALTER TABLE pieces ADD COLUMN hash_ts_seconds INTEGER", [])?;
+    }
+    if !names.iter().any(|name| name == "hash_ts_nanos") {
+        conn.execute("ALTER TABLE pieces ADD COLUMN hash_ts_nanos INTEGER", [])?;
+    }
+    Ok(())
 }
 
 pub(crate) fn system_to_millis(time: SystemTime) -> Result<i64> {
@@ -532,6 +597,8 @@ mod tests {
             created: UNIX_EPOCH + Duration::from_secs(1_700_000_000),
             expires,
             order_limit: b"limit".to_vec(),
+            hash_signature: b"sig".to_vec(),
+            hash_timestamp: Some((1_700_000_000, 123_456_789)),
         }
     }
 
@@ -556,6 +623,8 @@ mod tests {
         assert_eq!(got.created, created);
         assert_eq!(got.hash, [0x11; 32]);
         assert_eq!(got.order_limit, b"limit");
+        assert_eq!(got.hash_signature, b"sig");
+        assert_eq!(got.hash_timestamp, Some((1_700_000_000, 123_456_789)));
         assert_eq!(index.sums().unwrap(), (10, 0));
 
         let trashed = created + Duration::from_secs(50);

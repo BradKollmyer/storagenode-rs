@@ -8,11 +8,12 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use prost::Message;
-use s3store::{HashAlgorithm, PieceMeta, PieceState, Store};
+use s3store::{HashAlgorithm, PieceBody, PieceMeta, PieceState, Store, Upload};
 use storj_proto::orders::{Order, OrderLimit, PieceAction, PieceHash};
 use storj_proto::piecestore::{
     ExistsRequest, ExistsResponse, PieceDownloadRequest, PieceDownloadResponse, PieceUploadRequest,
@@ -22,8 +23,8 @@ use storj_proto::rpc::{PIECESTORE_DOWNLOAD, PIECESTORE_UPLOAD};
 use storj_rpc::frame::{Kind, Packet};
 use storj_rpc::{Conn, DRPC_TLS_MUX_PREFIX, Identity, NodeId, marshal_error};
 use storj_uplink::{
-    PieceHashAlgo, PieceHasher, PiecePublicKey, sign_piece_hash_node, verify_order,
-    verify_order_limit, verify_piece_hash_uplink,
+    PieceHashAlgo, PiecePublicKey, sign_piece_hash_node, verify_order, verify_order_limit,
+    verify_piece_hash_uplink,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
@@ -33,8 +34,8 @@ use tokio::net::{TcpListener, TcpStream};
 /// `storj-proto` exports upload and download only.
 pub const PIECESTORE_EXISTS: &str = "/piecestore.Piecestore/Exists";
 
-/// Order limits whose creation time is further than this from now are rejected.
-/// The same window is the grace after piece and order expiration.
+/// Order creation further than this from now is rejected (`OrderLimitGracePeriod`).
+/// Piece expiration and order expiration compare the timestamp to now.
 const ORDER_LIMIT_GRACE: Duration = Duration::from_secs(60 * 60);
 
 /// Unix seconds of Go's zero `time.Time` (year 1). Unset on the wire.
@@ -50,21 +51,34 @@ const RPC_UNAUTHENTICATED: u64 = 16;
 
 /// A satellite whose order limits this node will accept.
 ///
-/// `leaf_der` is the certificate that signed the limit. An empty leaf means
-/// the id is trusted (Exists) but signatures cannot be checked yet.
+/// `leaf_der` is the certificate that signed the limit. `ca_der` is the CA
+/// whose hash is `id`. A node URL does not carry either certificate.
 #[derive(Clone, Debug)]
 pub struct TrustedSatellite {
-    /// Satellite node id.
+    /// Satellite node id. Must equal the node id of [`Self::ca_der`].
     pub id: NodeId,
-    /// Leaf certificate DER, or empty when the certificate has not been seen.
+    /// Leaf certificate DER passed to `verify_order_limit`.
     pub leaf_der: Vec<u8>,
+    /// CA certificate DER.
+    pub ca_der: Vec<u8>,
+}
+
+/// `Node::new` could not build the TLS acceptor or accept a satellite chain.
+#[derive(Debug, thiserror::Error)]
+pub enum BuildError {
+    /// The storage node identity could not build a server config.
+    #[error(transparent)]
+    Tls(#[from] storj_rpc::IdentityError),
+    /// The leaf was empty, was the CA, or the CA hashed to a different id.
+    #[error("{0}")]
+    Satellite(String),
 }
 
 /// TLS piecestore server bound to one identity and one bucket.
 pub struct Node {
     identity: Identity,
     store: Store,
-    /// Satellite id to leaf certificate. Empty leaf: id only.
+    /// Satellite id to the leaf that verifies order limits.
     satellites: HashMap<NodeId, Vec<u8>>,
     /// Replay window. In memory until orders are persisted.
     serials: Mutex<HashMap<(NodeId, Vec<u8>), SystemTime>>,
@@ -77,11 +91,12 @@ impl Node {
         identity: Identity,
         store: Store,
         trusted: Vec<TrustedSatellite>,
-    ) -> Result<Self, storj_rpc::IdentityError> {
+    ) -> Result<Self, BuildError> {
         let config: rustls::ServerConfig = storj_rpc::server_config(&identity)?;
         let mut satellites = HashMap::with_capacity(trusted.len());
         for satellite in trusted {
-            satellites.insert(satellite.id, satellite.leaf_der);
+            let leaf = verified_leaf(&satellite)?;
+            satellites.insert(satellite.id, leaf);
         }
         Ok(Self {
             identity,
@@ -174,7 +189,8 @@ impl Node {
         let mut limit: Option<OrderLimit> = None;
         let mut algo = PieceHashAlgo::Sha256;
         let mut hasher = PieceHashAlgo::Sha256.hasher();
-        let mut body = Vec::new();
+        let mut staging: Option<(Upload, String)> = None;
+        let mut staged: i64 = 0;
         let mut authorized: i64 = 0;
 
         loop {
@@ -212,7 +228,18 @@ impl Node {
                 authorized = check_order(limit_ref, order, authorized)?;
             }
             if let Some(chunk) = req.chunk.as_ref() {
-                accept_chunk(&mut body, &mut hasher, limit_ref.limit, authorized, chunk)?;
+                let next_len = check_chunk(staged, limit_ref.limit, authorized, chunk)?;
+                if staging.is_none() {
+                    let id = next_stage_id();
+                    let upload = self.store.stage(&id).map_err(store_err)?;
+                    staging = Some((upload, id));
+                }
+                let (spill, _) = staging.as_mut().expect("staging was opened for this chunk");
+                // Hash and spill each chunk. The uplink hash arrives later, so
+                // this is not the piece key yet.
+                hasher.update(&chunk.data);
+                spill.write(&chunk.data).await.map_err(store_err)?;
+                staged = next_len;
             }
             if let Some(done) = req.done {
                 let Some(limit) = limit.take() else {
@@ -220,7 +247,7 @@ impl Node {
                 };
                 let digest = hasher.finalize();
                 return self
-                    .commit_upload(out, &limit, algo, &body, &digest, &done)
+                    .commit_upload(out, &limit, algo, (staging, staged), &digest, &done)
                     .await;
             }
         }
@@ -231,7 +258,7 @@ impl Node {
         out: &mut Out<T>,
         limit: &OrderLimit,
         algo: PieceHashAlgo,
-        body: &[u8],
+        spill: (Option<(Upload, String)>, i64),
         digest: &[u8],
         done: &PieceHash,
     ) -> Result<(), Fail>
@@ -244,9 +271,8 @@ impl Node {
         if done.hash_algorithm != algo.to_i32() {
             return Err(Fail::proto(RPC_INVALID_ARGUMENT, "hash algorithm mismatch"));
         }
-        let piece_size = i64::try_from(body.len())
-            .map_err(|_| Fail::proto(RPC_INVALID_ARGUMENT, "piece too large"))?;
-        if done.piece_size != piece_size {
+        let (staging, staged) = spill;
+        if done.piece_size != staged {
             return Err(Fail::proto(RPC_INVALID_ARGUMENT, "piece size mismatch"));
         }
         if done.hash.as_slice() != digest {
@@ -259,12 +285,21 @@ impl Node {
         if digest.len() != 32 {
             return Err(Fail::proto(RPC_INTERNAL, "piece hash is not 32 bytes"));
         }
+        if done.signature.is_empty() {
+            return Err(Fail::proto(
+                RPC_UNAUTHENTICATED,
+                "invalid piece hash signature",
+            ));
+        }
         let mut hash = [0u8; 32];
         hash.copy_from_slice(digest);
 
         let satellite_id = parse_node_id(&limit.satellite_id)?;
-        // The hash is part of the object metadata, and the uplink sends it
-        // only in the final message, so the body cannot be committed earlier.
+        let sat = satellite_id.to_string();
+        let piece = encode_hex(&limit.piece_id);
+        // Metadata, including the hash, is fixed when the piece object is
+        // created. The spill has no piece metadata. Publish the piece key
+        // only after the uplink hash verifies.
         let meta = PieceMeta {
             hash,
             algorithm: store_algo(algo),
@@ -278,16 +313,29 @@ impl Node {
                 .as_ref()
                 .and_then(timestamp_to_system),
             order_limit: limit.encode_to_vec(),
+            hash_signature: done.signature.clone(),
+            hash_timestamp: done
+                .timestamp
+                .as_ref()
+                .map(|stamp| (stamp.seconds, stamp.nanos)),
         };
-        self.store
-            .put_piece(
-                &satellite_id.to_string(),
-                &encode_hex(&limit.piece_id),
-                body,
-                meta,
-            )
-            .await
-            .map_err(store_err)?;
+        if staged == 0 {
+            let upload = self
+                .store
+                .upload_piece(&sat, &piece, meta)
+                .map_err(store_err)?;
+            upload.finish().await.map_err(store_err)?;
+        } else {
+            let Some((staging, stage_id)) = staging else {
+                return Err(Fail::proto(RPC_INTERNAL, "missing staged piece"));
+            };
+            staging.finish().await.map_err(store_err)?;
+            self.store
+                .commit_staged_piece(&sat, &piece, &stage_id, meta)
+                .await
+                .map_err(store_err)?;
+        }
+        let piece_size = staged;
 
         let mut sn_hash = PieceHash {
             piece_id: limit.piece_id.clone(),
@@ -383,19 +431,17 @@ impl Node {
             ));
         }
         let restored = info.state == PieceState::Trash;
-        let bytes = if size == 0 {
-            Vec::new()
+        let mut body = if size == 0 {
+            None
         } else {
-            let download = self
-                .store
-                .download(&sat, &piece, Some(offset..end))
-                .await
-                .map_err(store_err)?;
-            if download.bytes.len() != usize::try_from(size).unwrap_or(usize::MAX) {
-                return Err(Fail::proto(RPC_INTERNAL, "short piece read"));
-            }
-            download.bytes
+            Some(
+                self.store
+                    .open_download(&sat, &piece, Some(offset..end))
+                    .await
+                    .map_err(store_err)?,
+            )
         };
+        let mut pending = Vec::new();
 
         // GET and GET_AUDIT do not send the hash. GET_REPAIR does, before bytes.
         if limit.action == PieceAction::GetRepair as i32 {
@@ -406,8 +452,10 @@ impl Node {
                     piece_id: limit.piece_id.clone(),
                     hash: info.hash.to_vec(),
                     piece_size: i64::try_from(info.size).unwrap_or(i64::MAX),
-                    timestamp: Some(system_to_timestamp(info.created)),
-                    signature: Vec::new(),
+                    timestamp: info
+                        .hash_timestamp
+                        .map(|(seconds, nanos)| prost_types::Timestamp { seconds, nanos }),
+                    signature: info.hash_signature.clone(),
                     hash_algorithm: algo_i32(info.algorithm),
                 }),
                 limit: Some(stored_limit),
@@ -426,9 +474,9 @@ impl Node {
         // The uplink sends the next order only after it has read part of what
         // was already authorized. Do not send past that, or both sides wait.
         let chunk_size = chunk_limit(advisory);
-        let mut sent: usize = 0;
+        let mut sent: u64 = 0;
         let mut file_off = offset;
-        while sent < bytes.len() {
+        while sent < size {
             let sent_i =
                 i64::try_from(sent).map_err(|_| Fail::proto(RPC_INTERNAL, "offset overflow"))?;
             if sent_i >= authorized {
@@ -445,10 +493,13 @@ impl Node {
                 }
                 continue;
             }
-            let room = usize::try_from(authorized - sent_i)
+            let room = u64::try_from(authorized - sent_i)
                 .map_err(|_| Fail::proto(RPC_INTERNAL, "offset overflow"))?;
-            let n = room.min(bytes.len() - sent).min(chunk_size);
-            let data = bytes[sent..sent + n].to_vec();
+            let n = room.min(size - sent).min(chunk_size as u64);
+            let reader = body
+                .as_mut()
+                .ok_or_else(|| Fail::proto(RPC_INTERNAL, "missing piece body"))?;
+            let data = read_piece(reader, &mut pending, n).await?;
             let response = PieceDownloadResponse {
                 chunk: Some(piece_download_response::Chunk {
                     offset: i64::try_from(file_off)
@@ -459,7 +510,7 @@ impl Node {
             };
             out.message(&response.encode_to_vec()).await?;
             sent += n;
-            file_off += u64::try_from(n).unwrap_or(0);
+            file_off += n;
         }
         out.close().await?;
         Ok(())
@@ -700,6 +751,11 @@ impl From<storj_rpc::Error> for Fail {
     }
 }
 
+fn next_stage_id() -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    format!("{:016x}", NEXT.fetch_add(1, Ordering::Relaxed))
+}
+
 fn store_err(err: s3store::Error) -> Fail {
     match err {
         s3store::Error::NotFound => Fail::proto(RPC_NOT_FOUND, "piece not found"),
@@ -750,18 +806,15 @@ fn check_order(limit: &OrderLimit, order: &Order, previous: i64) -> Result<i64, 
     Ok(order.amount)
 }
 
-fn accept_chunk(
-    body: &mut Vec<u8>,
-    hasher: &mut PieceHasher,
+fn check_chunk(
+    have: i64,
     limit_bytes: i64,
     authorized: i64,
     chunk: &piece_upload_request::Chunk,
-) -> Result<(), Fail> {
+) -> Result<i64, Fail> {
     if chunk.offset < 0 {
         return Err(Fail::proto(RPC_INVALID_ARGUMENT, "negative chunk offset"));
     }
-    let have = i64::try_from(body.len())
-        .map_err(|_| Fail::proto(RPC_INVALID_ARGUMENT, "piece too large"))?;
     if chunk.offset != have {
         return Err(Fail::proto(RPC_INVALID_ARGUMENT, "chunk out of order"));
     }
@@ -782,9 +835,51 @@ fn accept_chunk(
             "not enough allocated for the chunk",
         ));
     }
-    hasher.update(&chunk.data);
-    body.extend_from_slice(&chunk.data);
-    Ok(())
+    Ok(new_len)
+}
+
+/// Reads `n` bytes from the object stream. `pending` is only the unread tail
+/// of the last store chunk, not the piece.
+async fn read_piece(body: &mut PieceBody, pending: &mut Vec<u8>, n: u64) -> Result<Vec<u8>, Fail> {
+    let n = usize::try_from(n).map_err(|_| Fail::proto(RPC_INTERNAL, "offset overflow"))?;
+    while pending.len() < n {
+        match body.next().await.map_err(store_err)? {
+            Some(chunk) if !chunk.is_empty() => pending.extend_from_slice(&chunk),
+            Some(_) => {}
+            None => break,
+        }
+    }
+    if pending.len() < n {
+        return Err(Fail::proto(RPC_INTERNAL, "short piece read"));
+    }
+    Ok(pending.drain(..n).collect())
+}
+
+/// The leaf `verify_order_limit` uses, after the CA hashes to the trusted id.
+fn verified_leaf(satellite: &TrustedSatellite) -> Result<Vec<u8>, BuildError> {
+    if satellite.leaf_der.is_empty() || satellite.ca_der.is_empty() {
+        return Err(BuildError::Satellite(format!(
+            "satellite {} certificate is not known",
+            satellite.id
+        )));
+    }
+    let ca_id = NodeId::from_certificate_der(&satellite.ca_der)
+        .map_err(|err| BuildError::Satellite(format!("satellite {} CA: {err}", satellite.id)))?;
+    if ca_id != satellite.id {
+        return Err(BuildError::Satellite(format!(
+            "satellite {} CA does not hash to the trusted node id",
+            satellite.id
+        )));
+    }
+    let leaf_id = NodeId::from_certificate_der(&satellite.leaf_der)
+        .map_err(|err| BuildError::Satellite(format!("satellite {} leaf: {err}", satellite.id)))?;
+    if leaf_id == ca_id {
+        return Err(BuildError::Satellite(format!(
+            "satellite {} leaf is the CA, not the signing certificate",
+            satellite.id
+        )));
+    }
+    Ok(satellite.leaf_der.clone())
 }
 
 /// Go uses 1 MiB unless the uplink asked for a size strictly between 1 KiB and 1 MiB.
@@ -846,10 +941,8 @@ fn expired(ts: Option<&prost_types::Timestamp>, now: SystemTime) -> bool {
         return false;
     }
     match timestamp_to_system(ts) {
-        Some(time) => time
-            .checked_add(ORDER_LIMIT_GRACE)
-            .map(|deadline| deadline < now)
-            .unwrap_or(true),
+        // Equal to now is still valid. There is no expiration grace.
+        Some(time) => time < now,
         None => true,
     }
 }
@@ -869,12 +962,11 @@ fn creation_ok(ts: Option<&prost_types::Timestamp>, now: SystemTime) -> bool {
 }
 
 fn serial_deadline(limit: &OrderLimit, now: SystemTime) -> SystemTime {
-    let base = limit
+    limit
         .order_expiration
         .as_ref()
         .and_then(timestamp_to_system)
-        .unwrap_or(now);
-    base.checked_add(ORDER_LIMIT_GRACE).unwrap_or(base)
+        .unwrap_or(now)
 }
 
 #[cfg(test)]
@@ -1012,6 +1104,7 @@ mod tests {
                 .map(|sat| TrustedSatellite {
                     id: sat.node_id(),
                     leaf_der: sat.leaf_der().as_ref().to_vec(),
+                    ca_der: sat.ca_der().as_ref().to_vec(),
                 })
                 .collect();
             let node = Arc::new(Node::new(identity.clone(), bucket.store, trusted).expect("node"));
@@ -1129,7 +1222,7 @@ mod tests {
     }
 
     #[test]
-    fn order_creation_grace_is_one_hour_both_ways() {
+    fn order_creation_grace_is_one_hour_and_expiration_has_none() {
         let now = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         let at = |delta: Duration, future: bool| {
             let time = if future {
@@ -1160,14 +1253,45 @@ mod tests {
         assert!(!creation_ok(Some(&zero), now));
         assert!(!expired(Some(&zero), now));
         assert!(!expired(None, now));
-        assert!(!expired(
-            Some(&at(Duration::from_secs(30 * 60), false)),
-            now
-        ));
-        assert!(expired(
-            Some(&at(Duration::from_secs(60 * 60 + 5), false)),
-            now
-        ));
+        assert!(!expired(Some(&at(Duration::from_secs(0), true)), now));
+        assert!(!expired(Some(&at(Duration::from_secs(1), true)), now));
+        assert!(expired(Some(&at(Duration::from_secs(1), false)), now));
+        let bad = prost_types::Timestamp {
+            seconds: 1_700_000_000,
+            nanos: 1_000_000_000,
+        };
+        assert!(expired(Some(&bad), now));
+    }
+
+    #[tokio::test]
+    async fn stage_with_a_real_node_id() {
+        let satellite = Identity::generate().unwrap();
+        let harness = Harness::start(std::slice::from_ref(&satellite)).await;
+        let piece = "11".repeat(32);
+        let stage_id = "ab".repeat(8);
+        let mut upload = harness.node.store.stage(&stage_id).expect("stage");
+        upload.write(b"hello-piece").await.expect("write");
+        upload.finish().await.expect("finish");
+        let meta = s3store::PieceMeta {
+            hash: [0x11; 32],
+            algorithm: HashAlgorithm::Sha256,
+            created: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+            expires: None,
+            order_limit: vec![1, 2, 3, 255],
+            hash_signature: vec![0x30, 0x44, 0xff, b'+', b'/'],
+            hash_timestamp: Some((1_700_000_000, 123_456_789)),
+        };
+        let sat = satellite.node_id().to_string();
+        harness
+            .node
+            .store
+            .commit_staged_piece(&sat, &piece, &stage_id, meta.clone())
+            .await
+            .expect("commit");
+        let info = harness.node.store.info(&sat, &piece).unwrap().expect("row");
+        assert_eq!(info.size, b"hello-piece".len() as u64);
+        assert_eq!(info.hash_signature, meta.hash_signature);
+        assert_eq!(info.hash_timestamp, meta.hash_timestamp);
     }
 
     #[tokio::test]
@@ -1278,6 +1402,15 @@ mod tests {
         assert_eq!(hash.hash, uploaded.hash);
         assert_eq!(hash.piece_size, body.len() as i64);
         assert_eq!(hash.hash_algorithm, PieceHashAlgo::Sha256.to_i32());
+        assert_eq!(hash.timestamp, put.order_creation);
+        assert!(!hash.signature.is_empty());
+        storj_uplink::verify_piece_hash_uplink(&hash, &piece_key.public()).expect("uplink hash");
+        assert_eq!(info.hash_signature, hash.signature);
+        let (seconds, nanos) = info.hash_timestamp.expect("stored timestamp");
+        assert_eq!(
+            hash.timestamp,
+            Some(prost_types::Timestamp { seconds, nanos })
+        );
         let limit = header.limit.expect("repair limit");
         assert_eq!(limit.serial_number, put.serial_number);
         assert_eq!(limit.piece_id, piece_id);
@@ -1556,6 +1689,38 @@ mod tests {
         assert_eq!(n, 0);
     }
 
+    #[test]
+    fn satellite_leaf_must_be_the_certificate_whose_ca_matches() {
+        let sat = Identity::generate().unwrap();
+        let other = Identity::generate().unwrap();
+        let ok = TrustedSatellite {
+            id: sat.node_id(),
+            leaf_der: sat.leaf_der().as_ref().to_vec(),
+            ca_der: sat.ca_der().as_ref().to_vec(),
+        };
+        assert_eq!(super::verified_leaf(&ok).unwrap(), sat.leaf_der().as_ref());
+        let empty = TrustedSatellite {
+            id: sat.node_id(),
+            leaf_der: Vec::new(),
+            ca_der: sat.ca_der().as_ref().to_vec(),
+        };
+        assert!(super::verified_leaf(&empty).is_err());
+        let mismatch = TrustedSatellite {
+            id: sat.node_id(),
+            leaf_der: sat.leaf_der().as_ref().to_vec(),
+            ca_der: other.ca_der().as_ref().to_vec(),
+        };
+        let err = super::verified_leaf(&mismatch).unwrap_err();
+        assert!(err.to_string().contains("does not hash"), "{err}");
+        let ca_as_leaf = TrustedSatellite {
+            id: sat.node_id(),
+            leaf_der: sat.ca_der().as_ref().to_vec(),
+            ca_der: sat.ca_der().as_ref().to_vec(),
+        };
+        let err = super::verified_leaf(&ca_as_leaf).unwrap_err();
+        assert!(err.to_string().contains("leaf is the CA"), "{err}");
+    }
+
     #[tokio::test]
     async fn head_bucket_failure_is_returned() {
         let root = TempRoot::new();
@@ -1578,6 +1743,57 @@ mod tests {
             Ok(Err(err)) => assert!(matches!(err, crate::Error::Store(_)), "{err}"),
             Ok(Ok(_)) => panic!("head bucket succeeded"),
             Err(_) => panic!("head bucket should fail without hanging"),
+        }
+    }
+
+    #[tokio::test]
+    async fn start_refuses_a_satellite_without_a_leaf() {
+        let root = TempRoot::new();
+        let satellite = Identity::generate().unwrap();
+        let config = node_config(&root, satellite.node_id());
+        match crate::start(&config).await {
+            Err(err) => {
+                assert!(matches!(err, crate::Error::Satellite(_)), "{err}");
+                assert!(err.to_string().contains("missing certificate"), "{err}");
+            }
+            Ok(_) => panic!("start listened without a satellite leaf"),
+        }
+    }
+
+    #[tokio::test]
+    async fn start_accepts_a_leaf_whose_ca_matches_then_checks_the_bucket() {
+        let root = TempRoot::new();
+        let satellite = Identity::generate().unwrap();
+        let dir = root.path().join("volume").join("satellites");
+        std::fs::create_dir_all(&dir).unwrap();
+        let pem = crate::identity::certificate_chain_pem(&satellite);
+        std::fs::write(dir.join(format!("{}.pem", satellite.node_id())), pem).unwrap();
+        let config = node_config(&root, satellite.node_id());
+        match tokio::time::timeout(Duration::from_secs(20), crate::start(&config)).await {
+            Ok(Err(err)) => assert!(matches!(err, crate::Error::Store(_)), "{err}"),
+            Ok(Ok(_)) => panic!("head bucket succeeded"),
+            Err(_) => panic!("head bucket should fail without hanging"),
+        }
+    }
+
+    fn node_config(root: &TempRoot, satellite: storj_rpc::NodeId) -> Config {
+        Config {
+            s3: s3store::Config {
+                endpoint: "http://127.0.0.1:1".into(),
+                bucket: "missing".into(),
+                access_key_id: "ak".into(),
+                secret_access_key: "sk".into(),
+                volume: root.path().join("volume"),
+                ..s3store::Config::default()
+            },
+            operator_email: "op@example.com".into(),
+            operator_wallet: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            contact_external_address: "127.0.0.1:28967".into(),
+            satellites: vec![storj_rpc::NodeUrl {
+                id: satellite,
+                address: "127.0.0.1:7777".into(),
+            }],
+            listen: "127.0.0.1:0".parse().unwrap(),
         }
     }
 

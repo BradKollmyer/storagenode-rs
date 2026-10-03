@@ -6,6 +6,8 @@
 //! `x-amz-meta-` prefix. Piece metadata keys (the SDK adds `x-amz-meta-`):
 //! - `piece-hash` — hex
 //! - `hash-algorithm` — `sha256` or `blake3`
+//! - `hash-signature` — standard base64 of the uplink `PieceHash` signature
+//! - `hash-timestamp` — `{seconds}:{nanos}` of the original protobuf timestamp, or absent
 //! - `created` — RFC3339
 //! - `expires` — RFC3339, or absent
 //! - `order-limit` — standard base64 of the encoded order limit
@@ -123,6 +125,28 @@ impl fmt::Debug for Store {
             .field("prefix", &self.prefix)
             .field("allocated_bytes", &self.allocated_bytes)
             .finish_non_exhaustive()
+    }
+}
+
+/// A piece body read as it arrives. The range is not collected into one `Vec`.
+pub struct PieceBody {
+    restored_from_trash: bool,
+    body: ByteStream,
+}
+
+impl PieceBody {
+    /// The row was trash and the object is still in the bucket.
+    pub fn restored_from_trash(&self) -> bool {
+        self.restored_from_trash
+    }
+
+    /// The next chunk, or `Ok(None)` at the end of the object.
+    pub async fn next(&mut self) -> Result<Option<Vec<u8>>> {
+        match self.body.try_next().await {
+            Ok(Some(bytes)) => Ok(Some(bytes.to_vec())),
+            Ok(None) => Ok(None),
+            Err(err) => Err(Error::S3(err.to_string())),
+        }
     }
 }
 
@@ -335,28 +359,103 @@ impl Store {
                 restored_from_trash: restored,
             }),
             Err(Error::NotFound) => {
-                // `finish` holds `commit` across the put and the live upsert.
-                // Recheck the row and the object under that lock so this
-                // delete cannot remove a row a concurrent put just published.
-                // PieceInfo equality is not a generation: the same bytes
-                // compare equal, so the object must still be absent.
-                let _guard = self.commit.lock().await;
-                let still_same = self.index.get(satellite_id, piece_id)?.as_ref() == Some(&info);
-                // A head error is not absence. Return it and leave the row.
-                let absent = if still_same {
-                    match self.head(satellite_id, piece_id).await {
-                        Err(Error::NotFound) => true,
-                        Ok(_) => false,
-                        Err(err) => return Err(err),
-                    }
-                } else {
-                    false
-                };
-                if absent {
-                    self.index.delete(satellite_id, piece_id)?;
-                }
+                self.forget_if_still_absent(satellite_id, piece_id, &info)
+                    .await?;
                 Err(Error::NotFound)
             }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Opens a live or trashed piece without collecting the range first.
+    ///
+    /// A `writing` row and a missing row are [`Error::NotFound`]. The caller
+    /// reads [`PieceBody::next`] as bytes arrive.
+    pub async fn open_download(
+        &self,
+        satellite_id: &str,
+        piece_id: &str,
+        range: Option<std::ops::Range<u64>>,
+    ) -> Result<PieceBody> {
+        check_piece(satellite_id, piece_id)?;
+        let info = self
+            .index
+            .get(satellite_id, piece_id)?
+            .ok_or(Error::NotFound)?;
+        let restored = match info.state {
+            PieceState::Live => false,
+            PieceState::Trash => true,
+            PieceState::Writing => return Err(Error::NotFound),
+        };
+        let key = object_key(&self.prefix, satellite_id, piece_id)?;
+        match self.open_object(&key, range).await {
+            Ok(body) => Ok(PieceBody {
+                restored_from_trash: restored,
+                body,
+            }),
+            Err(Error::NotFound) => {
+                self.forget_if_still_absent(satellite_id, piece_id, &info)
+                    .await?;
+                Err(Error::NotFound)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Spill key for an upload whose hash is not known yet.
+    ///
+    /// The object is not an index row. [`Upload::finish`] writes it.
+    /// [`Self::commit_staged_piece`] copies it onto the piece key.
+    /// `stage_id` is one path segment. The object key stays short so the
+    /// metadata file name fits in `NAME_MAX`.
+    pub fn stage(&self, stage_id: &str) -> Result<Upload> {
+        let key = stage_key(&self.prefix, stage_id)?;
+        Ok(self.begin(key, None))
+    }
+
+    /// Copies a finished staging object onto the piece key, then deletes only
+    /// the staging key.
+    ///
+    /// Metadata is attached when the piece upload is created, which is after
+    /// the caller has the uplink hash. The copy uses [`Upload::write`]. It
+    /// does not build one `Vec` of the piece. The piece commit lock stays
+    /// inside [`Upload::finish`]. This function does not delete the piece key
+    /// and does not roll back the row after that lock is released.
+    pub async fn commit_staged_piece(
+        &self,
+        satellite_id: &str,
+        piece_id: &str,
+        stage_id: &str,
+        meta: PieceMeta,
+    ) -> Result<()> {
+        let stage_key = stage_key(&self.prefix, stage_id)?;
+        let copied = match self.upload_piece(satellite_id, piece_id, meta) {
+            Ok(mut upload) => match self.open_object(&stage_key, None).await {
+                Ok(mut body) => {
+                    let written = async {
+                        while let Some(chunk) = body
+                            .try_next()
+                            .await
+                            .map_err(|err| Error::S3(err.to_string()))?
+                        {
+                            upload.write(&chunk).await?;
+                        }
+                        upload.finish().await
+                    }
+                    .await;
+                    drop(body);
+                    written
+                }
+                Err(err) => Err(err),
+            },
+            Err(err) => Err(err),
+        };
+        // The staging key is not the piece. Dropping it does not touch the
+        // index. A failed `finish` already restored its own writing row
+        // while it held `commit`.
+        let dropped = delete_object(&self.client, &self.bucket, &stage_key).await;
+        match copied {
+            Ok(()) => dropped,
             Err(err) => Err(err),
         }
     }
@@ -442,7 +541,11 @@ impl Store {
         metadata: Option<HashMap<String, String>>,
     ) -> Result<Upload> {
         let key = object_key(&self.prefix, satellite_id, piece_id)?;
-        Ok(Upload {
+        Ok(self.begin(key, metadata))
+    }
+
+    fn begin(&self, key: String, metadata: Option<HashMap<String, String>>) -> Upload {
+        Upload {
             client: self.client.clone(),
             bucket: self.bucket.clone(),
             key,
@@ -455,7 +558,63 @@ impl Store {
             index: self.index.clone(),
             commit: Arc::clone(&self.commit),
             piece: None,
-        })
+        }
+    }
+
+    /// `finish` holds `commit` across the put and the live upsert. Recheck
+    /// under that lock so a missing object cannot drop a row a later put
+    /// just published. Always returns [`Error::NotFound`] when the head
+    /// succeeds or reports absence. A head error is returned instead.
+    async fn forget_if_still_absent(
+        &self,
+        satellite_id: &str,
+        piece_id: &str,
+        info: &PieceInfo,
+    ) -> Result<()> {
+        let _guard = self.commit.lock().await;
+        let still_same = self.index.get(satellite_id, piece_id)?.as_ref() == Some(info);
+        // A head error is not absence. Return it and leave the row.
+        let absent = if still_same {
+            match self.head(satellite_id, piece_id).await {
+                Err(Error::NotFound) => true,
+                Ok(_) => false,
+                Err(err) => return Err(err),
+            }
+        } else {
+            false
+        };
+        if absent {
+            self.index.delete(satellite_id, piece_id)?;
+        }
+        Err(Error::NotFound)
+    }
+
+    async fn open_object(
+        &self,
+        key: &str,
+        range: Option<std::ops::Range<u64>>,
+    ) -> Result<ByteStream> {
+        if let Some(range) = &range {
+            if range.start > range.end {
+                return Err(Error::Range {
+                    start: range.start,
+                    end: range.end,
+                });
+            }
+            if range.start == range.end {
+                // S3 has no empty byte range. One GetObject byte classifies a
+                // missing key, same as [`Store::get`].
+                self.probe_object(key, range.start).await?;
+                return Ok(ByteStream::from_static(b""));
+            }
+        }
+        let mut req = self.client.get_object().bucket(&self.bucket).key(key);
+        if let Some(range) = range {
+            let end_inclusive = range.end - 1;
+            req = req.range(format!("bytes={}-{}", range.start, end_inclusive));
+        }
+        let out = req.send().await.map_err(map_s3)?;
+        Ok(out.body)
     }
 
     /// Writes `body` and commits it, overwriting an existing object at the same key.
@@ -1076,12 +1235,22 @@ fn metadata_map(meta: &PieceMeta) -> Result<HashMap<String, String>> {
     if meta.order_limit.is_empty() {
         return Err(Error::Metadata("order limit is empty".into()));
     }
+    if meta.hash_signature.is_empty() {
+        return Err(Error::Metadata("hash signature is empty".into()));
+    }
     let mut map = HashMap::new();
     map.insert("piece-hash".to_owned(), encode_hex(&meta.hash));
     map.insert(
         "hash-algorithm".to_owned(),
         meta.algorithm.as_str().to_owned(),
     );
+    map.insert(
+        "hash-signature".to_owned(),
+        BASE64.encode(&meta.hash_signature),
+    );
+    if let Some((seconds, nanos)) = meta.hash_timestamp {
+        map.insert("hash-timestamp".to_owned(), format!("{seconds}:{nanos}"));
+    }
     map.insert("created".to_owned(), format_rfc3339(meta.created)?);
     if let Some(expires) = meta.expires {
         map.insert("expires".to_owned(), format_rfc3339(expires)?);
@@ -1116,6 +1285,14 @@ fn piece_from_metadata(
     if order_limit.is_empty() {
         return None;
     }
+    let hash_signature = BASE64.decode(meta.get("hash-signature")?).ok()?;
+    if hash_signature.is_empty() {
+        return None;
+    }
+    let hash_timestamp = match meta.get("hash-timestamp") {
+        None => None,
+        Some(value) => Some(parse_hash_timestamp(value)?),
+    };
     Some(PieceInfo {
         satellite_id: satellite_id.to_owned(),
         piece_id: piece_id.to_owned(),
@@ -1123,11 +1300,36 @@ fn piece_from_metadata(
         hash,
         algorithm,
         order_limit,
+        hash_signature,
+        hash_timestamp,
         created,
         expires,
         trashed_at: None,
         state: PieceState::Live,
     })
+}
+
+fn parse_hash_timestamp(value: &str) -> Option<(i64, i32)> {
+    let (seconds, nanos) = value.split_once(':')?;
+    Some((seconds.parse().ok()?, nanos.parse().ok()?))
+}
+
+fn stage_key(prefix: &str, stage_id: &str) -> Result<String> {
+    check_id("stage id", stage_id)?;
+    // One segment, and it starts with `.`, so rebuild's
+    // `{prefix}/{satellite}/{piece}` split skips it. The satellite id and
+    // the piece id stay off this key: s3s-fs base64-encodes the whole key
+    // into one metadata file name, and `NAME_MAX` is 255.
+    let prefix = prefix.trim_matches('/');
+    if prefix.is_empty() {
+        return Ok(format!(".s{stage_id}"));
+    }
+    for segment in prefix.split('/') {
+        if segment.is_empty() || segment == "." || segment == ".." {
+            return Err(Error::InvalidKey("prefix is not a safe path".into()));
+        }
+    }
+    Ok(format!("{prefix}/.s{stage_id}"))
 }
 
 fn format_rfc3339(time: SystemTime) -> Result<String> {
@@ -1421,6 +1623,8 @@ mod tests {
             created,
             expires: Some(expires),
             order_limit: b"order-limit-bytes".to_vec(),
+            hash_signature: b"uplink-sig".to_vec(),
+            hash_timestamp: Some((1_700_000_000, 123_456_789)),
         };
         let map = metadata_map(&meta).unwrap();
         let hash = "ab".repeat(32);
@@ -1449,6 +1653,12 @@ mod tests {
             index::system_to_millis(expires).unwrap()
         );
         assert_eq!(info.state, PieceState::Live);
+        assert_eq!(info.hash_signature, b"uplink-sig");
+        assert_eq!(info.hash_timestamp, Some((1_700_000_000, 123_456_789)));
+        let staged = stage_key("pieces", "abc").unwrap();
+        assert_eq!(staged, "pieces/.sabc");
+        assert!(split_object_key("pieces", &staged).is_none(), "{staged}");
+        assert_eq!(stage_key("", "abc").unwrap(), ".sabc");
 
         let mut bare = HashMap::new();
         bare.insert("note".to_owned(), "x".to_owned());
@@ -1474,6 +1684,14 @@ mod tests {
             created: UNIX_EPOCH + std::time::Duration::from_secs(10),
             expires: None,
             order_limit: Vec::new(),
+            hash_signature: b"sig".to_vec(),
+            hash_timestamp: None,
+        };
+        assert!(matches!(metadata_map(&meta), Err(Error::Metadata(_))));
+        let meta = PieceMeta {
+            order_limit: b"limit".to_vec(),
+            hash_signature: Vec::new(),
+            ..meta
         };
         assert!(matches!(metadata_map(&meta), Err(Error::Metadata(_))));
     }
