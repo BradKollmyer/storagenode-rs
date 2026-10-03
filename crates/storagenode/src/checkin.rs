@@ -166,6 +166,9 @@ async fn attempt(
         )
         .await
         .map_err(|err| err.to_string())?;
+        // TLS pinned this connection to the satellite's id, so this is its
+        // current leaf. Order limits are verified with it from now on.
+        node.observe_satellite_leaf(id, &transport.peer_cert);
         let mut conn = Conn::new(transport);
         let bytes = conn
             .invoke(CHECK_IN, &request)
@@ -492,11 +495,21 @@ mod tests {
         let seen = Arc::new(Mutex::new(None));
         let address = spawn_satellite(satellite.clone(), Arc::clone(&seen), true);
         let fixture = fixture(&satellite, &address);
+        // The node starts with a leaf the satellite no longer uses. The
+        // check-in dial sees the current one.
+        let stale = Identity::generate().unwrap();
+        fixture
+            .node
+            .observe_satellite_leaf(satellite.node_id(), stale.leaf_der().as_ref());
         check_in(&fixture.node, &operator(), Duration::from_secs(5))
             .await
             .expect("check-in");
         let seen = seen.lock().expect("seen").take().expect("request");
         assert_eq!(seen.path, CHECK_IN);
+        assert_eq!(
+            fixture.node.satellite_leaf(satellite.node_id()).unwrap(),
+            satellite.leaf_der().as_ref()
+        );
         let req = seen.request;
         assert_eq!(req.address, "203.0.113.9:28967");
         assert_eq!(req.features, 0);
