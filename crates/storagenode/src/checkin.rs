@@ -187,12 +187,7 @@ fn check_in_request(node: &Node, operator: &Operator, free_disk: i64) -> Result<
     )?;
     let message = crate::contact::CheckInRequest {
         address: operator.address.clone(),
-        version: Some(crate::node::NodeVersion {
-            version: env!("CARGO_PKG_VERSION").to_owned(),
-            commit_hash: String::new(),
-            timestamp: None,
-            release: false,
-        }),
+        version: Some(node_version()),
         capacity: Some(capacity(free_disk)),
         operator: Some(crate::node::NodeOperator {
             email: operator.email.clone(),
@@ -206,6 +201,26 @@ fn check_in_request(node: &Node, operator: &Operator, free_disk: i64) -> Result<
         signed_tags: None,
     };
     Ok(message.encode_to_vec())
+}
+
+/// The version a satellite stores for this node.
+///
+/// A satellite that sets a minimum version selects only nodes that report
+/// `release` and a version at or above it. `release` is true for a release
+/// build, as the Go release binaries report. The commit and its time come
+/// from the build script. The version number is this crate's own, not a Go
+/// node release number.
+fn node_version() -> crate::node::NodeVersion {
+    let commit_unix: i64 = env!("STORAGENODE_COMMIT_UNIX").parse().unwrap_or(0);
+    crate::node::NodeVersion {
+        version: env!("CARGO_PKG_VERSION").to_owned(),
+        commit_hash: env!("STORAGENODE_COMMIT").to_owned(),
+        timestamp: (commit_unix > 0).then_some(prost_types::Timestamp {
+            seconds: commit_unix,
+            nanos: 0,
+        }),
+        release: !cfg!(debug_assertions),
+    }
 }
 
 #[allow(deprecated)]
@@ -465,6 +480,10 @@ mod tests {
         assert!(req.signed_tags.is_none());
         let version = req.version.expect("version");
         assert_eq!(version.version, env!("CARGO_PKG_VERSION"));
+        // Tests are a debug build. A release build reports `release`.
+        assert_eq!(version.release, !cfg!(debug_assertions));
+        assert_eq!(version.commit_hash, env!("STORAGENODE_COMMIT"));
+        assert_eq!(version.commit_hash.is_empty(), version.timestamp.is_none());
         let operator = req.operator.expect("operator");
         assert_eq!(operator.email, "op@example.com");
         assert_eq!(

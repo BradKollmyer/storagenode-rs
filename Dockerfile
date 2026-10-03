@@ -23,7 +23,13 @@ COPY storagenode-rs/crates /src/storagenode-rs/crates
 COPY storagenode-rs/proto /src/storagenode-rs/proto
 COPY storagenode-rs/third_party /src/storagenode-rs/third_party
 WORKDIR /src/storagenode-rs
-RUN cargo build --locked --release -p storagenode
+# The image build has no .git. Pass the commit to report at check-in:
+# --build-arg STORAGENODE_COMMIT=$(git -C storagenode-rs rev-parse HEAD)
+# --build-arg STORAGENODE_COMMIT_UNIX=$(git -C storagenode-rs log -1 --format=%ct)
+ARG STORAGENODE_COMMIT=""
+ARG STORAGENODE_COMMIT_UNIX=""
+RUN STORAGENODE_COMMIT="$STORAGENODE_COMMIT" STORAGENODE_COMMIT_UNIX="$STORAGENODE_COMMIT_UNIX" \
+    cargo build --locked --release -p storagenode
 
 FROM debian:bookworm-slim
 
