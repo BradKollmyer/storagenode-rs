@@ -756,25 +756,33 @@ impl Upload {
     /// when the process dies in that window. The object is then not served.
     pub async fn finish(mut self) -> Result<()> {
         let commit = Arc::clone(&self.commit);
-        let _guard = commit.lock().await;
-        self.reserve_piece()?;
-        if let Err(err) = self.finish_inner().await {
-            // The put did not succeed. Restore the previous row, and leave
-            // `reserved` set when that write fails so Drop retries it.
-            // A crash still leaves `writing`: startup must not guess whether
-            // the process died before or after the put.
-            if let Err(rollback_err) = self.rollback_piece() {
-                return Err(chain_restore(err, rollback_err));
+        let guard = commit.lock().await;
+        let result = async {
+            self.reserve_piece()?;
+            if let Err(err) = self.finish_inner().await {
+                // The put did not succeed. Restore the previous row. A crash
+                // still leaves `writing`: startup must not guess whether the
+                // process died before or after the put.
+                if let Err(rollback_err) = self.rollback_piece() {
+                    return Err(chain_restore(err, rollback_err));
+                }
+                return Err(err);
             }
-            return Err(err);
+            // Complete already published the object. Do not abort it on drop.
+            self.upload_id = None;
+            if let Some(piece) = &mut self.piece {
+                piece.committed = true;
+            }
+            self.mark_piece_live()?;
+            Ok(())
         }
-        // Complete already published the object. Do not abort it on drop.
-        self.upload_id = None;
-        if let Some(piece) = &mut self.piece {
-            piece.committed = true;
-        }
-        self.mark_piece_live()?;
-        Ok(())
+        .await;
+        // Locals drop before `self`, so the guard would unlock and a waiting
+        // finish could publish before Drop retries the restore. Drop `self`
+        // while the guard is still held. Drop must not lock `commit` itself.
+        drop(self);
+        drop(guard);
+        result
     }
 
     /// Aborts an in-progress multipart upload.
@@ -950,7 +958,7 @@ impl Upload {
     }
 
     fn rollback_piece(&mut self) -> Result<()> {
-        let (previous, satellite_id, piece_id) = {
+        let (previous, satellite_id, piece_id, hash) = {
             let Some(piece) = self.piece.as_ref() else {
                 return Ok(());
             };
@@ -961,11 +969,23 @@ impl Upload {
                 piece.previous.clone(),
                 piece.satellite_id.clone(),
                 piece.piece_id.clone(),
+                piece.meta.hash,
             )
         };
+        // A later commit of this key may already own the row. Restore only
+        // the `writing` row this attempt inserted.
+        let current = self.index.get(&satellite_id, &piece_id)?;
+        let still_ours = current
+            .as_ref()
+            .is_some_and(|row| row.state == PieceState::Writing && row.hash == hash);
+        if !still_ours {
+            if let Some(piece) = self.piece.as_mut() {
+                piece.reserved = false;
+            }
+            return Ok(());
+        }
         // Clear `reserved` only after the restore write returns. A failure
-        // leaves it set so Drop retries instead of keeping a `writing` row
-        // over the object that is still in the bucket.
+        // leaves it set so Drop can retry while `finish` still holds `commit`.
         if let Some(previous) = previous {
             self.index.upsert(&previous)?;
         } else {
@@ -1001,6 +1021,9 @@ impl Upload {
 
 impl Drop for Upload {
     fn drop(&mut self) {
+        // `finish` drops `self` before its commit guard. Do not lock `commit`
+        // here: this task already holds it, and a late lock after unlock would
+        // apply a stale `previous` over the upload that waited.
         if self
             .piece
             .as_ref()
