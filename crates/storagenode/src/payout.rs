@@ -259,6 +259,12 @@ async fn fetch_stats(
     )
     .await
     .map_err(rpc_message)?;
+    for warning in offline_warnings(
+        opt_time(resp.offline_suspended),
+        opt_time(resp.offline_under_review),
+    ) {
+        eprintln!("storagenode: satellite {id}: {warning}");
+    }
     let audit = resp.audit_check.as_ref();
     let row = SatelliteStats {
         satellite_id: id.to_string(),
@@ -577,6 +583,37 @@ fn time_of(ts: Option<&Timestamp>) -> SystemTime {
     opt_time(ts.cloned()).unwrap_or(UNIX_EPOCH)
 }
 
+/// What to tell the operator about the satellite's offline tracking.
+///
+/// The Go node stores both times; neither its console API nor the dashboard
+/// reads them, so this node has no column for them. A node suspended for
+/// being offline is no longer selected, and the log is the only place the
+/// operator can learn why.
+fn offline_warnings(
+    suspended: Option<SystemTime>,
+    under_review: Option<SystemTime>,
+) -> Vec<String> {
+    let unix = |time: SystemTime| {
+        time.duration_since(UNIX_EPOCH)
+            .map(|since| since.as_secs())
+            .unwrap_or(0)
+    };
+    let mut warnings = Vec::new();
+    if let Some(since) = suspended {
+        warnings.push(format!(
+            "this node is suspended for being offline (since unix {}) and is not selected for uploads",
+            unix(since)
+        ));
+    }
+    if let Some(since) = under_review {
+        warnings.push(format!(
+            "this node is under review for being offline (since unix {})",
+            unix(since)
+        ));
+    }
+    warnings
+}
+
 fn opt_time(ts: Option<Timestamp>) -> Option<SystemTime> {
     let ts = ts?;
     if ts.seconds < 0 {
@@ -608,6 +645,21 @@ mod tests {
     use crate::noise_key;
     use crate::server::TrustedSatellite;
 
+    #[test]
+    fn offline_suspension_and_review_are_reported() {
+        let since = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        assert!(offline_warnings(None, None).is_empty());
+        let both = offline_warnings(Some(since), Some(since));
+        assert_eq!(both.len(), 2);
+        assert!(
+            both[0].contains("suspended for being offline"),
+            "{}",
+            both[0]
+        );
+        assert!(both[0].contains("1700000000"), "{}", both[0]);
+        assert!(both[1].contains("under review"), "{}", both[1]);
+        assert_eq!(offline_warnings(None, Some(since)).len(), 1);
+    }
     #[test]
     fn held_rate_matches_go_month_table() {
         let oct = ts(2026, 10, 3);
