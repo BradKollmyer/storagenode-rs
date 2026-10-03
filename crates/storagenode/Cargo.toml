@@ -24,6 +24,7 @@ storj-proto = { path = "../../../storj-uplink/crates/storj-proto" }
 storj-rpc = { path = "../../../storj-uplink/crates/storj-rpc" }
 storj-uplink = { path = "../../../storj-uplink/crates/storj-uplink" }
 serde_json = "1"
+time = { version = "0.3", default-features = false, features = ["std", "formatting"] }
 thiserror.workspace = true
 tokio.workspace = true
 tokio-rustls = { version = "0.26", default-features = false, features = ["tls12", "aws_lc_rs"] }

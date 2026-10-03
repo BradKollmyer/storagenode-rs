@@ -78,10 +78,7 @@ CREATE TABLE IF NOT EXISTS bandwidth_daily (
 CREATE TABLE IF NOT EXISTS checkins (
     satellite TEXT PRIMARY KEY,
     checked_in_at INTEGER NOT NULL,
-    quic_ok INTEGER NOT NULL,
-    disqualified_at INTEGER,
-    suspended_at INTEGER,
-    vetted_at INTEGER
+    quic_ok INTEGER NOT NULL
 );
 ";
 
@@ -343,8 +340,8 @@ impl BandwidthDay {
 
 /// Last successful check-in for one satellite.
 ///
-/// `disqualified_at`, `suspended_at`, and `vetted_at` stay unset when that
-/// response did not carry them.
+/// Disqualified, suspended, and vetted times are not stored. The check-in
+/// response does not carry them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckInRow {
     /// Satellite id, the same string as `pieces.satellite`.
@@ -353,12 +350,6 @@ pub struct CheckInRow {
     pub checked_in_at: SystemTime,
     /// `CheckInResponse.ping_node_success_quic`.
     pub quic_ok: bool,
-    /// Set only when the response carried a disqualification time.
-    pub disqualified_at: Option<SystemTime>,
-    /// Set only when the response carried a suspension time.
-    pub suspended_at: Option<SystemTime>,
-    /// Set only when the response carried a vetted time.
-    pub vetted_at: Option<SystemTime>,
 }
 
 #[derive(Clone)]
@@ -957,28 +948,14 @@ impl Index {
     /// Replaces the stored summary for `row.satellite_id`.
     pub(crate) fn record_check_in(&self, row: &CheckInRow) -> Result<()> {
         let at = system_to_millis(row.checked_in_at)?;
-        let disqualified = option_millis(row.disqualified_at)?;
-        let suspended = option_millis(row.suspended_at)?;
-        let vetted = option_millis(row.vetted_at)?;
         self.with(|conn| {
             conn.execute(
-                "INSERT INTO checkins (
-                    satellite, checked_in_at, quic_ok, disqualified_at, suspended_at, vetted_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                "INSERT INTO checkins (satellite, checked_in_at, quic_ok)
+                 VALUES (?1, ?2, ?3)
                  ON CONFLICT(satellite) DO UPDATE SET
                     checked_in_at = excluded.checked_in_at,
-                    quic_ok = excluded.quic_ok,
-                    disqualified_at = excluded.disqualified_at,
-                    suspended_at = excluded.suspended_at,
-                    vetted_at = excluded.vetted_at",
-                params![
-                    row.satellite_id,
-                    at,
-                    i64::from(row.quic_ok),
-                    disqualified,
-                    suspended,
-                    vetted,
-                ],
+                    quic_ok = excluded.quic_ok",
+                params![row.satellite_id, at, i64::from(row.quic_ok)],
             )
         })?;
         Ok(())
@@ -988,7 +965,7 @@ impl Index {
     pub(crate) fn check_ins(&self) -> Result<Vec<CheckInRow>> {
         let rows = self.with(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT satellite, checked_in_at, quic_ok, disqualified_at, suspended_at, vetted_at
+                "SELECT satellite, checked_in_at, quic_ok
                  FROM checkins
                  ORDER BY satellite",
             )?;
@@ -997,9 +974,6 @@ impl Index {
                     satellite_id: row.get(0)?,
                     checked_in_at: row.get(1)?,
                     quic_ok: row.get(2)?,
-                    disqualified_at: row.get(3)?,
-                    suspended_at: row.get(4)?,
-                    vetted_at: row.get(5)?,
                 })
             })?;
             let mut out = Vec::new();
@@ -1275,9 +1249,6 @@ struct CheckInStored {
     satellite_id: String,
     checked_in_at: i64,
     quic_ok: i64,
-    disqualified_at: Option<i64>,
-    suspended_at: Option<i64>,
-    vetted_at: Option<i64>,
 }
 
 impl CheckInStored {
@@ -1286,9 +1257,6 @@ impl CheckInStored {
             satellite_id: self.satellite_id,
             checked_in_at: millis_to_system(self.checked_in_at)?,
             quic_ok: self.quic_ok != 0,
-            disqualified_at: self.disqualified_at.map(millis_to_system).transpose()?,
-            suspended_at: self.suspended_at.map(millis_to_system).transpose()?,
-            vetted_at: self.vetted_at.map(millis_to_system).transpose()?,
         })
     }
 }
@@ -1329,7 +1297,8 @@ fn month_window(now: SystemTime) -> Result<(i64, i64)> {
     Ok((start, end))
 }
 
-/// Adds the uplink-hash columns when `pieces.db` predates them.
+/// Adds piece columns that predate this schema, and drops check-in reputation
+/// columns this process does not store.
 fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     let mut stmt = conn.prepare("PRAGMA table_info(pieces)")?;
     let names = stmt
@@ -1346,6 +1315,26 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     }
     if !names.iter().any(|name| name == "hash_ts_nanos") {
         conn.execute("ALTER TABLE pieces ADD COLUMN hash_ts_nanos INTEGER", [])?;
+    }
+    drop_checkin_reputation(conn)?;
+    Ok(())
+}
+
+/// Older files stored these as NULL. Drop them so they are not leftover state.
+fn drop_checkin_reputation(conn: &Connection) -> rusqlite::Result<()> {
+    let names = {
+        let mut stmt = conn.prepare("PRAGMA table_info(checkins)")?;
+        stmt.query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    if names.iter().any(|name| name == "disqualified_at") {
+        conn.execute("ALTER TABLE checkins DROP COLUMN disqualified_at", [])?;
+    }
+    if names.iter().any(|name| name == "suspended_at") {
+        conn.execute("ALTER TABLE checkins DROP COLUMN suspended_at", [])?;
+    }
+    if names.iter().any(|name| name == "vetted_at") {
+        conn.execute("ALTER TABLE checkins DROP COLUMN vetted_at", [])?;
     }
     Ok(())
 }
@@ -1578,7 +1567,7 @@ mod tests {
     }
 
     #[test]
-    fn check_in_summary_keeps_null_reputation_times() {
+    fn check_in_summary_survives_reopen() {
         let (_dir, path) = temp_db();
         let index = Index::open(&path).unwrap();
         let at = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
@@ -1587,9 +1576,6 @@ mod tests {
                 satellite_id: "sat".into(),
                 checked_in_at: at,
                 quic_ok: false,
-                disqualified_at: None,
-                suspended_at: None,
-                vetted_at: None,
             })
             .unwrap();
         let rows = index.check_ins().unwrap();
@@ -1597,20 +1583,13 @@ mod tests {
         assert_eq!(rows[0].satellite_id, "sat");
         assert_eq!(rows[0].checked_in_at, at);
         assert!(!rows[0].quic_ok);
-        assert!(rows[0].disqualified_at.is_none());
-        assert!(rows[0].suspended_at.is_none());
-        assert!(rows[0].vetted_at.is_none());
 
         let later = at + Duration::from_secs(5);
-        let vetted = at + Duration::from_secs(9);
         index
             .record_check_in(&CheckInRow {
                 satellite_id: "sat".into(),
                 checked_in_at: later,
                 quic_ok: true,
-                disqualified_at: None,
-                suspended_at: None,
-                vetted_at: Some(vetted),
             })
             .unwrap();
         drop(index);
@@ -1619,8 +1598,37 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].checked_in_at, later);
         assert!(rows[0].quic_ok);
-        assert_eq!(rows[0].vetted_at, Some(vetted));
-        assert!(rows[0].disqualified_at.is_none());
+    }
+
+    #[test]
+    fn open_drops_unused_checkin_columns() {
+        let (_dir, path) = temp_db();
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE checkins (
+                satellite TEXT PRIMARY KEY,
+                checked_in_at INTEGER NOT NULL,
+                quic_ok INTEGER NOT NULL,
+                disqualified_at INTEGER,
+                suspended_at INTEGER,
+                vetted_at INTEGER
+            );",
+        )
+        .unwrap();
+        drop(conn);
+        let _index = Index::open(&path).unwrap();
+        let conn = Connection::open(&path).unwrap();
+        let mut stmt = conn.prepare("PRAGMA table_info(checkins)").unwrap();
+        let names = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(names.iter().any(|name| name == "checked_in_at"));
+        assert!(names.iter().any(|name| name == "quic_ok"));
+        assert!(!names.iter().any(|name| name == "disqualified_at"));
+        assert!(!names.iter().any(|name| name == "suspended_at"));
+        assert!(!names.iter().any(|name| name == "vetted_at"));
     }
 
     /// Tiny temp dir that deletes itself. Avoids a dev-dependency for one test.

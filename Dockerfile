@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.4
 # Context is the parent of this repo (`docker build -f storagenode-rs/Dockerfile .`).
 # The crate path-depends on storj-uplink, and the UI stage builds storj/web/storagenode.
-# Copy those trees only so a local target/ directory is not sent to the daemon.
+# COPY names those trees. The daemon still receives the whole parent context.
 
 ARG NODE_VERSION=24.11.1
 

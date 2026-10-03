@@ -3,12 +3,12 @@
 //! Serves the JSON the existing Vue app requests and, when the image has
 //! filled it, the built files under [`UI_DIR`]. There is no login. Disk
 //! totals come from the piece index. Bandwidth is the sqlite daily counter.
-//! Reputation times stay null until a check-in response carries them.
+//! Reputation times stay null until a stats poll stores them.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use http_body_util::Full;
@@ -190,24 +190,25 @@ impl Dashboard {
             .trusted()
             .into_iter()
             .map(|(id, url)| {
-                let saved = check_ins.iter().find(|row| row.satellite_id == id);
                 json!({
                     "id": id,
                     "url": url,
-                    "disqualified": optional_time(saved.and_then(|row| row.disqualified_at)),
-                    "suspended": optional_time(saved.and_then(|row| row.suspended_at)),
-                    "vettedAt": optional_time(saved.and_then(|row| row.vetted_at)),
+                    "disqualified": Value::Null,
+                    "suspended": Value::Null,
+                    "vettedAt": Value::Null,
                 })
             })
             .collect::<Vec<_>>();
+        // Vue draws `used - trash` as the live slice and free as `allocated - used`.
+        let disk_used = space.used.saturating_add(space.trash);
         json_ok(json!({
             "nodeID": self.node.node_id().to_string(),
             "wallet": self.wallet,
             "walletFeatures": self.wallet_features,
             "satellites": satellites,
             "diskSpace": {
-                "used": space.used,
-                "available": space.free,
+                "used": disk_used,
+                "available": space.allocated.saturating_sub(disk_used),
                 "overused": 0,
                 "allocated": space.allocated,
                 "trash": space.trash,
@@ -302,6 +303,9 @@ impl Dashboard {
 
     async fn index_html(&self) -> Reply {
         let path = self.ui_dir.join("index.html");
+        if !file_stays_under(&self.ui_dir, &path) {
+            return text(404, "not found");
+        }
         match tokio::fs::read(&path).await {
             Ok(body) => Reply {
                 status: 200,
@@ -378,7 +382,7 @@ fn bandwidth_daily(days: &[BandwidthDay]) -> Value {
                     "usage": day.put,
                 },
                 "delete": 0,
-                "intervalStart": rfc3339_millis(day.day_millis),
+                "intervalStart": format_unix_millis(day.day_millis),
             })
         })
         .collect()
@@ -391,7 +395,7 @@ fn storage_daily(live: u64, now: SystemTime) -> Value {
     json!([{
         "atRestTotal": live,
         "atRestTotalBytes": live,
-        "intervalStart": rfc3339_millis(day_millis(now)),
+        "intervalStart": utc_day_start(now),
         "calculated": true,
     }])
 }
@@ -565,65 +569,51 @@ fn content_type(path: &str) -> &'static str {
 
 fn time_value(time: Option<SystemTime>) -> Value {
     Value::String(match time {
-        Some(time) => rfc3339(time),
+        Some(time) => format_rfc3339(time),
         None => ZERO_TIME.to_owned(),
     })
 }
 
-fn optional_time(time: Option<SystemTime>) -> Value {
-    match time {
-        Some(time) => Value::String(rfc3339(time)),
-        None => Value::Null,
+fn format_unix_millis(millis: i64) -> String {
+    let Ok(millis) = u64::try_from(millis) else {
+        return ZERO_TIME.to_owned();
+    };
+    match UNIX_EPOCH.checked_add(Duration::from_millis(millis)) {
+        Some(time) => format_rfc3339(time),
+        None => ZERO_TIME.to_owned(),
     }
 }
 
-fn rfc3339(time: SystemTime) -> String {
+/// UTC midnight of `time`, as RFC3339. The daily stamp uses that boundary.
+fn utc_day_start(time: SystemTime) -> String {
     let Ok(elapsed) = time.duration_since(UNIX_EPOCH) else {
         return ZERO_TIME.to_owned();
     };
-    rfc3339_secs(i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX))
-}
-
-fn rfc3339_millis(millis: i64) -> String {
-    if millis < 0 {
+    let Ok(nanos) = i128::try_from(elapsed.as_nanos()) else {
         return ZERO_TIME.to_owned();
-    }
-    rfc3339_secs(millis.div_euclid(1_000))
-}
-
-fn day_millis(time: SystemTime) -> i64 {
-    let Ok(elapsed) = time.duration_since(UNIX_EPOCH) else {
-        return 0;
     };
-    let millis = i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX);
-    millis.div_euclid(86_400_000) * 86_400_000
+    let Ok(dt) = time::OffsetDateTime::from_unix_timestamp_nanos(nanos) else {
+        return ZERO_TIME.to_owned();
+    };
+    dt.date()
+        .midnight()
+        .assume_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| ZERO_TIME.to_owned())
 }
 
-fn rfc3339_secs(secs: i64) -> String {
-    let (year, month, day) = ymd_from_unix(secs);
-    let tod = secs.rem_euclid(86_400);
-    let hour = tod / 3_600;
-    let minute = (tod % 3_600) / 60;
-    let second = tod % 60;
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
-}
-
-/// Howard Hinnant's `civil_from_days`. `secs` is a unix timestamp.
-fn ymd_from_unix(secs: i64) -> (i32, u32, u32) {
-    let days = secs.div_euclid(86_400);
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let mut year = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    if month <= 2 {
-        year += 1;
-    }
-    (year as i32, month as u32, day as u32)
+fn format_rfc3339(time: SystemTime) -> String {
+    let Ok(elapsed) = time.duration_since(UNIX_EPOCH) else {
+        return ZERO_TIME.to_owned();
+    };
+    let Ok(nanos) = i128::try_from(elapsed.as_nanos()) else {
+        return ZERO_TIME.to_owned();
+    };
+    let Ok(dt) = time::OffsetDateTime::from_unix_timestamp_nanos(nanos) else {
+        return ZERO_TIME.to_owned();
+    };
+    dt.format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| ZERO_TIME.to_owned())
 }
 
 #[cfg(test)]
@@ -632,10 +622,13 @@ mod tests {
 
     #[test]
     fn rfc3339_formats_a_known_utc_instant() {
-        let time = UNIX_EPOCH + std::time::Duration::from_secs(1_791_039_845);
-        assert_eq!(rfc3339(time), "2026-10-03T15:04:05Z");
-        assert_eq!(rfc3339_millis(1_790_985_600_000), "2026-10-03T00:00:00Z");
-        assert_eq!(day_millis(time), 1_790_985_600_000);
+        let time = UNIX_EPOCH + Duration::from_secs(1_791_039_845);
+        assert_eq!(format_rfc3339(time), "2026-10-03T15:04:05Z");
+        assert_eq!(
+            format_unix_millis(1_790_985_600_000),
+            "2026-10-03T00:00:00Z"
+        );
+        assert_eq!(utc_day_start(time), "2026-10-03T00:00:00Z");
     }
 
     #[test]

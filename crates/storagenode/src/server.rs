@@ -2478,7 +2478,6 @@ mod tests {
             contact_external_address: "127.0.0.1:28967".into(),
             satellites: Vec::new(),
             listen: "127.0.0.1:0".parse().unwrap(),
-            dashboard: "0.0.0.0:14002".parse().unwrap(),
         };
         match tokio::time::timeout(Duration::from_secs(20), crate::start(&config)).await {
             Ok(Err(err)) => assert!(matches!(err, crate::Error::Store(_)), "{err}"),
@@ -2541,7 +2540,6 @@ mod tests {
                 address: "127.0.0.1:7777".into(),
             }],
             listen: "127.0.0.1:0".parse().unwrap(),
-            dashboard: "0.0.0.0:14002".parse().unwrap(),
         }
     }
 
@@ -3536,13 +3534,11 @@ mod tests {
         let (status, body) = dash.handle("GET", "/api/sno").await;
         assert_eq!(status, 200);
         let page: serde_json::Value = serde_json::from_slice(&body).expect("json");
-        assert_eq!(page["diskSpace"]["used"], live.len() as u64);
+        let disk_used = (live.len() + trashed.len()) as u64;
+        assert_eq!(page["diskSpace"]["used"], disk_used);
         assert_eq!(page["diskSpace"]["trash"], trashed.len() as u64);
         assert_eq!(page["diskSpace"]["allocated"], allocated);
-        assert_eq!(
-            page["diskSpace"]["available"],
-            allocated - live.len() as u64
-        );
+        assert_eq!(page["diskSpace"]["available"], allocated - disk_used);
         assert_eq!(page["diskSpace"]["overused"], 0);
         assert_eq!(page["diskSpace"]["reclaimable"], 0);
         assert_eq!(page["diskSpace"]["reserved"], 0);
@@ -3659,6 +3655,13 @@ mod tests {
         assert_eq!(status, 404);
         let (status, _) = dash.handle("GET", "/static/%2e%2e/index.html").await;
         assert_eq!(status, 404);
+        let outside = harness._root.path().join("outside.html");
+        std::fs::write(&outside, b"secret").expect("outside");
+        std::fs::remove_file(ui.join("index.html")).expect("replace index");
+        std::os::unix::fs::symlink(&outside, ui.join("index.html")).expect("symlink");
+        let (status, body) = dash.handle("GET", "/").await;
+        assert_eq!(status, 404);
+        assert!(!String::from_utf8_lossy(&body).contains("secret"));
 
         harness
             .node
@@ -3667,9 +3670,6 @@ mod tests {
                 satellite_id: sat.clone(),
                 checked_in_at: SystemTime::now(),
                 quic_ok: false,
-                disqualified_at: None,
-                suspended_at: None,
-                vetted_at: None,
             })
             .expect("check-in");
         let (status, body) = dash.handle("GET", "/api/sno/").await;
@@ -3687,9 +3687,6 @@ mod tests {
                 satellite_id: sat,
                 checked_in_at: SystemTime::now(),
                 quic_ok: true,
-                disqualified_at: None,
-                suspended_at: None,
-                vetted_at: None,
             })
             .expect("check-in");
         let (_, body) = dash.handle("GET", "/api/sno/").await;

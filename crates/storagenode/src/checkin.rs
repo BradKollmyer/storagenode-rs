@@ -162,15 +162,10 @@ async fn attempt(
                 response.ping_error_message
             );
         }
-        // The decoded check-in response has no disqualified, suspended, or
-        // vetted time. Those stay unset until a response carries them.
         let row = s3store::CheckInRow {
             satellite_id: id.to_string(),
             checked_in_at: SystemTime::now(),
             quic_ok: response.ping_node_success_quic,
-            disqualified_at: None,
-            suspended_at: None,
-            vetted_at: None,
         };
         node.piece_store()
             .record_check_in(&row)
@@ -510,9 +505,6 @@ mod tests {
         assert_eq!(saved.len(), 1);
         assert_eq!(saved[0].satellite_id, satellite.node_id().to_string());
         assert!(!saved[0].quic_ok);
-        assert!(saved[0].disqualified_at.is_none());
-        assert!(saved[0].suspended_at.is_none());
-        assert!(saved[0].vetted_at.is_none());
     }
 
     #[tokio::test]

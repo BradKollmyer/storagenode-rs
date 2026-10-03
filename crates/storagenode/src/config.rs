@@ -36,8 +36,6 @@ pub struct Config {
     pub satellites: Vec<NodeUrl>,
     /// DRPC listen address. Always `0.0.0.0:28967`.
     pub listen: SocketAddr,
-    /// Dashboard listen address. Always `0.0.0.0:14002`.
-    pub dashboard: SocketAddr,
 }
 
 /// Rejected environment.
@@ -129,7 +127,6 @@ impl Config {
             contact_external_address,
             satellites,
             listen: SocketAddr::from((Ipv4Addr::UNSPECIFIED, LISTEN_PORT)),
-            dashboard: SocketAddr::from((Ipv4Addr::UNSPECIFIED, DASHBOARD_PORT)),
         })
     }
 }
@@ -217,8 +214,8 @@ mod tests {
         assert_eq!(config.s3.path_style, Some(true));
         assert_eq!(config.s3.prefix, "custom");
         assert_eq!(config.listen.port(), LISTEN_PORT);
-        assert_eq!(config.dashboard.port(), DASHBOARD_PORT);
-        assert!(config.dashboard.ip().is_unspecified());
+        assert!(config.listen.ip().is_unspecified());
+        assert_eq!(DASHBOARD_PORT, 14002);
         assert_eq!(config.satellites.len(), 1);
         assert!(!config.satellites[0].id.is_zero());
         assert_eq!(
