@@ -475,6 +475,16 @@ impl Node {
     where
         T: AsyncRead + AsyncWrite + Unpin,
     {
+        let mut usage = Usage::default();
+        let result = self.upload_stream(out, &mut usage).await;
+        self.note_usage(&usage);
+        result
+    }
+
+    async fn upload_stream<T>(&self, out: &mut Out<T>, usage: &mut Usage) -> Result<(), Fail>
+    where
+        T: AsyncRead + AsyncWrite + Unpin,
+    {
         let mut limit: Option<OrderLimit> = None;
         let mut algo = PieceHashAlgo::Sha256;
         let mut hasher = PieceHashAlgo::Sha256.hasher();
@@ -508,6 +518,8 @@ impl Node {
                 self.check_limit(&next, true)?;
                 self.check_space(&next)?;
                 tracked = Some(self.track_order(&next)?);
+                usage.satellite = parse_node_id(&next.satellite_id)?.to_string();
+                usage.action = next.action;
                 limit = Some(next);
             } else if limit.is_none() {
                 return Err(Fail::proto(
@@ -526,6 +538,7 @@ impl Node {
                 if let Some(tracked) = tracked.as_mut() {
                     tracked.note(order);
                 }
+                usage.ordered |= order.amount > 0;
             }
             if let Some(chunk) = req.chunk.as_ref() {
                 let next_len = check_chunk(staged, limit_ref.limit, authorized, chunk)?;
@@ -541,6 +554,7 @@ impl Node {
                 hasher.update(&chunk.data);
                 spill.write(&chunk.data).await.map_err(store_err)?;
                 staged = next_len;
+                usage.bytes = u64::try_from(staged).unwrap_or(0);
             }
             if let Some(done) = req.done {
                 let Some(limit) = limit.take() else {
@@ -652,14 +666,21 @@ impl Node {
         };
         self.note_stored(u64::try_from(piece_size).unwrap_or(0));
         out.message(&response.encode_to_vec()).await?;
-        // Count before the next await. The uplink returns as soon as it
-        // reads this hash, and a counter error must not fail the commit.
-        self.note_bandwidth(&sat, limit.action, u64::try_from(piece_size).unwrap_or(0));
         out.close().await?;
         Ok(())
     }
 
     async fn download<T>(&self, out: &mut Out<T>) -> Result<(), Fail>
+    where
+        T: AsyncRead + AsyncWrite + Unpin,
+    {
+        let mut usage = Usage::default();
+        let result = self.download_stream(out, &mut usage).await;
+        self.note_usage(&usage);
+        result
+    }
+
+    async fn download_stream<T>(&self, out: &mut Out<T>, usage: &mut Usage) -> Result<(), Fail>
     where
         T: AsyncRead + AsyncWrite + Unpin,
     {
@@ -767,6 +788,9 @@ impl Node {
                 tracked.note(order);
             }
         }
+        usage.satellite = sat.clone();
+        usage.action = limit.action;
+        usage.ordered_up_to(authorized);
         let mut pending = Vec::new();
 
         // GET and GET_AUDIT do not send the hash. GET_REPAIR does, before bytes.
@@ -813,6 +837,7 @@ impl Node {
                 match out.recv_ready().await? {
                     Some(Some(more)) => {
                         authorized = later_order(&limit, &more, authorized, &mut tracked)?;
+                        usage.ordered_up_to(authorized);
                     }
                     Some(None) => orders_closed = true,
                     None => break,
@@ -833,6 +858,7 @@ impl Node {
                     ));
                 };
                 authorized = later_order(&limit, &more, authorized, &mut tracked)?;
+                usage.ordered_up_to(authorized);
                 continue;
             }
             let room = u64::try_from(authorized - sent_i)
@@ -854,10 +880,6 @@ impl Node {
             sent += n;
             file_off += n;
         }
-        // Same as upload: the counter is updated before the handler awaits
-        // again, so a finished download is visible as soon as the client
-        // observes the last chunk. Zero bytes and an earlier error skip this.
-        self.note_bandwidth(&sat, limit.action, sent);
         out.close().await?;
         Ok(())
     }
@@ -1212,8 +1234,15 @@ impl Node {
         Ok(())
     }
 
-    /// Records a finished transfer. Zero bytes are ignored. A sqlite error is
-    /// logged so the piece RPC still succeeds.
+    /// Counts a transfer whose order was kept for settlement, finished or not.
+    fn note_usage(&self, usage: &Usage) {
+        if usage.ordered {
+            self.note_bandwidth(&usage.satellite, usage.action, usage.bytes);
+        }
+    }
+
+    /// Records a transfer. Zero bytes are ignored. A sqlite error is logged
+    /// so the piece RPC still succeeds.
     fn note_bandwidth(&self, satellite: &str, action: i32, bytes: u64) {
         if bytes == 0 {
             return;
@@ -1503,6 +1532,32 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Out<T> {
                     ));
                 }
             }
+        }
+    }
+}
+
+/// What one upload or download adds to the local bandwidth counters.
+///
+/// The Go node adds it when it saves the order, which it does on every way
+/// out of the RPC. An upload counts the bytes it wrote. A download counts
+/// its largest order, not the bytes it sent.
+#[derive(Default)]
+struct Usage {
+    satellite: String,
+    action: i32,
+    bytes: u64,
+    /// An order with a positive amount was kept. Without one nothing is
+    /// settled and nothing is counted.
+    ordered: bool,
+}
+
+impl Usage {
+    fn ordered_up_to(&mut self, amount: i64) {
+        if let Ok(bytes) = u64::try_from(amount)
+            && bytes > 0
+        {
+            self.ordered = true;
+            self.bytes = bytes;
         }
     }
 }
@@ -2783,6 +2838,9 @@ mod tests {
             .unwrap()
             .expect("an order was saved");
         assert_eq!(saved.amount, body.len() as i64);
+        // The egress counter follows the saved order, as in Go, although the
+        // download did not finish.
+        wait_bandwidth(&harness.node, body.len() as u64).await;
     }
 
     #[tokio::test]
