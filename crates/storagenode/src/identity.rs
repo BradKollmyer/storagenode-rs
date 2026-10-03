@@ -52,6 +52,12 @@ pub fn load_or_create(volume: &Path) -> Result<Identity, Error> {
     }
 }
 
+/// Loads `{volume}/identity.pem`. `Ok(None)` when there is none. Never
+/// creates one.
+pub(crate) fn load(volume: &Path) -> Result<Option<Identity>, Error> {
+    read_identity(&volume.join(IDENTITY_PEM))
+}
+
 /// Leaf, CA, then any parents. No private key. Satellite trust files use this shape.
 #[cfg(test)]
 pub(crate) fn certificate_chain_pem(identity: &Identity) -> String {

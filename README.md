@@ -42,7 +42,7 @@ storagenode exit-satellite <satellite-id>
 storagenode exit-status
 ```
 
-`exit-satellite` records a pending exit for a trusted satellite and the bytes live for it. Pieces stay until the satellite sends `ExitCompleted`. `exit-status` prints the stored rows.
+`exit-satellite` asks the satellite whether the node is old enough to exit, then records a pending exit for it and the bytes live for it. A refusal records nothing. Pieces stay until the satellite sends `ExitCompleted`. `exit-status` prints the stored rows.
 
 The first start writes `{STORJ_VOLUME}/identity.pem` and `{STORJ_VOLUME}/noise.key`. The identity difficulty is 0. Public satellites refuse that id. Put each trusted satellite's certificate at `{STORJ_VOLUME}/satellites/{node-id}.pem` (leaf, then CA). The CA must hash to that node id.
 

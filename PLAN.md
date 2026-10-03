@@ -113,7 +113,7 @@ Same behavior as the current Go worker (`storagenode/gracefulexit/worker.go`). T
 
 What the node does:
 
-- `storagenode exit-satellite` records a pending exit for a trusted satellite, with the bytes currently live for it. `storagenode exit-status` prints that row.
+- `storagenode exit-satellite` calls `GracefulExitFeasibility` on a trusted satellite and, when the node is allowed to exit, records a pending exit with the bytes currently live for it. `storagenode exit-status` prints that row.
 - A chore dials `SatelliteGracefulExit.Process` for each pending satellite. Those messages are not in the vendored uplink protos. Copy them from `storj/common` at the same SHA as `CheckIn`.
 - `NotReady` — retry on the next chore tick.
 - Failed precondition — drop the pending row. Exit was refused.

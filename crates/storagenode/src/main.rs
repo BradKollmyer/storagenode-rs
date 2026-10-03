@@ -1,7 +1,7 @@
 //! `storagenode` binary. `HeadBucket` failure exits the process.
 //!
 //! `storagenode` serves DRPC and the dashboard on `0.0.0.0:14002`.
-//! `storagenode exit-satellite <id>` records a pending exit.
+//! `storagenode exit-satellite <id>` asks the satellite, then records a pending exit.
 //! `storagenode exit-status` prints the stored rows.
 
 use std::process::ExitCode;
@@ -26,7 +26,7 @@ async fn main() -> ExitCode {
     };
     let result = match command {
         Command::Run => storagenode::run(config).await,
-        Command::ExitSatellite(id) => storagenode::request_exit(&config, &id).map(|row| {
+        Command::ExitSatellite(id) => storagenode::request_exit(&config, &id).await.map(|row| {
             println!("{}", storagenode::format_exit_row(&row));
         }),
         Command::ExitStatus => storagenode::exit_status(&config).map(|text| {

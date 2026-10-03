@@ -1,6 +1,7 @@
 //! Graceful exit. The satellite moves the data. This node only receives.
 //!
-//! `exit-satellite` stores a pending row. The chore dials `Process` for each
+//! `exit-satellite` asks the satellite whether the node may exit yet, then
+//! stores a pending row. The chore dials `Process` for each
 //! pending satellite and only calls Recv. `NotReady` waits for the next tick.
 //! `ExitCompleted` stores the receipt, then deletes that satellite's pieces.
 
@@ -11,10 +12,11 @@ use std::time::Duration;
 use prost::Message;
 use s3store::{ExitRow, ExitStatus, Store};
 use storj_rpc::transport::{self, TransportMode};
-use storj_rpc::{Conn, Error as RpcError, NodeId};
+use storj_rpc::{Conn, Error as RpcError, Identity, NodeId};
 
 use crate::gracefulexit::SatelliteMessage;
 use crate::gracefulexit::satellite_message::Message as SatelliteMessageKind;
+use crate::gracefulexit::{GracefulExitFeasibilityRequest, GracefulExitFeasibilityResponse};
 use crate::server::{Node, encode_hex};
 
 /// `/gracefulexit.SatelliteGracefulExit/Process`.
@@ -22,9 +24,7 @@ pub(crate) const PROCESS: &str = "/gracefulexit.SatelliteGracefulExit/Process";
 
 /// `/gracefulexit.SatelliteGracefulExit/GracefulExitFeasibility`.
 ///
-/// The Go console dials this. This process has no dashboard, so the worker
-/// does not.
-#[allow(dead_code)]
+/// `exit-satellite` dials this before it records the exit.
 pub(crate) const FEASIBILITY: &str = "/gracefulexit.SatelliteGracefulExit/GracefulExitFeasibility";
 
 /// Go `gracefulexit.Config.ChoreInterval` release default.
@@ -56,6 +56,53 @@ pub(crate) async fn serve(node: Arc<Node>) {
         }
         tokio::time::sleep(INTERVAL).await;
     }
+}
+
+/// Asks the satellite whether this node is old enough to exit.
+///
+/// The Go CLI does this before it records an exit. Once `Process` is dialed
+/// the satellite has started the exit, and that cannot be taken back.
+pub(crate) async fn check_feasibility(
+    identity: &Identity,
+    id: NodeId,
+    address: &str,
+) -> Result<(), String> {
+    if address.is_empty() {
+        return Err(format!("satellite {id} has no dial address"));
+    }
+    let rpc = async {
+        let transport = transport::dial(
+            identity,
+            id,
+            address,
+            TransportMode::Tcp,
+            DIAL_TIMEOUT,
+            None,
+        )
+        .await
+        .map_err(|err| err.to_string())?;
+        let mut conn = Conn::new(transport);
+        let bytes = conn
+            .invoke(
+                FEASIBILITY,
+                &GracefulExitFeasibilityRequest {}.encode_to_vec(),
+            )
+            .await
+            .map_err(|err| err.to_string())?;
+        GracefulExitFeasibilityResponse::decode(bytes.as_slice()).map_err(|err| err.to_string())
+    };
+    let response = match tokio::time::timeout(DIAL_TIMEOUT, rpc).await {
+        Ok(response) => response?,
+        Err(_) => return Err(format!("satellite {id} did not answer in time")),
+    };
+    if !response.is_allowed {
+        let joined = response.joined_at.map(|at| at.seconds).unwrap_or(0);
+        return Err(format!(
+            "satellite {id} does not allow graceful exit yet: a node must be {} months old, and this one joined at unix {joined}",
+            response.months_required
+        ));
+    }
+    Ok(())
 }
 
 fn launch(node: &Arc<Node>, running: &Arc<Mutex<HashSet<String>>>, satellite_id: String) {
@@ -491,7 +538,12 @@ mod tests {
         })
         .await
         .map_err(|err| err.to_string())?;
-        let _ = tokio::time::timeout(Duration::from_secs(2), conn.read_packet()).await;
+        // A unary caller is still writing its request and close. Read until
+        // it hangs up, so its writes do not hit a closed socket.
+        let _ = tokio::time::timeout(Duration::from_secs(2), async {
+            while conn.read_packet().await.is_ok() {}
+        })
+        .await;
         Ok(())
     }
 
@@ -853,8 +905,44 @@ mod tests {
             certificate_chain_pem(&satellite),
         )
         .unwrap();
-        let config = exit_config(&bucket, &sat);
-        let row = crate::request_exit(&config, &sat).unwrap();
+        crate::load_or_create(&volume).unwrap();
+        let feasibility = |is_allowed: bool| {
+            crate::gracefulexit::GracefulExitFeasibilityResponse {
+                joined_at: Some(prost_types::Timestamp {
+                    seconds: 1_700_000_000,
+                    nanos: 0,
+                }),
+                months_required: 6,
+                is_allowed,
+            }
+            .encode_to_vec()
+        };
+
+        // Too young: the satellite says no and nothing is recorded.
+        let seen = Arc::new(Mutex::new(None));
+        let address = spawn_satellite(
+            satellite.clone(),
+            vec![Step::Message(feasibility(false))],
+            Arc::clone(&seen),
+        );
+        let config = exit_config(&bucket, &sat, &address);
+        let err = crate::request_exit(&config, &sat).await.unwrap_err();
+        assert!(err.to_string().contains("6 months old"), "{err}");
+        assert_eq!(seen.lock().unwrap().as_deref(), Some(FEASIBILITY));
+        assert!(bucket.store.exit_row(&sat).unwrap().is_none());
+
+        // No answer at all records nothing either.
+        let config = exit_config(&bucket, &sat, "127.0.0.1:1");
+        crate::request_exit(&config, &sat).await.unwrap_err();
+        assert!(bucket.store.exit_row(&sat).unwrap().is_none());
+
+        let address = spawn_satellite(
+            satellite.clone(),
+            vec![Step::Message(feasibility(true))],
+            Arc::new(Mutex::new(None)),
+        );
+        let config = exit_config(&bucket, &sat, &address);
+        let row = crate::request_exit(&config, &sat).await.unwrap();
         assert_eq!(row.live_bytes, 10);
         assert_eq!(row.status, ExitStatus::Pending);
         let text = crate::exit_status(&config).unwrap();
@@ -868,9 +956,13 @@ mod tests {
         assert_eq!(stored.live_bytes, 10);
         assert_eq!(stored.status, ExitStatus::Pending);
 
-        let err = crate::request_exit(&config, &stranger.node_id().to_string()).unwrap_err();
+        let err = crate::request_exit(&config, &stranger.node_id().to_string())
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("not a trusted satellite"), "{err}");
-        let err = crate::request_exit(&config, "not-a-node-id").unwrap_err();
+        let err = crate::request_exit(&config, "not-a-node-id")
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("not a node id"), "{err}");
 
         let ca = satellite.ca_der();
@@ -878,14 +970,14 @@ mod tests {
         std::fs::write(volume.join("satellites").join(format!("{sat}.pem")), bad).unwrap();
         // begin_exit rejects an existing row before the certificate is checked.
         again.cancel_exit(&sat).unwrap();
-        let err = crate::request_exit(&config, &sat).unwrap_err();
+        let err = crate::request_exit(&config, &sat).await.unwrap_err();
         assert!(
             err.to_string().contains("leaf") || err.to_string().contains("CA"),
             "{err}"
         );
     }
 
-    fn exit_config(bucket: &Bucket, satellite_id: &str) -> Config {
+    fn exit_config(bucket: &Bucket, satellite_id: &str, address: &str) -> Config {
         Config::from_fn(|key| {
             let value = match key {
                 "STORJ_S3_ENDPOINT" => bucket.endpoint.as_str(),
@@ -895,7 +987,7 @@ mod tests {
                 "STORJ_OPERATOR_EMAIL" => "op@example.com",
                 "STORJ_OPERATOR_WALLET" => "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 "STORJ_CONTACT_EXTERNAL_ADDRESS" => "127.0.0.1:28967",
-                "STORJ_SATELLITES" => return Some(format!("{satellite_id}@127.0.0.1:7777")),
+                "STORJ_SATELLITES" => return Some(format!("{satellite_id}@{address}")),
                 "STORJ_VOLUME" => {
                     return Some(bucket.root.path().join("volume").display().to_string());
                 }
