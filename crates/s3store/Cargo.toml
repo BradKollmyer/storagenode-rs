@@ -9,7 +9,10 @@ publish = false
 
 [dependencies]
 aws-sdk-s3.workspace = true
+base64 = "0.22"
+rusqlite = { version = "0.32", features = ["bundled"] }
 thiserror.workspace = true
+time = { version = "0.3", default-features = false, features = ["std", "formatting", "parsing"] }
 tokio.workspace = true
 
 [dev-dependencies]

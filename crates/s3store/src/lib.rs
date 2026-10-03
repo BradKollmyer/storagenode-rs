@@ -3,15 +3,32 @@
 //! One object per piece. The key is `{prefix}/{satellite-id}/{piece-id}`
 //! (prefix defaults to `pieces`). The body is the raw piece bytes, with no
 //! hashstore footer. User metadata is stored and returned without the
-//! `x-amz-meta-` prefix. This crate does not define piece-hash keys.
+//! `x-amz-meta-` prefix. Piece metadata keys (the SDK adds `x-amz-meta-`):
+//! - `piece-hash` — hex
+//! - `hash-algorithm` — `sha256` or `blake3`
+//! - `created` — RFC3339
+//! - `expires` — RFC3339, or absent
+//! - `order-limit` — standard base64 of the encoded order limit
+//!
+//! [`Store::put_piece`] commits that metadata in order: insert `writing`,
+//! `PutObject` or complete multipart, then mark `live`. [`Store::put`] writes
+//! an object and does not touch the index.
 //!
 //! Bodies of at most [`PART_SIZE`] bytes use one `PutObject`. Larger bodies
 //! use multipart upload, [`PART_SIZE`] per part, last part shorter.
 
 #![deny(clippy::undocumented_unsafe_blocks)]
 
+mod index;
+
+pub use index::{HashAlgorithm, PIECES_DB, PieceInfo, PieceMeta, PieceState, Space, TRASH_KEEP};
+
 use std::collections::HashMap;
 use std::fmt;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use aws_sdk_s3::config::{
     BehaviorVersion, Credentials, Region, RequestChecksumCalculation, ResponseChecksumValidation,
@@ -19,6 +36,8 @@ use aws_sdk_s3::config::{
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 
 /// Single `PutObject` limit. Larger bodies are multipart with parts of this size.
 pub const PART_SIZE: usize = 5 * 1024 * 1024;
@@ -45,6 +64,10 @@ pub struct Config {
     pub prefix: String,
     /// `None` uses path-style unless the endpoint host is `amazonaws.com`.
     pub path_style: Option<bool>,
+    /// Directory that holds [`PIECES_DB`]. Created if absent.
+    pub volume: PathBuf,
+    /// Allocation in bytes. Free space is this minus the sum of live sizes.
+    pub allocated_bytes: u64,
 }
 
 impl Default for Config {
@@ -57,6 +80,8 @@ impl Default for Config {
             region: DEFAULT_REGION.to_owned(),
             prefix: DEFAULT_PREFIX.to_owned(),
             path_style: None,
+            volume: PathBuf::new(),
+            allocated_bytes: 0,
         }
     }
 }
@@ -71,6 +96,8 @@ impl fmt::Debug for Config {
             .field("region", &self.region)
             .field("prefix", &self.prefix)
             .field("path_style", &self.path_style)
+            .field("volume", &self.volume)
+            .field("allocated_bytes", &self.allocated_bytes)
             .finish()
     }
 }
@@ -80,6 +107,14 @@ pub struct Store {
     client: aws_sdk_s3::Client,
     bucket: String,
     prefix: String,
+    index: index::Index,
+    allocated_bytes: u64,
+    /// File was absent at open. [`Store::startup`] lists the bucket once.
+    needs_rebuild: AtomicBool,
+    /// Held across a piece commit and across each chore delete, so GC cannot
+    /// remove an object a commit just replaced. One lock for the bucket;
+    /// split per piece if a GC pass blocks uploads.
+    commit: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl fmt::Debug for Store {
@@ -87,8 +122,20 @@ impl fmt::Debug for Store {
         f.debug_struct("Store")
             .field("bucket", &self.bucket)
             .field("prefix", &self.prefix)
+            .field("allocated_bytes", &self.allocated_bytes)
             .finish_non_exhaustive()
     }
+}
+
+/// Bytes from [`Store::download`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Download {
+    /// Object bytes for the requested range.
+    pub bytes: Vec<u8>,
+    /// The row was trash and the object is still in the bucket.
+    ///
+    /// The download does not clear the flag. [`Store::restore_trash`] does.
+    pub restored_from_trash: bool,
 }
 
 /// Failure from the piece store. Display text does not include the secret.
@@ -117,13 +164,22 @@ pub enum Error {
     /// The S3 API returned an error, or the bucket could not be reached.
     #[error("{0}")]
     S3(String),
+    /// Piece hash, algorithm, time, or order limit cannot be stored.
+    #[error("piece metadata: {0}")]
+    Metadata(String),
+    /// `pieces.db` could not be opened or updated.
+    #[error("piece index: {0}")]
+    Index(String),
 }
 
 /// Piece-store result.
 pub type Result<T> = std::result::Result<T, Error>;
 
 impl Store {
-    /// Builds a client. Does not contact the bucket; call [`Store::head_bucket`] for that.
+    /// Builds a client and opens `pieces.db`.
+    ///
+    /// Does not contact the bucket. [`Store::startup`] does, and rebuilds the
+    /// index when the database file was missing.
     pub fn new(config: Config) -> Result<Self> {
         if config.endpoint.is_empty() {
             return Err(Error::Config("endpoint is required"));
@@ -136,6 +192,9 @@ impl Store {
         }
         if config.secret_access_key.is_empty() {
             return Err(Error::Config("secret is required"));
+        }
+        if config.volume.as_os_str().is_empty() {
+            return Err(Error::Config("volume is required"));
         }
 
         let path_style = path_style_for(&config.endpoint, config.path_style)?;
@@ -168,10 +227,15 @@ impl Store {
             .response_checksum_validation(ResponseChecksumValidation::WhenRequired)
             .build();
 
+        let (index, missing) = index::Index::open(&config.volume.join(PIECES_DB))?;
         Ok(Self {
             client: aws_sdk_s3::Client::from_conf(sdk),
             bucket: config.bucket,
             prefix,
+            index,
+            allocated_bytes: config.allocated_bytes,
+            needs_rebuild: AtomicBool::new(missing),
+            commit: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
@@ -187,6 +251,158 @@ impl Store {
             .await
             .map(|_| ())
             .map_err(|err| Error::S3(err.to_string()))
+    }
+
+    /// Checks the bucket, then rebuilds the index if `pieces.db` was missing.
+    ///
+    /// Rebuild lists the prefix and inserts a live row for every object whose
+    /// user metadata has the piece fields. Trash is not on the object, so
+    /// every rebuilt row is live.
+    pub async fn startup(&self) -> Result<()> {
+        self.head_bucket().await?;
+        if self.needs_rebuild.swap(false, Ordering::AcqRel)
+            && let Err(err) = self.rebuild().await
+        {
+            self.needs_rebuild.store(true, Ordering::Release);
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    /// Writes a piece: insert `writing`, put the object, then mark `live`.
+    pub async fn put_piece(
+        &self,
+        satellite_id: &str,
+        piece_id: &str,
+        body: &[u8],
+        meta: PieceMeta,
+    ) -> Result<()> {
+        let mut upload = self.upload_piece(satellite_id, piece_id, meta)?;
+        upload.write(body).await?;
+        upload.finish().await
+    }
+
+    /// Starts a piece upload. [`Upload::finish`] runs the writing/live commit.
+    ///
+    /// [`Upload::cancel`] before finish aborts a multipart upload and does not
+    /// delete an object already stored at this key.
+    pub fn upload_piece(
+        &self,
+        satellite_id: &str,
+        piece_id: &str,
+        meta: PieceMeta,
+    ) -> Result<Upload> {
+        let map = metadata_map(&meta)?;
+        let mut upload = self.upload(satellite_id, piece_id, Some(map))?;
+        upload.piece = Some(PieceAttempt {
+            satellite_id: satellite_id.to_owned(),
+            piece_id: piece_id.to_owned(),
+            meta,
+            previous: None,
+            reserved: false,
+            committed: false,
+        });
+        Ok(upload)
+    }
+
+    /// Reads a live or trashed piece.
+    ///
+    /// A `writing` row and a missing row are [`Error::NotFound`], even when
+    /// the key is in the bucket. Trash still returns the bytes and sets
+    /// [`Download::restored_from_trash`].
+    pub async fn download(
+        &self,
+        satellite_id: &str,
+        piece_id: &str,
+        range: Option<std::ops::Range<u64>>,
+    ) -> Result<Download> {
+        check_piece(satellite_id, piece_id)?;
+        let info = self
+            .index
+            .get(satellite_id, piece_id)?
+            .ok_or(Error::NotFound)?;
+        let restored = match info.state {
+            PieceState::Live => false,
+            PieceState::Trash => true,
+            PieceState::Writing => return Err(Error::NotFound),
+        };
+        match self.get(satellite_id, piece_id, range).await {
+            Ok(bytes) => Ok(Download {
+                bytes,
+                restored_from_trash: restored,
+            }),
+            Err(Error::NotFound) => {
+                if self.index.get(satellite_id, piece_id)?.as_ref() == Some(&info) {
+                    self.index.delete(satellite_id, piece_id)?;
+                }
+                Err(Error::NotFound)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// True only for a `live` row.
+    pub fn exists(&self, satellite_id: &str, piece_id: &str) -> Result<bool> {
+        check_piece(satellite_id, piece_id)?;
+        self.index.exists_live(satellite_id, piece_id)
+    }
+
+    /// The index row, including `writing` and `trash`. `Ok(None)` when absent.
+    pub fn info(&self, satellite_id: &str, piece_id: &str) -> Result<Option<PieceInfo>> {
+        check_piece(satellite_id, piece_id)?;
+        self.index.get(satellite_id, piece_id)
+    }
+
+    /// Flags a live piece as trash. Does not move the object.
+    ///
+    /// Already-trash succeeds and leaves the original `trashed_at` in place.
+    pub async fn trash(&self, satellite_id: &str, piece_id: &str, at: SystemTime) -> Result<()> {
+        check_piece(satellite_id, piece_id)?;
+        let _guard = self.commit.lock().await;
+        if self.index.trash(satellite_id, piece_id, at)? {
+            return Ok(());
+        }
+        match self.index.get(satellite_id, piece_id)? {
+            Some(info) if info.state == PieceState::Trash => Ok(()),
+            _ => Err(Error::NotFound),
+        }
+    }
+
+    /// Clears trash for one satellite. Rows whose objects were already
+    /// deleted by the chore are gone, so they are not restored.
+    pub async fn restore_trash(&self, satellite_id: &str) -> Result<u64> {
+        check_id("satellite id", satellite_id)?;
+        let _guard = self.commit.lock().await;
+        self.index.restore_trash(satellite_id)
+    }
+
+    /// Allocation, live bytes, trash bytes, and free space (`allocated - live`).
+    pub fn space(&self) -> Result<Space> {
+        let (used, trash) = self.index.sums()?;
+        Ok(Space {
+            allocated: self.allocated_bytes,
+            used,
+            trash,
+            free: self.allocated_bytes.saturating_sub(used),
+        })
+    }
+
+    /// Deletes expired pieces, then trash whose `trashed_at` is at least
+    /// [`TRASH_KEEP`] before `now`. Each delete removes the object and the row.
+    pub async fn run_chore(&self, now: SystemTime) -> Result<()> {
+        for (satellite_id, piece_id) in self.index.expired(now)? {
+            let _guard = self.commit.lock().await;
+            if self.index.is_expired(&satellite_id, &piece_id, now)? {
+                self.delete_stored(&satellite_id, &piece_id).await?;
+            }
+        }
+        for (satellite_id, piece_id) in self.index.trash_due(now)? {
+            let _guard = self.commit.lock().await;
+            if self.index.is_trash_due(&satellite_id, &piece_id, now)? {
+                self.delete_stored(&satellite_id, &piece_id).await?;
+            }
+        }
+        Ok(())
     }
 
     /// Starts an upload.
@@ -211,6 +427,9 @@ impl Store {
             parts: Vec::new(),
             next_part: 1,
             failed: None,
+            index: self.index.clone(),
+            commit: Arc::clone(&self.commit),
+            piece: None,
         })
     }
 
@@ -323,10 +542,100 @@ impl Store {
         }
     }
 
-    /// Deletes the object. Already-absent keys succeed.
+    /// Deletes the object and the index row. Already-absent keys succeed.
     pub async fn delete(&self, satellite_id: &str, piece_id: &str) -> Result<()> {
+        let _guard = self.commit.lock().await;
+        self.delete_stored(satellite_id, piece_id).await
+    }
+
+    async fn delete_stored(&self, satellite_id: &str, piece_id: &str) -> Result<()> {
         let key = object_key(&self.prefix, satellite_id, piece_id)?;
-        delete_object(&self.client, &self.bucket, &key).await
+        delete_object(&self.client, &self.bucket, &key).await?;
+        self.index.delete(satellite_id, piece_id)
+    }
+
+    async fn rebuild(&self) -> Result<u64> {
+        let prefix = list_prefix(&self.prefix);
+        let mut count = 0u64;
+        let mut start_after: Option<String> = None;
+        loop {
+            let page = self.list_page(&prefix, start_after.as_deref()).await?;
+            if page.keys.is_empty() {
+                break;
+            }
+            for key in &page.keys {
+                let Some((satellite_id, piece_id)) = split_object_key(&self.prefix, key) else {
+                    continue;
+                };
+                let Some((size, meta)) = self.head_listed(key).await? else {
+                    continue;
+                };
+                let Some(info) = piece_from_metadata(&satellite_id, &piece_id, size, &meta) else {
+                    continue;
+                };
+                self.index.upsert(&info)?;
+                count += 1;
+            }
+            if !page.truncated {
+                break;
+            }
+            // s3s-fs pages with start_after and is_truncated. It does not
+            // return a continuation token.
+            let Some(last) = page.keys.last() else {
+                break;
+            };
+            if start_after.as_deref() == Some(last.as_str()) {
+                break;
+            }
+            start_after = Some(last.clone());
+        }
+        Ok(count)
+    }
+
+    async fn list_page(&self, prefix: &str, start_after: Option<&str>) -> Result<ListPage> {
+        let mut req = self
+            .client
+            .list_objects_v2()
+            .bucket(&self.bucket)
+            .max_keys(1000);
+        if !prefix.is_empty() {
+            req = req.prefix(prefix);
+        }
+        if let Some(start_after) = start_after {
+            req = req.start_after(start_after);
+        }
+        let out = req.send().await.map_err(map_s3)?;
+        let keys = out
+            .contents()
+            .iter()
+            .filter_map(|obj| obj.key().map(str::to_owned))
+            .collect();
+        Ok(ListPage {
+            keys,
+            truncated: out.is_truncated().unwrap_or(false),
+        })
+    }
+
+    async fn head_listed(&self, key: &str) -> Result<Option<(u64, HashMap<String, String>)>> {
+        match self
+            .client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+        {
+            Ok(out) => {
+                let size = out.content_length().unwrap_or(0);
+                let size = u64::try_from(size).unwrap_or(0);
+                let meta = normalize_metadata(out.metadata()).unwrap_or_default();
+                Ok(Some((size, meta)))
+            }
+            Err(err) if is_missing_code(err.code()) || err.code() == Some("NoSuchBucket") => {
+                Ok(None)
+            }
+            Err(err) => Err(map_s3(err)),
+        }
     }
 }
 
@@ -347,6 +656,23 @@ pub struct Upload {
     next_part: i32,
     // A failed part must not be completed later as a short or empty object.
     failed: Option<Error>,
+    index: index::Index,
+    commit: Arc<tokio::sync::Mutex<()>>,
+    piece: Option<PieceAttempt>,
+}
+
+struct PieceAttempt {
+    satellite_id: String,
+    piece_id: String,
+    meta: PieceMeta,
+    previous: Option<PieceInfo>,
+    reserved: bool,
+    committed: bool,
+}
+
+struct ListPage {
+    keys: Vec<String>,
+    truncated: bool,
 }
 
 impl Upload {
@@ -369,22 +695,38 @@ impl Upload {
     }
 
     /// Commits the object, overwriting any previous body at this key.
+    ///
+    /// A piece upload inserts `writing` first. The row stays `writing` when
+    /// this returns after the put and before `live` is recorded, including
+    /// when the process dies in that window. The object is then not served.
     pub async fn finish(mut self) -> Result<()> {
-        let result = self.finish_inner().await;
-        if result.is_ok() {
-            // Complete already published the object. Do not abort it on drop.
-            self.upload_id = None;
+        let commit = Arc::clone(&self.commit);
+        let _guard = commit.lock().await;
+        self.reserve_piece()?;
+        if let Err(err) = self.finish_inner().await {
+            // Put did not return success. Restore the previous row so a failed
+            // overwrite does not hide that piece. A crash skips this and leaves
+            // `writing`, which is not served.
+            self.rollback_piece()?;
+            return Err(err);
         }
-        result
+        // Complete already published the object. Do not abort it on drop.
+        self.upload_id = None;
+        if let Some(piece) = &mut self.piece {
+            piece.committed = true;
+        }
+        self.mark_piece_live()?;
+        Ok(())
     }
 
     /// Aborts an in-progress multipart upload.
     ///
-    /// An object already stored at this key stays. This upload has not committed,
-    /// so cancel does not delete the key.
+    /// An object already stored at this key stays. This upload has not put,
+    /// so cancel does not delete that key or a live row.
     pub async fn cancel(mut self) -> Result<()> {
         self.abort_multipart().await?;
         self.upload_id = None;
+        self.rollback_piece()?;
         Ok(())
     }
 
@@ -526,10 +868,78 @@ impl Upload {
             Err(err) => Err(Error::S3(err.to_string())),
         }
     }
+
+    fn reserve_piece(&mut self) -> Result<()> {
+        let Some(piece) = &self.piece else {
+            return Ok(());
+        };
+        if piece.reserved {
+            return Ok(());
+        }
+        let satellite_id = piece.satellite_id.clone();
+        let piece_id = piece.piece_id.clone();
+        let meta = piece.meta.clone();
+        let size = self.buffered_len();
+        let previous = self.index.get(&satellite_id, &piece_id)?;
+        let row = PieceInfo::from_meta(&satellite_id, &piece_id, size, &meta, PieceState::Writing);
+        self.index.upsert(&row)?;
+        let Some(piece) = self.piece.as_mut() else {
+            return Ok(());
+        };
+        piece.previous = previous;
+        piece.reserved = true;
+        Ok(())
+    }
+
+    fn rollback_piece(&mut self) -> Result<()> {
+        let Some(piece) = self.piece.as_mut() else {
+            return Ok(());
+        };
+        if !piece.reserved || piece.committed {
+            return Ok(());
+        }
+        let previous = piece.previous.clone();
+        let satellite_id = piece.satellite_id.clone();
+        let piece_id = piece.piece_id.clone();
+        piece.reserved = false;
+        if let Some(previous) = previous {
+            self.index.upsert(&previous)
+        } else {
+            self.index.delete(&satellite_id, &piece_id)
+        }
+    }
+
+    fn mark_piece_live(&mut self) -> Result<()> {
+        let Some(piece) = self.piece.as_mut() else {
+            return Ok(());
+        };
+        if !piece.reserved {
+            return Ok(());
+        }
+        self.index.mark_live(&piece.satellite_id, &piece.piece_id)?;
+        piece.reserved = false;
+        piece.previous = None;
+        Ok(())
+    }
+
+    fn buffered_len(&self) -> u64 {
+        let parts = u64::from(self.next_part.saturating_sub(1).cast_unsigned());
+        let part_len = u64::try_from(PART_SIZE).unwrap_or(u64::MAX);
+        parts
+            .saturating_mul(part_len)
+            .saturating_add(u64::try_from(self.buf.len()).unwrap_or(u64::MAX))
+    }
 }
 
 impl Drop for Upload {
     fn drop(&mut self) {
+        if self
+            .piece
+            .as_ref()
+            .is_some_and(|piece| piece.reserved && !piece.committed)
+        {
+            let _ = self.rollback_piece();
+        }
         // Only abort this upload id. DeleteObject from Drop can run after a
         // later put of the same key and remove that committed object.
         let Some(upload_id) = self.upload_id.clone() else {
@@ -550,6 +960,166 @@ impl Drop for Upload {
             });
         }
     }
+}
+
+fn check_piece(satellite_id: &str, piece_id: &str) -> Result<()> {
+    check_id("satellite id", satellite_id)?;
+    check_id("piece id", piece_id)?;
+    Ok(())
+}
+
+fn metadata_map(meta: &PieceMeta) -> Result<HashMap<String, String>> {
+    if meta.order_limit.is_empty() {
+        return Err(Error::Metadata("order limit is empty".into()));
+    }
+    let mut map = HashMap::new();
+    map.insert("piece-hash".to_owned(), encode_hex(&meta.hash));
+    map.insert(
+        "hash-algorithm".to_owned(),
+        meta.algorithm.as_str().to_owned(),
+    );
+    map.insert("created".to_owned(), format_rfc3339(meta.created)?);
+    if let Some(expires) = meta.expires {
+        map.insert("expires".to_owned(), format_rfc3339(expires)?);
+    }
+    map.insert("order-limit".to_owned(), BASE64.encode(&meta.order_limit));
+    let len = map
+        .iter()
+        .map(|(key, value)| "x-amz-meta-".len() + key.len() + value.len())
+        .sum::<usize>();
+    if len > 2048 {
+        return Err(Error::Metadata("user metadata exceeds 2048 bytes".into()));
+    }
+    Ok(map)
+}
+
+fn piece_from_metadata(
+    satellite_id: &str,
+    piece_id: &str,
+    size: u64,
+    meta: &HashMap<String, String>,
+) -> Option<PieceInfo> {
+    let hash = decode_hex(meta.get("piece-hash")?)?;
+    let hash: [u8; 32] = hash.try_into().ok()?;
+    let algorithm = HashAlgorithm::parse(meta.get("hash-algorithm")?)?;
+    let created = parse_rfc3339(meta.get("created")?).ok()?;
+    let expires = match meta.get("expires") {
+        None => None,
+        Some(value) if value.is_empty() => None,
+        Some(value) => Some(parse_rfc3339(value).ok()?),
+    };
+    let order_limit = BASE64.decode(meta.get("order-limit")?).ok()?;
+    if order_limit.is_empty() {
+        return None;
+    }
+    Some(PieceInfo {
+        satellite_id: satellite_id.to_owned(),
+        piece_id: piece_id.to_owned(),
+        size,
+        hash,
+        algorithm,
+        order_limit,
+        created,
+        expires,
+        trashed_at: None,
+        state: PieceState::Live,
+    })
+}
+
+fn format_rfc3339(time: SystemTime) -> Result<String> {
+    let dt = system_to_offset(time)?;
+    dt.format(&time::format_description::well_known::Rfc3339)
+        .map_err(|err| Error::Metadata(err.to_string()))
+}
+
+fn parse_rfc3339(value: &str) -> Result<SystemTime> {
+    let dt = time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
+        .map_err(|err| Error::Metadata(err.to_string()))?;
+    let nanos = dt.unix_timestamp_nanos();
+    if nanos < 0 {
+        return Err(Error::Metadata("timestamp is before the unix epoch".into()));
+    }
+    let nanos = u64::try_from(nanos).map_err(|_| Error::Metadata("timestamp overflow".into()))?;
+    let secs = nanos / 1_000_000_000;
+    let sub = u32::try_from(nanos % 1_000_000_000)
+        .map_err(|_| Error::Metadata("timestamp overflow".into()))?;
+    UNIX_EPOCH
+        .checked_add(std::time::Duration::new(secs, sub))
+        .ok_or_else(|| Error::Metadata("timestamp overflow".into()))
+}
+
+fn system_to_offset(time: SystemTime) -> Result<time::OffsetDateTime> {
+    let dur = time
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| Error::Metadata("timestamp is before the unix epoch".into()))?;
+    let nanos =
+        i128::try_from(dur.as_nanos()).map_err(|_| Error::Metadata("timestamp overflow".into()))?;
+    time::OffsetDateTime::from_unix_timestamp_nanos(nanos)
+        .map_err(|err| Error::Metadata(err.to_string()))
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(char::from(HEX[usize::from(byte >> 4)]));
+        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    out
+}
+
+fn decode_hex(value: &str) -> Option<Vec<u8>> {
+    if !value.len().is_multiple_of(2) {
+        return None;
+    }
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    let mut i = 0;
+    while i < bytes.len() {
+        let hi = from_hex(bytes[i])?;
+        let lo = from_hex(bytes[i + 1])?;
+        out.push((hi << 4) | lo);
+        i += 2;
+    }
+    Some(out)
+}
+
+fn from_hex(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn list_prefix(prefix: &str) -> String {
+    let prefix = prefix.trim_matches('/');
+    if prefix.is_empty() {
+        String::new()
+    } else {
+        format!("{prefix}/")
+    }
+}
+
+fn split_object_key(prefix: &str, key: &str) -> Option<(String, String)> {
+    let prefix = prefix.trim_matches('/');
+    let rest = if prefix.is_empty() {
+        key
+    } else {
+        key.strip_prefix(prefix)?.strip_prefix('/')?
+    };
+    if rest.is_empty() || rest.ends_with('/') {
+        return None;
+    }
+    let (satellite_id, piece_id) = rest.split_once('/')?;
+    if piece_id.contains('/') || satellite_id.starts_with('.') || piece_id.starts_with('.') {
+        return None;
+    }
+    if check_id("satellite id", satellite_id).is_err() || check_id("piece id", piece_id).is_err() {
+        return None;
+    }
+    Some((satellite_id.to_owned(), piece_id.to_owned()))
 }
 
 fn metadata_pairs(metadata: Option<&HashMap<String, String>>) -> Result<Vec<(String, String)>> {
@@ -735,5 +1305,72 @@ mod tests {
     fn metadata_keys_drop_the_amz_prefix() {
         assert_eq!(normalize_meta_key("X-Amz-Meta-Piece-Hash"), "piece-hash");
         assert_eq!(normalize_meta_key("note"), "note");
+    }
+
+    #[test]
+    fn piece_metadata_round_trip() {
+        let created = UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let expires = created + std::time::Duration::from_millis(1500);
+        let meta = PieceMeta {
+            hash: [0xab; 32],
+            algorithm: HashAlgorithm::Blake3,
+            created,
+            expires: Some(expires),
+            order_limit: b"order-limit-bytes".to_vec(),
+        };
+        let map = metadata_map(&meta).unwrap();
+        let hash = "ab".repeat(32);
+        assert_eq!(
+            map.get("piece-hash").map(String::as_str),
+            Some(hash.as_str())
+        );
+        assert_eq!(
+            map.get("hash-algorithm").map(String::as_str),
+            Some("blake3")
+        );
+        assert_eq!(
+            map.get("order-limit").map(String::as_str),
+            Some("b3JkZXItbGltaXQtYnl0ZXM=")
+        );
+        let info = piece_from_metadata("sat", "piece", 4, &map).unwrap();
+        assert_eq!(info.hash, meta.hash);
+        assert_eq!(info.algorithm, HashAlgorithm::Blake3);
+        assert_eq!(info.order_limit, meta.order_limit);
+        assert_eq!(
+            index::system_to_millis(info.created).unwrap(),
+            index::system_to_millis(created).unwrap()
+        );
+        assert_eq!(
+            index::system_to_millis(info.expires.unwrap()).unwrap(),
+            index::system_to_millis(expires).unwrap()
+        );
+        assert_eq!(info.state, PieceState::Live);
+
+        let mut bare = HashMap::new();
+        bare.insert("note".to_owned(), "x".to_owned());
+        assert!(piece_from_metadata("sat", "piece", 1, &bare).is_none());
+    }
+
+    #[test]
+    fn split_key_is_prefix_satellite_and_piece() {
+        assert_eq!(
+            split_object_key("pieces", "pieces/sat/abc").unwrap(),
+            ("sat".to_owned(), "abc".to_owned())
+        );
+        assert!(split_object_key("pieces", "pieces/sat").is_none());
+        assert!(split_object_key("pieces", "other/sat/abc").is_none());
+        assert!(split_object_key("pieces", "pieces/sat/a/b").is_none());
+    }
+
+    #[test]
+    fn empty_order_limit_is_rejected() {
+        let meta = PieceMeta {
+            hash: [1; 32],
+            algorithm: HashAlgorithm::Sha256,
+            created: UNIX_EPOCH + std::time::Duration::from_secs(10),
+            expires: None,
+            order_limit: Vec::new(),
+        };
+        assert!(matches!(metadata_map(&meta), Err(Error::Metadata(_))));
     }
 }

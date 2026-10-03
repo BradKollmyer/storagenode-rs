@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -14,7 +14,9 @@ use hyper_util::server::conn::auto::Builder as ConnBuilder;
 use s3s::auth::SimpleAuth;
 use s3s::service::S3ServiceBuilder;
 use s3s_fs::FileSystem;
-use s3store::{Config, Error, PART_SIZE, Store};
+use s3store::{
+    Config, Error, HashAlgorithm, PART_SIZE, PIECES_DB, PieceMeta, PieceState, Store, TRASH_KEEP,
+};
 
 const ACCESS_KEY: &str = "test-access-key";
 const SECRET: &str = "test-secret-key";
@@ -49,6 +51,7 @@ struct TestS3 {
     store: Store,
     root: TempRoot,
     endpoint: String,
+    config: Config,
 }
 
 impl TestS3 {
@@ -58,20 +61,43 @@ impl TestS3 {
         std::fs::create_dir(root.path().join(BUCKET)).expect("bucket dir");
         let addr = spawn_server(root.path());
         let endpoint = format!("http://{addr}");
-        let store = Store::new(Config {
+        let config = Config {
             endpoint: endpoint.clone(),
             bucket: BUCKET.to_owned(),
             access_key_id: ACCESS_KEY.to_owned(),
             secret_access_key: SECRET.to_owned(),
+            volume: root.path().join("volume"),
+            allocated_bytes: 1 << 40,
             ..Config::default()
-        })
-        .expect("store");
-        store.head_bucket().await.expect("bucket is reachable");
+        };
+        let store = Store::new(config.clone()).expect("store");
+        store.startup().await.expect("startup");
         Self {
             store,
             root,
             endpoint,
+            config,
         }
+    }
+
+    /// Drops the open database, deletes it, and opens a new one on the same volume.
+    fn reopen_without_db(&mut self) {
+        let scratch = self.root.path().join(format!(
+            "scratch-{}",
+            TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&scratch).expect("scratch");
+        let mut scratch_config = self.config.clone();
+        scratch_config.volume = scratch;
+        // Drop the connection before unlinking pieces.db.
+        self.store = Store::new(scratch_config).expect("scratch store");
+        for name in [PIECES_DB, "pieces.db-wal", "pieces.db-shm"] {
+            let path = self.config.volume.join(name);
+            if path.exists() {
+                std::fs::remove_file(&path).expect("remove db");
+            }
+        }
+        self.store = Store::new(self.config.clone()).expect("reopen");
     }
 }
 
@@ -427,11 +453,13 @@ async fn missing_key_head_and_empty_range_are_not_found() {
         Some("empty")
     );
 
+    let volume = TempRoot::new();
     let missing_bucket = Store::new(Config {
         endpoint: s3.endpoint.clone(),
         bucket: "no-such-bucket".to_owned(),
         access_key_id: ACCESS_KEY.to_owned(),
         secret_access_key: SECRET.to_owned(),
+        volume: volume.path().join("volume"),
         ..Config::default()
     })
     .expect("store");
@@ -465,11 +493,13 @@ async fn drop_aborts_multipart_without_deleting_a_later_put() {
 
 #[tokio::test]
 async fn head_bucket_errors_when_unreachable() {
+    let volume = TempRoot::new();
     let store = Store::new(Config {
         endpoint: "http://127.0.0.1:1".to_owned(),
         bucket: BUCKET.to_owned(),
         access_key_id: ACCESS_KEY.to_owned(),
         secret_access_key: SECRET.to_owned(),
+        volume: volume.path().join("volume"),
         ..Config::default()
     })
     .expect("store");
@@ -477,4 +507,336 @@ async fn head_bucket_errors_when_unreachable() {
     let text = err.to_string();
     assert!(!text.contains(SECRET), "{text}");
     assert!(!matches!(err, Error::NotFound), "{err}");
+}
+
+fn piece_meta(expires: Option<SystemTime>, hash_byte: u8) -> PieceMeta {
+    PieceMeta {
+        hash: [hash_byte; 32],
+        algorithm: HashAlgorithm::Blake3,
+        created: UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+        expires,
+        order_limit: b"order-limit-bytes".to_vec(),
+    }
+}
+
+#[tokio::test]
+async fn trash_restore_and_chore() {
+    let s3 = TestS3::start().await;
+    let store = &s3.store;
+    let body = b"trashed-bytes";
+    store
+        .put_piece("sat-a", "piece-1", body, piece_meta(None, 0x11))
+        .await
+        .expect("put");
+    store
+        .put_piece("sat-b", "piece-1", b"other", piece_meta(None, 0x22))
+        .await
+        .expect("other sat");
+    assert!(store.exists("sat-a", "piece-1").expect("exists"));
+
+    let trashed_at = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    store
+        .trash("sat-a", "piece-1", trashed_at)
+        .await
+        .expect("trash");
+    assert!(!store.exists("sat-a", "piece-1").expect("exists"));
+    assert!(store.exists("sat-b", "piece-1").expect("other"));
+    // Trash is a flag. The object stays at the same key.
+    assert_eq!(
+        store.get("sat-a", "piece-1", None).await.expect("object"),
+        body
+    );
+
+    let download = store
+        .download("sat-a", "piece-1", None)
+        .await
+        .expect("download trash");
+    assert!(download.restored_from_trash);
+    assert_eq!(download.bytes, body);
+    assert!(!store.exists("sat-a", "piece-1").expect("still trash"));
+
+    // A second trash does not move the 7-day clock.
+    store
+        .trash("sat-a", "piece-1", trashed_at + Duration::from_secs(10))
+        .await
+        .expect("trash again");
+    let info = store.info("sat-a", "piece-1").expect("info").expect("row");
+    assert_eq!(info.state, PieceState::Trash);
+    assert_eq!(info.trashed_at, Some(trashed_at));
+
+    assert_eq!(store.restore_trash("sat-b").await.expect("other"), 0);
+    assert!(!store.exists("sat-a", "piece-1").expect("untouched"));
+    assert_eq!(store.restore_trash("sat-a").await.expect("restore"), 1);
+    assert!(store.exists("sat-a", "piece-1").expect("live"));
+    let download = store
+        .download("sat-a", "piece-1", Some(0..4))
+        .await
+        .expect("download");
+    assert!(!download.restored_from_trash);
+    assert_eq!(download.bytes, b"tras");
+
+    store
+        .trash("sat-a", "piece-1", trashed_at)
+        .await
+        .expect("trash");
+    store
+        .run_chore(trashed_at + TRASH_KEEP - Duration::from_secs(1))
+        .await
+        .expect("too soon");
+    assert!(
+        store
+            .download("sat-a", "piece-1", None)
+            .await
+            .expect("kept")
+            .restored_from_trash
+    );
+    store
+        .run_chore(trashed_at + TRASH_KEEP)
+        .await
+        .expect("empty trash");
+    let err = store
+        .download("sat-a", "piece-1", None)
+        .await
+        .expect_err("deleted");
+    assert!(matches!(err, Error::NotFound), "{err}");
+    let err = store
+        .get("sat-a", "piece-1", None)
+        .await
+        .expect_err("object gone");
+    assert!(matches!(err, Error::NotFound), "{err}");
+    assert!(store.info("sat-a", "piece-1").expect("info").is_none());
+    assert!(store.exists("sat-b", "piece-1").expect("other sat"));
+
+    // No index row: the object is not served.
+    store
+        .put("sat-a", "orphan", b"hidden", None)
+        .await
+        .expect("raw put");
+    let err = store
+        .download("sat-a", "orphan", None)
+        .await
+        .expect_err("unreferenced");
+    assert!(matches!(err, Error::NotFound), "{err}");
+    assert_eq!(
+        store.get("sat-a", "orphan", None).await.expect("bytes"),
+        b"hidden"
+    );
+
+    let mut upload = store
+        .upload_piece("sat-b", "piece-1", piece_meta(None, 0x33))
+        .expect("upload");
+    upload.write(b"nope").await.expect("write");
+    upload.cancel().await.expect("cancel");
+    assert!(store.exists("sat-b", "piece-1").expect("still live"));
+    assert_eq!(
+        store.get("sat-b", "piece-1", None).await.expect("kept"),
+        b"other"
+    );
+}
+
+#[tokio::test]
+async fn chore_deletes_expired_pieces() {
+    let s3 = TestS3::start().await;
+    let store = &s3.store;
+    let created = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let expires = created + Duration::from_secs(100);
+    store
+        .put_piece("sat-e", "old", b"gone", piece_meta(Some(expires), 0x44))
+        .await
+        .expect("old");
+    store
+        .put_piece(
+            "sat-e",
+            "keep",
+            b"stay",
+            piece_meta(Some(expires + Duration::from_secs(50)), 0x45),
+        )
+        .await
+        .expect("keep");
+    store
+        .put_piece("sat-e", "forever", b"ever", piece_meta(None, 0x46))
+        .await
+        .expect("forever");
+
+    store
+        .run_chore(expires - Duration::from_secs(1))
+        .await
+        .expect("before expiry");
+    assert!(store.exists("sat-e", "old").expect("not yet"));
+
+    store.run_chore(expires).await.expect("expire");
+    assert!(store.info("sat-e", "old").expect("info").is_none());
+    assert!(matches!(
+        store.get("sat-e", "old", None).await,
+        Err(Error::NotFound)
+    ));
+    assert!(store.exists("sat-e", "keep").expect("keep"));
+    assert!(store.exists("sat-e", "forever").expect("forever"));
+
+    store
+        .run_chore(expires + Duration::from_secs(50))
+        .await
+        .expect("later");
+    assert!(store.info("sat-e", "keep").expect("info").is_none());
+    assert!(store.exists("sat-e", "forever").expect("no expiry"));
+    assert_eq!(
+        store.get("sat-e", "forever", None).await.expect("bytes"),
+        b"ever"
+    );
+}
+
+#[tokio::test]
+async fn free_space_is_allocation_minus_live_sizes() {
+    let s3 = TestS3::start().await;
+    let mut config = s3.config.clone();
+    config.allocated_bytes = 1000;
+    config.volume = s3.root.path().join("space-volume");
+    let store = Store::new(config).expect("store");
+    store.startup().await.expect("startup");
+    let space = store.space().expect("space");
+    assert_eq!(
+        (space.allocated, space.used, space.trash, space.free),
+        (1000, 0, 0, 1000)
+    );
+
+    store
+        .put_piece("sat-s", "a", &[1; 400], piece_meta(None, 0x01))
+        .await
+        .expect("a");
+    store
+        .put_piece("sat-s", "b", &[2; 100], piece_meta(None, 0x02))
+        .await
+        .expect("b");
+    let space = store.space().expect("space");
+    assert_eq!((space.used, space.trash, space.free), (500, 0, 500));
+
+    store
+        .put_piece("sat-s", "a", &[3; 50], piece_meta(None, 0x03))
+        .await
+        .expect("overwrite");
+    let space = store.space().expect("space");
+    assert_eq!((space.used, space.free), (150, 850));
+
+    store
+        .trash(
+            "sat-s",
+            "b",
+            UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+        )
+        .await
+        .expect("trash");
+    let space = store.space().expect("space");
+    assert_eq!((space.used, space.trash, space.free), (50, 100, 950));
+
+    store
+        .put_piece("sat-s", "big", &[9; 2000], piece_meta(None, 0x04))
+        .await
+        .expect("over");
+    assert_eq!(store.space().expect("space").free, 0);
+}
+
+#[tokio::test]
+async fn rebuild_from_object_metadata() {
+    let mut s3 = TestS3::start().await;
+    let created = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let expires = created + Duration::from_secs(3600);
+    let body = b"rebuild-me";
+    s3.store
+        .put_piece("sat-r", "piece", body, piece_meta(Some(expires), 0xab))
+        .await
+        .expect("put");
+
+    let mut big = vec![0_u8; PART_SIZE + 3];
+    big[0] = 1;
+    big[PART_SIZE] = 2;
+    s3.store
+        .put_piece("sat-r", "big", &big, piece_meta(None, 0xcd))
+        .await
+        .expect("multipart");
+
+    // Trash is not stored on the object.
+    s3.store
+        .trash("sat-r", "piece", created)
+        .await
+        .expect("trash");
+    s3.store
+        .put("sat-r", "plain", b"xyz", Some(note("nope")))
+        .await
+        .expect("plain");
+
+    let head = s3
+        .store
+        .head("sat-r", "piece")
+        .await
+        .expect("head")
+        .expect("meta");
+    assert_eq!(
+        head.get("piece-hash").map(String::as_str),
+        Some("ab".repeat(32).as_str())
+    );
+    assert_eq!(
+        head.get("hash-algorithm").map(String::as_str),
+        Some("blake3")
+    );
+    let created_meta = head.get("created").expect("created");
+    assert!(
+        created_meta.starts_with("2023-11-14T22:13:20"),
+        "{created_meta}"
+    );
+    assert!(head.contains_key("expires"));
+    assert_eq!(
+        head.get("order-limit").map(String::as_str),
+        Some("b3JkZXItbGltaXQtYnl0ZXM=")
+    );
+
+    s3.reopen_without_db();
+    s3.store.startup().await.expect("rebuild");
+
+    let info = s3.store.info("sat-r", "piece").expect("info").expect("row");
+    assert_eq!(info.state, PieceState::Live);
+    assert_eq!(info.hash, [0xab; 32]);
+    assert_eq!(info.algorithm, HashAlgorithm::Blake3);
+    assert_eq!(info.order_limit, b"order-limit-bytes");
+    assert_eq!(info.size, u64::try_from(body.len()).unwrap());
+    assert_eq!(info.created, created);
+    assert_eq!(info.expires, Some(expires));
+    assert!(info.trashed_at.is_none());
+    assert!(s3.store.exists("sat-r", "piece").expect("exists"));
+    let download = s3
+        .store
+        .download("sat-r", "piece", None)
+        .await
+        .expect("download");
+    assert!(!download.restored_from_trash);
+    assert_eq!(download.bytes, body);
+
+    let big_info = s3.store.info("sat-r", "big").expect("info").expect("row");
+    assert_eq!(big_info.size, u64::try_from(big.len()).unwrap());
+    assert_eq!(big_info.hash, [0xcd; 32]);
+    assert!(big_info.expires.is_none());
+    assert_eq!(
+        s3.store
+            .get("sat-r", "big", Some(0..1))
+            .await
+            .expect("head byte"),
+        [1]
+    );
+
+    assert!(s3.store.info("sat-r", "plain").expect("info").is_none());
+    assert!(!s3.store.exists("sat-r", "plain").expect("plain"));
+
+    // The database file exists now, so startup must not rebuild trash away.
+    s3.store
+        .trash("sat-r", "piece", created)
+        .await
+        .expect("trash");
+    s3.store.startup().await.expect("startup");
+    assert_eq!(
+        s3.store
+            .info("sat-r", "piece")
+            .expect("info")
+            .expect("row")
+            .state,
+        PieceState::Trash
+    );
 }
