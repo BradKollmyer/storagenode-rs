@@ -5,9 +5,8 @@
 //! [`DEFAULT_PROTOCOL`] (`NOISE_IK_25519_CHACHAPOLY_BLAKE2B`).
 
 use std::fs;
-use std::io::{self, Write};
+use std::io;
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use snow::params::DHChoice;
 use snow::resolvers::{CryptoResolver, DefaultResolver};
@@ -66,7 +65,7 @@ impl Key {
             Ok(key) => Ok(key),
             Err(Error::Io(err)) if err.kind() == io::ErrorKind::NotFound => {
                 let key = Self::generate()?;
-                match publish_secret(volume, &path, key.private()) {
+                match crate::secret::publish(volume, &path, key.private()) {
                     Ok(()) => Ok(key),
                     Err(err) if err.kind() == io::ErrorKind::AlreadyExists => read_key(&path),
                     Err(err) => Err(err.into()),
@@ -123,51 +122,10 @@ fn read_key(path: &Path) -> Result<Key, Error> {
     Key::from_private(&bytes)
 }
 
-/// Writes `bytes` to a temp file in `volume`, syncs it, then links `path`.
-///
-/// `rename` would replace a key the other start already published.
-/// `hard_link` fails with [`io::ErrorKind::AlreadyExists`] instead.
-fn publish_secret(volume: &Path, path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|dur| dur.as_nanos())
-        .unwrap_or(0);
-    let tmp = volume.join(format!(".{FILE_NAME}.{}.{nanos}.tmp", std::process::id()));
-    let mut opts = fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut file = opts.open(&tmp)?;
-    let write = (|| {
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        Ok(())
-    })();
-    drop(file);
-    if let Err(err) = write {
-        let _ = fs::remove_file(&tmp);
-        return Err(err);
-    }
-    let linked = fs::hard_link(&tmp, path);
-    if linked.is_ok() {
-        sync_dir(volume)?;
-    }
-    let _ = fs::remove_file(&tmp);
-    linked
-}
-
-fn sync_dir(dir: &Path) -> io::Result<()> {
-    let file = fs::File::open(dir)?;
-    file.sync_all()?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn persists_32_bytes_and_reloads_the_same_public_key() {

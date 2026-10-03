@@ -38,6 +38,7 @@ mod identity;
 mod noise_key;
 mod orders;
 mod payout;
+mod secret;
 mod server;
 
 pub use config::Config;

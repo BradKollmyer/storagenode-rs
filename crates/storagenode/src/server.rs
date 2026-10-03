@@ -1576,7 +1576,8 @@ fn parse_node_id(bytes: &[u8]) -> Result<NodeId, Fail> {
     Ok(NodeId::from_bytes(arr))
 }
 
-fn encode_hex(bytes: &[u8]) -> String {
+/// Lowercase hex. Piece ids in the index and exit receipts on the console.
+pub(crate) fn encode_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
