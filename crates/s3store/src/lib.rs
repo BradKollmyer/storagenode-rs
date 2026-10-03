@@ -43,9 +43,14 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use futures_util::stream::{self, StreamExt, TryStreamExt};
 
 /// Single `PutObject` limit. Larger bodies are multipart with parts of this size.
 pub const PART_SIZE: usize = 5 * 1024 * 1024;
+
+/// `HeadObject` requests the index rebuild keeps in flight. The listing does
+/// not return user metadata, so every object needs one.
+const REBUILD_HEADS: usize = 32;
 
 const DEFAULT_REGION: &str = "us-east-1";
 const DEFAULT_PREFIX: &str = "pieces";
@@ -1202,17 +1207,22 @@ impl Store {
             if page.objects.is_empty() {
                 break;
             }
-            for object in &page.objects {
-                let Some((satellite_id, piece_id)) = split_object_key(&self.prefix, &object.key)
-                else {
-                    continue;
-                };
-                let Some((size, meta)) = self.head_listed(&object.key, object.size).await? else {
-                    continue;
-                };
-                let Some(info) = piece_from_metadata(&satellite_id, &piece_id, size, &meta) else {
-                    continue;
-                };
+            // The node does not bind its port until this returns. One head at
+            // a time makes a large bucket's restart as slow as its round trips.
+            let heads = page.objects.iter().filter_map(|object| {
+                let (satellite_id, piece_id) = split_object_key(&self.prefix, &object.key)?;
+                Some(async move {
+                    let head = self.head_listed(&object.key, object.size).await?;
+                    Ok::<_, Error>(head.and_then(|(size, meta)| {
+                        piece_from_metadata(&satellite_id, &piece_id, size, &meta)
+                    }))
+                })
+            });
+            let rows: Vec<Option<PieceInfo>> = stream::iter(heads)
+                .buffer_unordered(REBUILD_HEADS)
+                .try_collect()
+                .await?;
+            for info in rows.into_iter().flatten() {
                 self.index.upsert(&info)?;
                 count += 1;
             }
