@@ -487,10 +487,13 @@ impl Node {
 
         loop {
             let Some(bytes) = out.recv().await? else {
-                return Err(Fail::proto(
-                    RPC_INVALID_ARGUMENT,
-                    "upload closed before the piece hash",
-                ));
+                // Go: Canceled when the stream ends at the first receive,
+                // Aborted once the upload has started.
+                return Err(if limit.is_none() {
+                    Fail::proto(RPC_CANCELED, "upload closed before the order limit")
+                } else {
+                    Fail::proto(RPC_ABORTED, "upload closed before the piece hash")
+                });
             };
             let req = PieceUploadRequest::decode(bytes.as_slice())
                 .map_err(|err| Fail::proto(RPC_INVALID_ARGUMENT, err.to_string()))?;
@@ -563,31 +566,30 @@ impl Node {
     where
         T: AsyncRead + AsyncWrite + Unpin,
     {
+        // The Go endpoint wraps a failed piece-hash check, and a changed hash
+        // algorithm, as Internal. The size check below stays InvalidArgument.
         if done.piece_id != limit.piece_id {
-            return Err(Fail::proto(RPC_INVALID_ARGUMENT, "piece id changed"));
+            return Err(Fail::proto(RPC_INTERNAL, "piece id changed"));
         }
         if done.hash_algorithm != algo.to_i32() {
-            return Err(Fail::proto(RPC_INVALID_ARGUMENT, "hash algorithm mismatch"));
+            return Err(Fail::proto(RPC_INTERNAL, "hash algorithm mismatch"));
         }
         let (staging, staged) = spill;
         if done.piece_size != staged {
             return Err(Fail::proto(RPC_INVALID_ARGUMENT, "piece size mismatch"));
         }
         if done.hash.as_slice() != digest {
-            return Err(Fail::proto(RPC_INVALID_ARGUMENT, "piece hash mismatch"));
+            return Err(Fail::proto(RPC_INTERNAL, "piece hash mismatch"));
         }
         let public = PiecePublicKey::from_bytes(&limit.uplink_public_key)
-            .map_err(|_| Fail::proto(RPC_UNAUTHENTICATED, "invalid uplink public key"))?;
+            .map_err(|_| Fail::proto(RPC_INTERNAL, "invalid uplink public key"))?;
         verify_piece_hash_uplink(done, &public)
-            .map_err(|_| Fail::proto(RPC_UNAUTHENTICATED, "invalid piece hash signature"))?;
+            .map_err(|_| Fail::proto(RPC_INTERNAL, "invalid piece hash signature"))?;
         if digest.len() != 32 {
             return Err(Fail::proto(RPC_INTERNAL, "piece hash is not 32 bytes"));
         }
         if done.signature.is_empty() {
-            return Err(Fail::proto(
-                RPC_UNAUTHENTICATED,
-                "invalid piece hash signature",
-            ));
+            return Err(Fail::proto(RPC_INTERNAL, "invalid piece hash signature"));
         }
         let mut hash = [0u8; 32];
         hash.copy_from_slice(digest);
@@ -693,7 +695,7 @@ impl Node {
                 let Some(limit_ref) = limit.as_ref() else {
                     return Err(Fail::proto(RPC_INVALID_ARGUMENT, "order before limit"));
                 };
-                authorized = check_order(limit_ref, &order, authorized)?;
+                authorized = check_order(limit_ref, &order, authorized).map_err(as_internal)?;
                 early_orders.push(order);
             }
             if let Some(next) = req.chunk {
@@ -934,14 +936,16 @@ impl Node {
         let mut filter = Vec::new();
         loop {
             let Some(bytes) = out.recv().await? else {
-                return Err(Fail::proto(
-                    RPC_INVALID_ARGUMENT,
-                    "retain closed before the hash",
-                ));
+                return Err(Fail::proto(RPC_INTERNAL, "retain closed before the hash"));
             };
             let req = RetainRequest::decode(bytes.as_slice())
                 .map_err(|err| Fail::proto(RPC_INVALID_ARGUMENT, err.to_string()))?;
-            if creation_date.is_none() {
+            // The first date that is set, as `RetainRequestFromStream` takes it.
+            if creation_date
+                .as_ref()
+                .and_then(timestamp_to_system)
+                .is_none()
+            {
                 creation_date = req.creation_date;
             }
             filter.extend_from_slice(&req.filter);
@@ -964,15 +968,20 @@ impl Node {
     /// not contain them. The object stays; the 7-day chore deletes trash.
     async fn apply_retain(&self, peer: NodeId, req: &RetainRequest) -> Result<(), Fail> {
         check_retain_hash(req.hash_algorithm, &req.filter, &req.hash)?;
+        let filter = crate::bloom::Filter::from_bytes(&req.filter)
+            .map_err(|err| Fail::proto(RPC_INVALID_ARGUMENT, err.to_string()))?;
+        // An unset date is not an error in Go: its cutoff falls before every
+        // piece, nothing is trashed, and the satellite gets its reply. The
+        // same holds for a cutoff at or before the epoch.
         let created_before = req
             .creation_date
             .as_ref()
             .and_then(timestamp_to_system)
-            .ok_or_else(|| Fail::proto(RPC_INVALID_ARGUMENT, "missing creation date"))?
-            .checked_sub(RETAIN_MAX_TIME_SKEW)
-            .unwrap_or(UNIX_EPOCH);
-        let filter = crate::bloom::Filter::from_bytes(&req.filter)
-            .map_err(|err| Fail::proto(RPC_INVALID_ARGUMENT, err.to_string()))?;
+            .and_then(|created| created.checked_sub(RETAIN_MAX_TIME_SKEW))
+            .filter(|cutoff| *cutoff > UNIX_EPOCH);
+        let Some(created_before) = created_before else {
+            return Ok(());
+        };
         let sat = peer.to_string();
         let pieces = self
             .store
@@ -1119,6 +1128,20 @@ impl Node {
             return Err(Fail::proto(RPC_INVALID_ARGUMENT, "missing serial number"));
         }
         let satellite_id = parse_node_id(&limit.satellite_id)?;
+        // Go refuses these three as InvalidArgument before it looks at trust
+        // or at the signature.
+        if satellite_id.is_zero() {
+            return Err(Fail::proto(RPC_INVALID_ARGUMENT, "missing satellite id"));
+        }
+        if limit.satellite_signature.is_empty() {
+            return Err(Fail::proto(
+                RPC_INVALID_ARGUMENT,
+                "missing satellite signature",
+            ));
+        }
+        if limit.piece_id.iter().all(|byte| *byte == 0) {
+            return Err(Fail::proto(RPC_INVALID_ARGUMENT, "missing piece id"));
+        }
         let Some(known) = self.satellites.get(&satellite_id) else {
             return Err(Fail::proto(RPC_PERMISSION_DENIED, "untrusted satellite"));
         };
@@ -1570,6 +1593,15 @@ fn check_order(limit: &OrderLimit, order: &Order, previous: i64) -> Result<i64, 
     Ok(order.amount)
 }
 
+/// The Go download wraps whatever its send and receive loops return,
+/// a refused order included, as Internal.
+fn as_internal(fail: Fail) -> Fail {
+    match fail {
+        Fail::Proto { message, .. } => Fail::proto(RPC_INTERNAL, message),
+        transport => transport,
+    }
+}
+
 /// A download message after the first. Its order raises the authorized
 /// amount and becomes the one to settle.
 fn later_order(
@@ -1581,9 +1613,9 @@ fn later_order(
     let req = PieceDownloadRequest::decode(message)
         .map_err(|err| Fail::proto(RPC_INVALID_ARGUMENT, err.to_string()))?;
     let Some(order) = req.order else {
-        return Ok(authorized);
+        return Err(Fail::proto(RPC_INTERNAL, "expected order as the message"));
     };
-    let authorized = check_order(limit, &order, authorized)?;
+    let authorized = check_order(limit, &order, authorized).map_err(as_internal)?;
     if let Some(tracked) = tracked.as_mut() {
         tracked.note(&order);
     }
@@ -3411,6 +3443,60 @@ mod tests {
             .await
             .expect_err("only a trusted satellite may ping");
         assert!(denied.to_string().contains("untrusted"), "{denied}");
+    }
+
+    #[tokio::test]
+    async fn retain_without_a_creation_date_trashes_nothing() {
+        let satellite = Identity::generate().unwrap();
+        let harness = Harness::start(std::slice::from_ref(&satellite)).await;
+        let sat = satellite.node_id().to_string();
+        let piece_id = [0x02; 32];
+        let old = UNIX_EPOCH + Duration::from_secs(1_600_000_000);
+        put_piece_at(&harness.node.store, &sat, &piece_id, old, b"old").await;
+        // An empty filter contains nothing, so any cutoff would trash the piece.
+        let filter = Filter::new(0, 1, 8).unwrap();
+        let mut request = retain_message(&filter, old, PieceHashAlgo::Sha256, true);
+        request.creation_date = None;
+        let reply = invoke_retain(&harness, &satellite, &request)
+            .await
+            .expect("the Go node answers this too");
+        assert_eq!(
+            RetainResponse::decode(reply.as_slice()).unwrap(),
+            RetainResponse {}
+        );
+        assert_eq!(piece_state(&harness, &sat, &piece_id), PieceState::Live);
+    }
+
+    #[tokio::test]
+    async fn zero_piece_id_is_an_invalid_argument() {
+        let satellite = Identity::generate().unwrap();
+        let uplink = Identity::generate().unwrap();
+        let harness = Harness::start(std::slice::from_ref(&satellite)).await;
+        let piece_key = PiecePrivateKey::generate();
+        let limit = signed_limit(
+            &satellite,
+            &harness.identity,
+            &piece_key,
+            &[0u8; 32],
+            PieceAction::Put,
+            4,
+        );
+        let mut conn = harness.conn(&uplink).await;
+        let first = PieceUploadRequest {
+            limit: Some(limit),
+            ..PieceUploadRequest::default()
+        };
+        let err = conn
+            .invoke(PIECESTORE_UPLOAD, &first.encode_to_vec())
+            .await
+            .expect_err("zero piece id");
+        match err {
+            storj_rpc::Error::Remote { code, message } => {
+                assert_eq!(code, 3, "{message}");
+                assert!(message.contains("missing piece id"), "{message}");
+            }
+            other => panic!("expected a status, got {other}"),
+        }
     }
 
     #[tokio::test]
