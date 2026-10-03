@@ -1,12 +1,12 @@
 # Rust storage node, S3 piece store
 
-A new Rust process stores piece bytes only in an S3 API (AWS S3 or Ceph RGW). You already have the endpoint. Identity and a small SQLite index stay on a local volume. Nothing in the Go `storj` tree changes.
+A Rust process stores piece bytes only in an S3 API (AWS S3 or Ceph RGW). Identity and a small SQLite index stay on a local volume. Nothing in the Go `storj` tree changes.
 
-Implementation has not started. Read [BUILD.md](BUILD.md) before writing code. That file has the proto pin, DRPC paths, Noise handshake, bloom filter, and dashboard JSON keys.
+[README.md](README.md) is how to build and run it. [BUILD.md](BUILD.md) has the proto pin, DRPC paths, Noise handshake, bloom filter, and dashboard JSON keys.
 
 ## Where it lives
 
-New project: `/Volumes/SSD/repos/storj/storagenode-rs`, next to `storj-uplink/`. Its own git repo (the parent directory is not one). Edition 2024, MSRV 1.88, license `MIT OR Apache-2.0`, DCO, same as `storj-uplink`. `git init` happens with the first code change, not with these docs.
+This repo sits next to a `storj-uplink` checkout. Edition 2024, MSRV 1.88, license `MIT OR Apache-2.0`, DCO, same as `storj-uplink`.
 
 ```
 storagenode-rs/
@@ -14,8 +14,10 @@ storagenode-rs/
   PLAN.md
   BUILD.md
   Dockerfile
+  proto/
+  third_party/s3s/       vendored s3s 0.12
   crates/s3store/        bucket + sqlite index
-  crates/storagenode/    binary: identity, DRPC server, check-in
+  crates/storagenode/    binary: identity, DRPC, check-in, exit, dashboard
 ```
 
 ## API
@@ -136,7 +138,7 @@ Routes match `storagenode/console/consoleserver/server.go`:
 - `/api/heldamount/...` — paystubs and payments stored from the `HeldAmount` poll. Empty until the satellite has a stub.
 - Everything else under `/` serves `index.html`. `/static/` serves the built files.
 
-Disk numbers come from the S3 index (used, allocated, trash). Overused and reclaimable are 0. Bandwidth is a sqlite daily counter updated on successful upload and download. Satellite disqualified / suspended / vetted come from the last check-in when that response carries them. Audit scores in the satellite view are 0 until a stats poll exists. The keys are present so the Vue page does not throw.
+Disk numbers come from the S3 index. JSON `diskSpace.used` is live bytes plus trash, so the Vue chart can subtract trash. `trash` is the trash sum. Overused and reclaimable are 0. Bandwidth is a sqlite daily counter updated on successful upload and download. Disqualified, suspended, and vetted times, and the audit scores, come from the `GetStats` poll. Until that poll succeeds, the times are null and the scores are 0. Check-in stores the last contact time and the QUIC bit. The vendored check-in response has no reputation fields. The keys are present so the Vue page does not throw.
 
 ## Container
 

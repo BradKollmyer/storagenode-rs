@@ -1,14 +1,12 @@
 # Builder notes
 
-Read [PLAN.md](PLAN.md) for what to build. This file is how, and the traps. Do not re-derive the pins. Do not edit `storj/`, `uplink/`, or `storj-uplink/`.
-
-Implementation has not started. `git init` happens with the first code change.
+Read [PLAN.md](PLAN.md) for what the node does. This file is how, and the traps. Do not re-derive the pins. Do not edit `storj/`, `uplink/`, or `storj-uplink/`. [README.md](README.md) is how to build and run the binary.
 
 ## Trees
 
 | Path | Role |
 |---|---|
-| `/Volumes/SSD/repos/storj/storagenode-rs` | This project. Docs only until the build order below. |
+| `/Volumes/SSD/repos/storj/storagenode-rs` | This project. |
 | `/Volumes/SSD/repos/storj/storj-uplink` | Protocol API. Path-depend. Public crate `storj` does not export identity, frames, or order bytes. |
 | `/Volumes/SSD/repos/storj/storj` | Go node and `web/storagenode`. Behavior reference and the Vue app. |
 | `/Volumes/SSD/repos/storj/uplink` | Go uplink. Not a dependency. |
