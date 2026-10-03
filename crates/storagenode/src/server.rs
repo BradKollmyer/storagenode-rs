@@ -52,6 +52,13 @@ pub const PIECESTORE_RETAIN_BIG: &str = "/piecestore.Piecestore/RetainBig";
 /// DRPC path for `piecestore.Piecestore/RestoreTrash`.
 pub const PIECESTORE_RESTORE_TRASH: &str = "/piecestore.Piecestore/RestoreTrash";
 
+/// DRPC path for `contact.Contact/PingNode`.
+///
+/// The satellite dials the node back and calls this inside every check-in,
+/// over TCP and then over QUIC. A node that does not answer is recorded as
+/// down and is never selected.
+pub const CONTACT_PING_NODE: &str = "/contact.Contact/PingNode";
+
 /// Unix seconds of Go's zero `time.Time` (year 1). Unset on the wire.
 const GO_ZERO_TIME_UNIX: i64 = -62_135_596_800;
 
@@ -447,6 +454,7 @@ impl Node {
             PIECESTORE_RETAIN => self.retain(out, peer).await,
             PIECESTORE_RETAIN_BIG => self.retain_big(out, peer).await,
             PIECESTORE_RESTORE_TRASH => self.restore_trash(out, peer).await,
+            CONTACT_PING_NODE => self.ping_node(out, peer).await,
             // `DeletePieces` lands here too. The Go node also answers it
             // with Unimplemented; deleted data is collected by retain.
             _ => Err(Fail::proto(RPC_UNIMPLEMENTED, "unknown rpc")),
@@ -987,6 +995,32 @@ impl Node {
             .await
             .map_err(store_err)?;
         out.message(&RestoreTrashResponse {}.encode_to_vec())
+            .await?;
+        out.close().await?;
+        Ok(())
+    }
+
+    /// The satellite's ping-back. An empty reply to a trusted satellite.
+    async fn ping_node<T>(&self, out: &mut Out<T>, peer: Option<NodeId>) -> Result<(), Fail>
+    where
+        T: AsyncRead + AsyncWrite + Unpin,
+    {
+        // The Go endpoint answers Unauthenticated for an untrusted peer too.
+        let Some(peer) = peer else {
+            return Err(Fail::proto(RPC_UNAUTHENTICATED, "missing peer identity"));
+        };
+        if !self.satellites.contains_key(&peer) {
+            return Err(Fail::proto(
+                RPC_UNAUTHENTICATED,
+                "ping called with untrusted id",
+            ));
+        }
+        let Some(bytes) = out.recv().await? else {
+            return Err(Fail::proto(RPC_INVALID_ARGUMENT, "missing ping request"));
+        };
+        crate::contact::ContactPingRequest::decode(bytes.as_slice())
+            .map_err(|err| Fail::proto(RPC_INVALID_ARGUMENT, err.to_string()))?;
+        out.message(&crate::contact::ContactPingResponse {}.encode_to_vec())
             .await?;
         out.close().await?;
         Ok(())
@@ -1735,9 +1769,9 @@ fn serial_deadline(limit: &OrderLimit, now: SystemTime) -> SystemTime {
 #[cfg(test)]
 mod tests {
     use super::{
-        GO_ZERO_TIME_UNIX, Node, PIECESTORE_EXISTS, PIECESTORE_RESTORE_TRASH, PIECESTORE_RETAIN,
-        PIECESTORE_RETAIN_BIG, RETAIN_MAX_TIME_SKEW, Serials, TrustedSatellite, creation_ok,
-        encode_hex, expired, system_to_timestamp,
+        CONTACT_PING_NODE, GO_ZERO_TIME_UNIX, Node, PIECESTORE_EXISTS, PIECESTORE_RESTORE_TRASH,
+        PIECESTORE_RETAIN, PIECESTORE_RETAIN_BIG, RETAIN_MAX_TIME_SKEW, Serials, TrustedSatellite,
+        creation_ok, encode_hex, expired, system_to_timestamp,
     };
     use std::future::Future;
     use std::net::SocketAddr;
@@ -3097,6 +3131,49 @@ mod tests {
             .upload(&put([0x43; 32], 6), &piece_key, b"abcdef")
             .await
             .expect("exactly the space left");
+    }
+
+    #[tokio::test]
+    async fn satellite_ping_back_is_answered_over_tls_and_quic() {
+        let satellite = Identity::generate().unwrap();
+        let uplink = Identity::generate().unwrap();
+        let harness = Harness::start(std::slice::from_ref(&satellite)).await;
+        let request = crate::contact::ContactPingRequest {}.encode_to_vec();
+
+        let mut conn = harness.conn(&satellite).await;
+        let reply = conn
+            .invoke(CONTACT_PING_NODE, &request)
+            .await
+            .expect("ping over tls");
+        assert_eq!(
+            crate::contact::ContactPingResponse::decode(reply.as_slice()).unwrap(),
+            crate::contact::ContactPingResponse {}
+        );
+
+        // The satellite pings over QUIC next, on the UDP port of the same number.
+        let quic = transport::dial(
+            &satellite,
+            harness.identity.node_id(),
+            &harness.addr.to_string(),
+            TransportMode::Quic,
+            Duration::from_secs(10),
+            None,
+        )
+        .await
+        .expect("quic dial");
+        let mut conn = Conn::new(quic);
+        let reply = conn
+            .invoke(CONTACT_PING_NODE, &request)
+            .await
+            .expect("ping over quic");
+        assert!(reply.is_empty());
+
+        let mut stranger = harness.conn(&uplink).await;
+        let denied = stranger
+            .invoke(CONTACT_PING_NODE, &request)
+            .await
+            .expect_err("only a trusted satellite may ping");
+        assert!(denied.to_string().contains("untrusted"), "{denied}");
     }
 
     #[tokio::test]
