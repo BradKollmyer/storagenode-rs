@@ -3,7 +3,8 @@
 //! This crate serves `Upload`, `Download`, `Exists`, `Retain`, and `RetainBig`
 //! over TLS, Noise, and QUIC, settles closed bandwidth-order hours, checks in
 //! with each trusted satellite, dials graceful exit for a pending satellite,
-//! and serves the Vue dashboard JSON on `0.0.0.0:14002`.
+//! polls held amounts and pricing, and serves the Vue dashboard JSON on
+//! `0.0.0.0:14002`.
 
 #![deny(clippy::undocumented_unsafe_blocks)]
 
@@ -19,6 +20,14 @@ mod node {
 mod gracefulexit {
     include!(concat!(env!("OUT_DIR"), "/gracefulexit.rs"));
 }
+#[allow(clippy::all, dead_code, unused_imports)]
+mod heldamount {
+    include!(concat!(env!("OUT_DIR"), "/heldamount.rs"));
+}
+#[allow(clippy::all, dead_code, unused_imports)]
+mod nodestats {
+    include!(concat!(env!("OUT_DIR"), "/nodestats.rs"));
+}
 
 mod bloom;
 mod checkin;
@@ -28,6 +37,7 @@ mod exit;
 mod identity;
 mod noise_key;
 mod orders;
+mod payout;
 mod server;
 
 pub use config::Config;
@@ -45,7 +55,7 @@ use storj_rpc::{NodeId, NodeUrl};
 /// What the binary should do. No arguments serves the node.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
-    /// Serve DRPC, settlement, check-in, and the graceful-exit chore.
+    /// Serve DRPC, settlement, check-in, payout polling, and graceful exit.
     Run,
     /// Record a pending exit for one trusted satellite id.
     ExitSatellite(String),
@@ -196,6 +206,10 @@ pub async fn run(config: Config) -> Result<(), Error> {
     let exiting = Arc::clone(&node);
     tokio::spawn(async move {
         exit::serve(exiting).await;
+    });
+    let pricing = Arc::clone(&node);
+    tokio::spawn(async move {
+        payout::serve(pricing).await;
     });
     node.serve(listener).await?;
     Ok(())

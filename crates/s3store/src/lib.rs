@@ -25,7 +25,8 @@ mod index;
 
 pub use index::{
     BandwidthDay, BandwidthKind, CheckInRow, ExitRow, ExitStatus, HashAlgorithm, OrderRows,
-    PIECES_DB, PieceInfo, PieceMeta, PieceState, Space, StoredOrder, StoredOrderStatus, TRASH_KEEP,
+    PIECES_DB, PayStubRow, PaymentRow, PieceInfo, PieceMeta, PieceState, PricingRow,
+    SatelliteStats, Space, StoredOrder, StoredOrderStatus, TRASH_KEEP,
 };
 
 use std::collections::HashMap;
@@ -623,6 +624,51 @@ impl Store {
     /// Stored check-in summaries, ordered by satellite id.
     pub fn check_ins(&self) -> Result<Vec<CheckInRow>> {
         self.index.check_ins()
+    }
+
+    /// Inserts or replaces one paystub. Does not run on a failed poll.
+    pub fn upsert_paystub(&self, row: &PayStubRow) -> Result<()> {
+        self.index.upsert_paystub(row)
+    }
+
+    /// Every stored paystub, satellite id then period.
+    pub fn paystubs(&self) -> Result<Vec<PayStubRow>> {
+        self.index.paystubs()
+    }
+
+    /// Inserts or replaces one payment receipt.
+    pub fn upsert_payment(&self, row: &PaymentRow) -> Result<()> {
+        self.index.upsert_payment(row)
+    }
+
+    /// Every stored payment, satellite id then period.
+    pub fn payments(&self) -> Result<Vec<PaymentRow>> {
+        self.index.payments()
+    }
+
+    /// Inserts or replaces the pricing model for one satellite.
+    pub fn upsert_pricing(&self, satellite_id: &str, row: &PricingRow) -> Result<()> {
+        check_id("satellite id", satellite_id)?;
+        self.index.upsert_pricing(satellite_id, row)
+    }
+
+    /// Stored pricing, if a poll has succeeded.
+    pub fn pricing(&self, satellite_id: &str) -> Result<Option<PricingRow>> {
+        self.index.pricing(satellite_id)
+    }
+
+    /// Inserts or replaces `GetStats` for one satellite.
+    ///
+    /// This is a different row from the check-in summary. Check-in does not
+    /// clear it.
+    pub fn upsert_stats(&self, row: &SatelliteStats) -> Result<()> {
+        check_id("satellite id", &row.satellite_id)?;
+        self.index.upsert_stats(row)
+    }
+
+    /// Every stored stats row, ordered by satellite id.
+    pub fn satellite_stats(&self) -> Result<Vec<SatelliteStats>> {
+        self.index.satellite_stats()
     }
 
     /// Deletes expired pieces, then trash whose `trashed_at` is at least

@@ -1,4 +1,4 @@
-//! Generate check-in and graceful-exit messages from the vendored protos.
+//! Generate check-in, graceful-exit, held-amount, and node-stats messages.
 //!
 //! `proto/` is searched before `storj-uplink/proto`, so this repo's
 //! `contact.proto`, `nodetags.proto`, and `gracefulexit.proto` win.
@@ -7,7 +7,8 @@
 //! local node types. `.node` is not externed: uplink's `storj_proto::node`
 //! was generated from `node.proto` alone and has no tag sets. Piecestore
 //! keeps using `storj_proto`. `gracefulexit.proto` imports orders and
-//! metainfo; those packages stay on `storj_proto`.
+//! metainfo; those packages stay on `storj_proto`. `heldamount.proto` and
+//! `nodestats.proto` are not in the uplink pin.
 
 use std::io;
 use std::path::PathBuf;
@@ -19,6 +20,8 @@ fn main() -> io::Result<()> {
     if !local.join("contact.proto").is_file()
         || !local.join("nodetags.proto").is_file()
         || !local.join("gracefulexit.proto").is_file()
+        || !local.join("heldamount.proto").is_file()
+        || !local.join("nodestats.proto").is_file()
     {
         return Err(io::Error::other(format!(
             "missing vendored protos in {}",
@@ -42,6 +45,14 @@ fn main() -> io::Result<()> {
     println!(
         "cargo:rerun-if-changed={}",
         local.join("gracefulexit.proto").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        local.join("heldamount.proto").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        local.join("nodestats.proto").display()
     );
     println!(
         "cargo:rerun-if-changed={}",
@@ -74,6 +85,8 @@ fn main() -> io::Result<()> {
             local.join("contact.proto"),
             local.join("nodetags.proto"),
             local.join("gracefulexit.proto"),
+            local.join("heldamount.proto"),
+            local.join("nodestats.proto"),
         ],
         &[local, uplink, protoc_include],
     )?;

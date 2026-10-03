@@ -4,9 +4,9 @@
 //! Trash lives only here. A missing or unfinished database is rebuilt from
 //! object metadata; every rebuilt row is live. `user_version` stays 0 until
 //! that listing finishes, so a restart does not treat a partial file as done.
-//! Bandwidth orders, the daily transfer counter, and the last check-in
-//! summary live in the same file. A second database would not survive the
-//! volume the pieces already use.
+//! Bandwidth orders, the daily transfer counter, the last check-in summary,
+//! and the held-amount, pricing, and stats polls live in the same file. A
+//! second database would not survive the volume the pieces already use.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -79,6 +79,64 @@ CREATE TABLE IF NOT EXISTS checkins (
     satellite TEXT PRIMARY KEY,
     checked_in_at INTEGER NOT NULL,
     quic_ok INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS paystubs (
+    satellite TEXT NOT NULL,
+    period TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    codes TEXT NOT NULL,
+    usage_at_rest REAL NOT NULL,
+    usage_get INTEGER NOT NULL,
+    usage_put INTEGER NOT NULL,
+    usage_get_repair INTEGER NOT NULL,
+    usage_put_repair INTEGER NOT NULL,
+    usage_get_audit INTEGER NOT NULL,
+    comp_at_rest INTEGER NOT NULL,
+    comp_get INTEGER NOT NULL,
+    comp_put INTEGER NOT NULL,
+    comp_get_repair INTEGER NOT NULL,
+    comp_put_repair INTEGER NOT NULL,
+    comp_get_audit INTEGER NOT NULL,
+    surge_percent INTEGER NOT NULL,
+    held INTEGER NOT NULL,
+    owed INTEGER NOT NULL,
+    disposed INTEGER NOT NULL,
+    paid INTEGER NOT NULL,
+    distributed INTEGER NOT NULL,
+    PRIMARY KEY (satellite, period)
+);
+
+CREATE TABLE IF NOT EXISTS payments (
+    satellite TEXT NOT NULL,
+    period TEXT NOT NULL,
+    payment_id INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    amount INTEGER NOT NULL,
+    receipt TEXT NOT NULL,
+    notes TEXT NOT NULL,
+    PRIMARY KEY (satellite, period)
+);
+
+CREATE TABLE IF NOT EXISTS pricing (
+    satellite TEXT PRIMARY KEY,
+    egress_bandwidth INTEGER NOT NULL,
+    repair_bandwidth INTEGER NOT NULL,
+    audit_bandwidth INTEGER NOT NULL,
+    disk_space INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS satellite_stats (
+    satellite TEXT PRIMARY KEY,
+    audit_score REAL NOT NULL,
+    suspension_score REAL NOT NULL,
+    online_score REAL NOT NULL,
+    uptime_score REAL NOT NULL,
+    audit_history_score REAL NOT NULL,
+    disqualified_at INTEGER,
+    suspended_at INTEGER,
+    vetted_at INTEGER,
+    joined_at INTEGER
 );
 ";
 
@@ -336,6 +394,120 @@ impl BandwidthDay {
     pub fn ingress(self) -> u64 {
         self.put.saturating_add(self.put_repair)
     }
+}
+
+/// One stored paystub. `usage_at_rest` is the satellite's byte-hours, not
+/// the TB-month value the dashboard divides by 720.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PayStubRow {
+    /// Satellite id.
+    pub satellite_id: String,
+    /// `YYYY-MM`.
+    pub period: String,
+    /// When the satellite created the stub.
+    pub created_at: SystemTime,
+    /// Payment codes. Empty when the satellite sent none.
+    pub codes: String,
+    /// At-rest byte-hours.
+    pub usage_at_rest: f64,
+    /// GET bytes.
+    pub usage_get: i64,
+    /// PUT bytes.
+    pub usage_put: i64,
+    /// GET_REPAIR bytes.
+    pub usage_get_repair: i64,
+    /// PUT_REPAIR bytes.
+    pub usage_put_repair: i64,
+    /// GET_AUDIT bytes.
+    pub usage_get_audit: i64,
+    /// At-rest compensation in the satellite's minor units.
+    pub comp_at_rest: i64,
+    /// GET compensation.
+    pub comp_get: i64,
+    /// PUT compensation.
+    pub comp_put: i64,
+    /// GET_REPAIR compensation.
+    pub comp_get_repair: i64,
+    /// PUT_REPAIR compensation.
+    pub comp_put_repair: i64,
+    /// GET_AUDIT compensation.
+    pub comp_get_audit: i64,
+    /// Surge percent. `0` means no surge.
+    pub surge_percent: i64,
+    /// Amount held.
+    pub held: i64,
+    /// Amount owed.
+    pub owed: i64,
+    /// Amount disposed.
+    pub disposed: i64,
+    /// Amount paid.
+    pub paid: i64,
+    /// Amount distributed.
+    pub distributed: i64,
+}
+
+/// One stored payment receipt for a satellite period.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaymentRow {
+    /// Satellite id.
+    pub satellite_id: String,
+    /// `YYYY-MM`.
+    pub period: String,
+    /// Satellite payment id.
+    pub payment_id: i64,
+    /// When the payment was created.
+    pub created_at: SystemTime,
+    /// Amount in the satellite's minor units.
+    pub amount: i64,
+    /// Transaction receipt. Empty when the satellite sent none.
+    pub receipt: String,
+    /// Operator notes. Empty when the satellite sent none.
+    pub notes: String,
+}
+
+/// Satellite prices, in the units `PricingModel` returns.
+///
+/// Bandwidth prices are per TB. Disk is per TB-month. The estimate divides
+/// byte counts by `10^12`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PricingRow {
+    /// Egress (GET) price.
+    pub egress_bandwidth: i64,
+    /// Repair bandwidth price. The estimate uses [`Self::audit_bandwidth`].
+    pub repair_bandwidth: i64,
+    /// Audit bandwidth price. Repair and audit egress share this price.
+    pub audit_bandwidth: i64,
+    /// Disk price.
+    pub disk_space: i64,
+}
+
+/// Reputation from `GetStats`. Scores are fractions in `[0, 1]`, which is
+/// what the Vue `Score` type multiplies by 100.
+///
+/// These columns are not on `checkins`. A later check-in only rewrites
+/// `checked_in_at` and `quic_ok`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SatelliteStats {
+    /// Satellite id.
+    pub satellite_id: String,
+    /// `audit_check.reputation_score`.
+    pub audit_score: f64,
+    /// `audit_check.unknown_reputation_score`. The Vue suspension score.
+    pub suspension_score: f64,
+    /// `online_score`.
+    pub online_score: f64,
+    /// `uptime_check.reputation_score`. Not the Vue suspension field.
+    pub uptime_score: f64,
+    /// `audit_history.score`. Not the Vue audit field.
+    pub audit_history_score: f64,
+    /// `disqualified`, when set.
+    pub disqualified_at: Option<SystemTime>,
+    /// `suspended`, when set.
+    pub suspended_at: Option<SystemTime>,
+    /// `vetted_at`, when set.
+    pub vetted_at: Option<SystemTime>,
+    /// `joined_at`, when set.
+    pub joined_at: Option<SystemTime>,
 }
 
 /// Last successful check-in for one satellite.
@@ -984,6 +1156,298 @@ impl Index {
         })?;
         rows.into_iter().map(CheckInStored::into_row).collect()
     }
+
+    /// Inserts or replaces one paystub. A failed poll does not call this, so
+    /// the previous row stays.
+    pub(crate) fn upsert_paystub(&self, row: &PayStubRow) -> Result<()> {
+        let created = system_to_millis(row.created_at)?;
+        self.with(|conn| {
+            conn.execute(
+                "INSERT INTO paystubs (
+                    satellite, period, created_at, codes, usage_at_rest,
+                    usage_get, usage_put, usage_get_repair, usage_put_repair,
+                    usage_get_audit, comp_at_rest, comp_get, comp_put,
+                    comp_get_repair, comp_put_repair, comp_get_audit,
+                    surge_percent, held, owed, disposed, paid, distributed
+                 ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                    ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22
+                 )
+                 ON CONFLICT(satellite, period) DO UPDATE SET
+                    created_at = excluded.created_at,
+                    codes = excluded.codes,
+                    usage_at_rest = excluded.usage_at_rest,
+                    usage_get = excluded.usage_get,
+                    usage_put = excluded.usage_put,
+                    usage_get_repair = excluded.usage_get_repair,
+                    usage_put_repair = excluded.usage_put_repair,
+                    usage_get_audit = excluded.usage_get_audit,
+                    comp_at_rest = excluded.comp_at_rest,
+                    comp_get = excluded.comp_get,
+                    comp_put = excluded.comp_put,
+                    comp_get_repair = excluded.comp_get_repair,
+                    comp_put_repair = excluded.comp_put_repair,
+                    comp_get_audit = excluded.comp_get_audit,
+                    surge_percent = excluded.surge_percent,
+                    held = excluded.held,
+                    owed = excluded.owed,
+                    disposed = excluded.disposed,
+                    paid = excluded.paid,
+                    distributed = excluded.distributed",
+                params![
+                    row.satellite_id,
+                    row.period,
+                    created,
+                    row.codes,
+                    row.usage_at_rest,
+                    row.usage_get,
+                    row.usage_put,
+                    row.usage_get_repair,
+                    row.usage_put_repair,
+                    row.usage_get_audit,
+                    row.comp_at_rest,
+                    row.comp_get,
+                    row.comp_put,
+                    row.comp_get_repair,
+                    row.comp_put_repair,
+                    row.comp_get_audit,
+                    row.surge_percent,
+                    row.held,
+                    row.owed,
+                    row.disposed,
+                    row.paid,
+                    row.distributed,
+                ],
+            )
+        })?;
+        Ok(())
+    }
+
+    /// Every stored paystub, satellite id then period.
+    pub(crate) fn paystubs(&self) -> Result<Vec<PayStubRow>> {
+        self.with(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT satellite, period, created_at, codes, usage_at_rest,
+                        usage_get, usage_put, usage_get_repair, usage_put_repair,
+                        usage_get_audit, comp_at_rest, comp_get, comp_put,
+                        comp_get_repair, comp_put_repair, comp_get_audit,
+                        surge_percent, held, owed, disposed, paid, distributed
+                 FROM paystubs
+                 ORDER BY satellite, period",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok(PayStubStored {
+                    satellite_id: row.get(0)?,
+                    period: row.get(1)?,
+                    created_at: row.get(2)?,
+                    codes: row.get(3)?,
+                    usage_at_rest: row.get(4)?,
+                    usage_get: row.get(5)?,
+                    usage_put: row.get(6)?,
+                    usage_get_repair: row.get(7)?,
+                    usage_put_repair: row.get(8)?,
+                    usage_get_audit: row.get(9)?,
+                    comp_at_rest: row.get(10)?,
+                    comp_get: row.get(11)?,
+                    comp_put: row.get(12)?,
+                    comp_get_repair: row.get(13)?,
+                    comp_put_repair: row.get(14)?,
+                    comp_get_audit: row.get(15)?,
+                    surge_percent: row.get(16)?,
+                    held: row.get(17)?,
+                    owed: row.get(18)?,
+                    disposed: row.get(19)?,
+                    paid: row.get(20)?,
+                    distributed: row.get(21)?,
+                })
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })?
+        .into_iter()
+        .map(PayStubStored::into_row)
+        .collect()
+    }
+
+    /// Inserts or replaces the receipt for one satellite period.
+    pub(crate) fn upsert_payment(&self, row: &PaymentRow) -> Result<()> {
+        let created = system_to_millis(row.created_at)?;
+        self.with(|conn| {
+            conn.execute(
+                "INSERT INTO payments (
+                    satellite, period, payment_id, created_at, amount, receipt, notes
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(satellite, period) DO UPDATE SET
+                    payment_id = excluded.payment_id,
+                    created_at = excluded.created_at,
+                    amount = excluded.amount,
+                    receipt = excluded.receipt,
+                    notes = excluded.notes",
+                params![
+                    row.satellite_id,
+                    row.period,
+                    row.payment_id,
+                    created,
+                    row.amount,
+                    row.receipt,
+                    row.notes,
+                ],
+            )
+        })?;
+        Ok(())
+    }
+
+    /// Every stored payment, satellite id then period.
+    pub(crate) fn payments(&self) -> Result<Vec<PaymentRow>> {
+        self.with(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT satellite, period, payment_id, created_at, amount, receipt, notes
+                 FROM payments
+                 ORDER BY satellite, period",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok(PaymentStored {
+                    satellite_id: row.get(0)?,
+                    period: row.get(1)?,
+                    payment_id: row.get(2)?,
+                    created_at: row.get(3)?,
+                    amount: row.get(4)?,
+                    receipt: row.get(5)?,
+                    notes: row.get(6)?,
+                })
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })?
+        .into_iter()
+        .map(PaymentStored::into_row)
+        .collect()
+    }
+
+    /// Inserts or replaces the pricing model for one satellite.
+    pub(crate) fn upsert_pricing(&self, satellite_id: &str, row: &PricingRow) -> Result<()> {
+        self.with(|conn| {
+            conn.execute(
+                "INSERT INTO pricing (
+                    satellite, egress_bandwidth, repair_bandwidth, audit_bandwidth, disk_space
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(satellite) DO UPDATE SET
+                    egress_bandwidth = excluded.egress_bandwidth,
+                    repair_bandwidth = excluded.repair_bandwidth,
+                    audit_bandwidth = excluded.audit_bandwidth,
+                    disk_space = excluded.disk_space",
+                params![
+                    satellite_id,
+                    row.egress_bandwidth,
+                    row.repair_bandwidth,
+                    row.audit_bandwidth,
+                    row.disk_space,
+                ],
+            )
+        })?;
+        Ok(())
+    }
+
+    /// The stored pricing model, if a poll has succeeded for `satellite_id`.
+    pub(crate) fn pricing(&self, satellite_id: &str) -> Result<Option<PricingRow>> {
+        self.with(|conn| {
+            conn.query_row(
+                "SELECT egress_bandwidth, repair_bandwidth, audit_bandwidth, disk_space
+                 FROM pricing WHERE satellite = ?1",
+                params![satellite_id],
+                |row| {
+                    Ok(PricingRow {
+                        egress_bandwidth: row.get(0)?,
+                        repair_bandwidth: row.get(1)?,
+                        audit_bandwidth: row.get(2)?,
+                        disk_space: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+        })
+    }
+
+    /// Inserts or replaces `GetStats` for one satellite.
+    ///
+    /// Does not write `checkins`. A check-in cannot clear these columns.
+    pub(crate) fn upsert_stats(&self, row: &SatelliteStats) -> Result<()> {
+        let disqualified = option_millis(row.disqualified_at)?;
+        let suspended = option_millis(row.suspended_at)?;
+        let vetted = option_millis(row.vetted_at)?;
+        let joined = option_millis(row.joined_at)?;
+        self.with(|conn| {
+            conn.execute(
+                "INSERT INTO satellite_stats (
+                    satellite, audit_score, suspension_score, online_score, uptime_score,
+                    audit_history_score, disqualified_at, suspended_at, vetted_at, joined_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT(satellite) DO UPDATE SET
+                    audit_score = excluded.audit_score,
+                    suspension_score = excluded.suspension_score,
+                    online_score = excluded.online_score,
+                    uptime_score = excluded.uptime_score,
+                    audit_history_score = excluded.audit_history_score,
+                    disqualified_at = excluded.disqualified_at,
+                    suspended_at = excluded.suspended_at,
+                    vetted_at = excluded.vetted_at,
+                    joined_at = excluded.joined_at",
+                params![
+                    row.satellite_id,
+                    row.audit_score,
+                    row.suspension_score,
+                    row.online_score,
+                    row.uptime_score,
+                    row.audit_history_score,
+                    disqualified,
+                    suspended,
+                    vetted,
+                    joined,
+                ],
+            )
+        })?;
+        Ok(())
+    }
+
+    /// Every stored stats row, ordered by satellite id.
+    pub(crate) fn satellite_stats(&self) -> Result<Vec<SatelliteStats>> {
+        self.with(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT satellite, audit_score, suspension_score, online_score, uptime_score,
+                        audit_history_score, disqualified_at, suspended_at, vetted_at, joined_at
+                 FROM satellite_stats
+                 ORDER BY satellite",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok(StatsStored {
+                    satellite_id: row.get(0)?,
+                    audit_score: row.get(1)?,
+                    suspension_score: row.get(2)?,
+                    online_score: row.get(3)?,
+                    uptime_score: row.get(4)?,
+                    audit_history_score: row.get(5)?,
+                    disqualified_at: row.get(6)?,
+                    suspended_at: row.get(7)?,
+                    vetted_at: row.get(8)?,
+                    joined_at: row.get(9)?,
+                })
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })?
+        .into_iter()
+        .map(StatsStored::into_row)
+        .collect()
+    }
 }
 
 fn with_conn<T>(
@@ -1259,6 +1723,118 @@ impl CheckInStored {
             quic_ok: self.quic_ok != 0,
         })
     }
+}
+
+struct PayStubStored {
+    satellite_id: String,
+    period: String,
+    created_at: i64,
+    codes: String,
+    usage_at_rest: f64,
+    usage_get: i64,
+    usage_put: i64,
+    usage_get_repair: i64,
+    usage_put_repair: i64,
+    usage_get_audit: i64,
+    comp_at_rest: i64,
+    comp_get: i64,
+    comp_put: i64,
+    comp_get_repair: i64,
+    comp_put_repair: i64,
+    comp_get_audit: i64,
+    surge_percent: i64,
+    held: i64,
+    owed: i64,
+    disposed: i64,
+    paid: i64,
+    distributed: i64,
+}
+
+impl PayStubStored {
+    fn into_row(self) -> Result<PayStubRow> {
+        Ok(PayStubRow {
+            satellite_id: self.satellite_id,
+            period: self.period,
+            created_at: millis_to_system(self.created_at)?,
+            codes: self.codes,
+            usage_at_rest: self.usage_at_rest,
+            usage_get: self.usage_get,
+            usage_put: self.usage_put,
+            usage_get_repair: self.usage_get_repair,
+            usage_put_repair: self.usage_put_repair,
+            usage_get_audit: self.usage_get_audit,
+            comp_at_rest: self.comp_at_rest,
+            comp_get: self.comp_get,
+            comp_put: self.comp_put,
+            comp_get_repair: self.comp_get_repair,
+            comp_put_repair: self.comp_put_repair,
+            comp_get_audit: self.comp_get_audit,
+            surge_percent: self.surge_percent,
+            held: self.held,
+            owed: self.owed,
+            disposed: self.disposed,
+            paid: self.paid,
+            distributed: self.distributed,
+        })
+    }
+}
+
+struct PaymentStored {
+    satellite_id: String,
+    period: String,
+    payment_id: i64,
+    created_at: i64,
+    amount: i64,
+    receipt: String,
+    notes: String,
+}
+
+impl PaymentStored {
+    fn into_row(self) -> Result<PaymentRow> {
+        Ok(PaymentRow {
+            satellite_id: self.satellite_id,
+            period: self.period,
+            payment_id: self.payment_id,
+            created_at: millis_to_system(self.created_at)?,
+            amount: self.amount,
+            receipt: self.receipt,
+            notes: self.notes,
+        })
+    }
+}
+
+struct StatsStored {
+    satellite_id: String,
+    audit_score: f64,
+    suspension_score: f64,
+    online_score: f64,
+    uptime_score: f64,
+    audit_history_score: f64,
+    disqualified_at: Option<i64>,
+    suspended_at: Option<i64>,
+    vetted_at: Option<i64>,
+    joined_at: Option<i64>,
+}
+
+impl StatsStored {
+    fn into_row(self) -> Result<SatelliteStats> {
+        Ok(SatelliteStats {
+            satellite_id: self.satellite_id,
+            audit_score: self.audit_score,
+            suspension_score: self.suspension_score,
+            online_score: self.online_score,
+            uptime_score: self.uptime_score,
+            audit_history_score: self.audit_history_score,
+            disqualified_at: opt_system(self.disqualified_at)?,
+            suspended_at: opt_system(self.suspended_at)?,
+            vetted_at: opt_system(self.vetted_at)?,
+            joined_at: opt_system(self.joined_at)?,
+        })
+    }
+}
+
+fn opt_system(millis: Option<i64>) -> Result<Option<SystemTime>> {
+    millis.map(millis_to_system).transpose()
 }
 
 /// UTC midnight of `at`, as unix milliseconds.
