@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -12,7 +13,9 @@ static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as ConnBuilder;
 use s3s::auth::SimpleAuth;
+use s3s::dto::*;
 use s3s::service::S3ServiceBuilder;
+use s3s::{S3, S3Request, S3Response, S3Result, s3_error};
 use s3s_fs::FileSystem;
 use s3store::{
     Config, Error, HashAlgorithm, PART_SIZE, PIECES_DB, PieceMeta, PieceState, Store, TRASH_KEEP,
@@ -52,14 +55,27 @@ struct TestS3 {
     root: TempRoot,
     endpoint: String,
     config: Config,
+    /// `CopyObject` requests the server has received.
+    copies: Arc<AtomicU64>,
 }
 
 impl TestS3 {
     async fn start() -> Self {
+        Self::start_with(false).await
+    }
+
+    /// `replace_on_copy` makes `CopyObject` honor the REPLACE directive, as
+    /// AWS does. s3s-fs alone copies the source metadata whatever it says.
+    async fn start_with(replace_on_copy: bool) -> Self {
         let root = TempRoot::new();
         // s3s-fs CreateBucket is create_dir on the bucket path.
         std::fs::create_dir(root.path().join(BUCKET)).expect("bucket dir");
-        let addr = spawn_server(root.path());
+        let copies = Arc::new(AtomicU64::new(0));
+        let addr = spawn_server(TestFs {
+            inner: FileSystem::new(root.path()).expect("s3s filesystem"),
+            replace_on_copy,
+            copies: Arc::clone(&copies),
+        });
         let endpoint = format!("http://{addr}");
         let config = Config {
             endpoint: endpoint.clone(),
@@ -77,6 +93,7 @@ impl TestS3 {
             root,
             endpoint,
             config,
+            copies,
         }
     }
 
@@ -101,8 +118,140 @@ impl TestS3 {
     }
 }
 
-fn spawn_server(root: &Path) -> SocketAddr {
-    let fs = FileSystem::new(root).expect("s3s filesystem");
+/// s3s-fs, plus what a test needs to see or change about the server.
+struct TestFs {
+    inner: FileSystem,
+    replace_on_copy: bool,
+    copies: Arc<AtomicU64>,
+}
+
+// Everything the store calls goes to s3s-fs unchanged, except CopyObject.
+#[async_trait::async_trait]
+impl S3 for TestFs {
+    async fn abort_multipart_upload(
+        &self,
+        req: S3Request<AbortMultipartUploadInput>,
+    ) -> S3Result<S3Response<AbortMultipartUploadOutput>> {
+        self.inner.abort_multipart_upload(req).await
+    }
+
+    async fn complete_multipart_upload(
+        &self,
+        req: S3Request<CompleteMultipartUploadInput>,
+    ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
+        self.inner.complete_multipart_upload(req).await
+    }
+
+    async fn create_multipart_upload(
+        &self,
+        req: S3Request<CreateMultipartUploadInput>,
+    ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
+        self.inner.create_multipart_upload(req).await
+    }
+
+    async fn delete_object(
+        &self,
+        req: S3Request<DeleteObjectInput>,
+    ) -> S3Result<S3Response<DeleteObjectOutput>> {
+        self.inner.delete_object(req).await
+    }
+
+    async fn get_object(
+        &self,
+        req: S3Request<GetObjectInput>,
+    ) -> S3Result<S3Response<GetObjectOutput>> {
+        self.inner.get_object(req).await
+    }
+
+    async fn head_bucket(
+        &self,
+        req: S3Request<HeadBucketInput>,
+    ) -> S3Result<S3Response<HeadBucketOutput>> {
+        self.inner.head_bucket(req).await
+    }
+
+    async fn head_object(
+        &self,
+        req: S3Request<HeadObjectInput>,
+    ) -> S3Result<S3Response<HeadObjectOutput>> {
+        self.inner.head_object(req).await
+    }
+
+    async fn list_objects_v2(
+        &self,
+        req: S3Request<ListObjectsV2Input>,
+    ) -> S3Result<S3Response<ListObjectsV2Output>> {
+        self.inner.list_objects_v2(req).await
+    }
+
+    async fn put_object(
+        &self,
+        req: S3Request<PutObjectInput>,
+    ) -> S3Result<S3Response<PutObjectOutput>> {
+        self.inner.put_object(req).await
+    }
+
+    async fn upload_part(
+        &self,
+        req: S3Request<UploadPartInput>,
+    ) -> S3Result<S3Response<UploadPartOutput>> {
+        self.inner.upload_part(req).await
+    }
+
+    async fn copy_object(
+        &self,
+        req: S3Request<CopyObjectInput>,
+    ) -> S3Result<S3Response<CopyObjectOutput>> {
+        self.copies.fetch_add(1, Ordering::Relaxed);
+        let replace = req
+            .input
+            .metadata_directive
+            .as_ref()
+            .is_some_and(|directive| directive.as_str() == MetadataDirective::REPLACE);
+        if !(self.replace_on_copy && replace) {
+            return self.inner.copy_object(req).await;
+        }
+        // The source body with the request's metadata: a get, then a put.
+        let CopySource::Bucket {
+            bucket: from_bucket,
+            key: from_key,
+            ..
+        } = req.input.copy_source.clone()
+        else {
+            return Err(s3_error!(NotImplemented));
+        };
+        let to_bucket = req.input.bucket.clone();
+        let to_key = req.input.key.clone();
+        let metadata = req.input.metadata.clone();
+        let base = req.map_input(|_| ());
+        let get = GetObjectInput::builder()
+            .bucket(from_bucket.into())
+            .key(from_key.into())
+            .build()
+            .expect("get input");
+        let source = self
+            .inner
+            .get_object(base.clone().map_input(|()| get))
+            .await?;
+        let put = PutObjectInput::builder()
+            .bucket(to_bucket)
+            .key(to_key)
+            .body(source.output.body)
+            .metadata(metadata)
+            .build()
+            .expect("put input");
+        let stored = self.inner.put_object(base.map_input(|()| put)).await?;
+        Ok(S3Response::new(CopyObjectOutput {
+            copy_object_result: Some(CopyObjectResult {
+                e_tag: stored.output.e_tag,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }))
+    }
+}
+
+fn spawn_server(fs: TestFs) -> SocketAddr {
     let mut builder = S3ServiceBuilder::new(fs);
     builder.set_auth(SimpleAuth::from_single(ACCESS_KEY, SECRET));
     let service = builder.build();
@@ -916,21 +1065,76 @@ async fn buffered_stage_is_published_without_a_staging_object() {
 }
 
 #[tokio::test]
-async fn multipart_stage_is_copied_and_its_staging_object_deleted() {
-    let s3 = TestS3::start().await;
-    let meta = piece_meta(None, 0x46);
-    let mut stage = s3.store.stage("stage-3").expect("stage");
-    let body = vec![9u8; PART_SIZE + 1];
-    stage.write(&body[..PART_SIZE]).await.expect("first part");
-    stage.write(&body[PART_SIZE..]).await.expect("second part");
+async fn multipart_stage_is_copied_by_the_server_when_it_replaces_metadata() {
+    let s3 = TestS3::start_with(true).await;
+    assert!(s3.store.server_copy(), "the startup probe saw REPLACE work");
+    assert_eq!(s3.copies.load(Ordering::Relaxed), 1, "the probe's copy");
+    // The probe cleans up after itself.
+    assert!(!stage_object(&s3, "probe-src").exists());
+    assert!(!stage_object(&s3, "probe-dst").exists());
+
+    let meta = piece_meta(None, 0x48);
+    let mut stage = s3.store.stage("stage-5").expect("stage");
+    let body: Vec<u8> = (0..PART_SIZE + 1).map(|i| (i % 251) as u8).collect();
+    stage.write(&body).await.expect("spill");
     s3.store
-        .publish_staged(stage, "stage-3", "sat-s", "large", meta)
+        .publish_staged(stage, "stage-5", "sat-s", "copied", meta.clone())
         .await
         .expect("publish");
-    assert!(!stage_object(&s3, "stage-3").exists());
-    assert_eq!(read_piece(&s3, "sat-s", "large").await, body);
-    let info = s3.store.info("sat-s", "large").expect("info").expect("row");
+    // One CopyObject moved the piece. The bytes did not come back here.
+    assert_eq!(s3.copies.load(Ordering::Relaxed), 2);
+    assert!(!stage_object(&s3, "stage-5").exists());
+    assert_eq!(read_piece(&s3, "sat-s", "copied").await, body);
+    let info = s3
+        .store
+        .info("sat-s", "copied")
+        .expect("info")
+        .expect("row");
+    assert_eq!(info.state, PieceState::Live);
     assert_eq!(info.size, body.len() as u64);
+
+    // The piece metadata is on the copy. A rebuild would find this piece.
+    let head = s3
+        .store
+        .head("sat-s", "copied")
+        .await
+        .expect("head")
+        .expect("metadata");
+    let hash: String = meta.hash.iter().map(|byte| format!("{byte:02x}")).collect();
+    assert_eq!(head.get("piece-hash"), Some(&hash));
+    assert!(head.contains_key("order-limit"));
+    assert!(head.contains_key("hash-signature"));
+}
+
+#[tokio::test]
+async fn multipart_stage_is_streamed_when_the_server_keeps_source_metadata() {
+    let s3 = TestS3::start().await;
+    // s3s-fs ignores the directive. The probe must catch that: a piece
+    // copied this way would have no hash and no order limit on its object.
+    assert!(!s3.store.server_copy());
+    assert_eq!(s3.copies.load(Ordering::Relaxed), 1, "the probe's copy");
+    assert!(!stage_object(&s3, "probe-src").exists());
+    assert!(!stage_object(&s3, "probe-dst").exists());
+
+    let meta = piece_meta(None, 0x49);
+    let mut stage = s3.store.stage("stage-6").expect("stage");
+    let body = vec![3u8; PART_SIZE + 1];
+    stage.write(&body).await.expect("spill");
+    s3.store
+        .publish_staged(stage, "stage-6", "sat-s", "streamed", meta.clone())
+        .await
+        .expect("publish");
+    assert_eq!(s3.copies.load(Ordering::Relaxed), 1, "no CopyObject");
+    assert!(!stage_object(&s3, "stage-6").exists());
+    assert_eq!(read_piece(&s3, "sat-s", "streamed").await, body);
+    let head = s3
+        .store
+        .head("sat-s", "streamed")
+        .await
+        .expect("head")
+        .expect("metadata");
+    let hash: String = meta.hash.iter().map(|byte| format!("{byte:02x}")).collect();
+    assert_eq!(head.get("piece-hash"), Some(&hash));
 }
 
 #[tokio::test]

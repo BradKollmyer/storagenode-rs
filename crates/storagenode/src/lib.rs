@@ -186,6 +186,11 @@ pub async fn run(config: Config) -> Result<(), Error> {
             "storagenode: STORJ_ALLOCATED_BYTES is 0: the node reports no free space and refuses uploads"
         );
     }
+    if !node.piece_store().server_copy() {
+        eprintln!(
+            "storagenode: the S3 endpoint does not replace metadata on CopyObject: pieces over 5 MiB are copied through this node"
+        );
+    }
     let dashboard = Arc::new(dashboard::Dashboard::new(Arc::clone(&node), &config));
     let (dashboard_listener, dashboard_addr) = dashboard::listen().await?;
     let listener = Node::listen(config.listen).await?;

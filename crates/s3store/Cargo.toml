@@ -17,6 +17,7 @@ time = { version = "0.3", default-features = false, features = ["std", "formatti
 tokio.workspace = true
 
 [dev-dependencies]
+async-trait = "0.1"
 hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
 s3s = "0.12"
 s3s-fs = "0.12"

@@ -33,6 +33,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aws_sdk_s3::config::{
@@ -40,7 +41,7 @@ use aws_sdk_s3::config::{
 };
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart, MetadataDirective};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use futures_util::stream::{self, StreamExt, TryStreamExt};
@@ -121,6 +122,9 @@ pub struct Store {
     allocated_bytes: u64,
     /// One startup at a time. A second caller waits, then sees the marker.
     startup: tokio::sync::Mutex<()>,
+    /// The endpoint replaced the metadata on [`Store::startup`]'s probe copy.
+    /// False until then, and false when it did not.
+    server_copy: AtomicBool,
     /// A key's lock is held across a piece commit, including the object put,
     /// and across each chore delete. GC must not delete an object this commit
     /// just replaced, and a download must not drop a row this commit just
@@ -335,6 +339,7 @@ impl Store {
             index,
             allocated_bytes: config.allocated_bytes,
             startup: tokio::sync::Mutex::new(()),
+            server_copy: AtomicBool::new(false),
             commit: CommitLocks::new(),
         })
     }
@@ -364,11 +369,14 @@ impl Store {
     /// piece fields. Trash is not on the object, so every rebuilt row is live.
     /// A missing bucket fails this call and leaves the marker unset.
     ///
-    /// Staging objects a crashed process left behind are deleted first.
+    /// Staging objects a crashed process left behind are deleted first, and
+    /// the endpoint is probed for [`Self::server_copy`].
     pub async fn startup(&self) -> Result<()> {
         let _guard = self.startup.lock().await;
         self.head_bucket().await?;
         self.sweep_staging().await?;
+        let server_copy = self.probe_server_copy().await;
+        self.server_copy.store(server_copy, Ordering::Relaxed);
         if self.index.rebuild_done()? {
             return Ok(());
         }
@@ -501,7 +509,10 @@ impl Store {
     /// its metadata, in one request. The staging key is never written.
     ///
     /// A larger body already has parts on the staging key. That upload is
-    /// finished and [`Self::commit_staged_piece`] copies it.
+    /// finished and the object is copied to the piece key: by the server
+    /// when [`Self::server_copy`] is true, so the bytes do not come back
+    /// through this process, and by [`Self::commit_staged_piece`] otherwise
+    /// or when the server copy fails.
     pub async fn publish_staged(
         &self,
         mut staging: Upload,
@@ -511,7 +522,22 @@ impl Store {
         meta: PieceMeta,
     ) -> Result<()> {
         if staging.upload_id.is_some() || staging.failed.is_some() {
+            let size = staging.buffered_len();
             staging.finish().await?;
+            if self.server_copy() {
+                let key = stage_key(&self.prefix, stage_id)?;
+                let mut upload = self.upload_piece(satellite_id, piece_id, meta.clone())?;
+                upload.source = Some(CopyFrom {
+                    key: key.clone(),
+                    size,
+                });
+                if upload.finish().await.is_ok() {
+                    let _ = delete_object(&self.client, &self.bucket, &key).await;
+                    return Ok(());
+                }
+                // `finish` put the row back. The staging object is still
+                // there, and the streamed copy does not need CopyObject.
+            }
             return self
                 .commit_staged_piece(satellite_id, piece_id, stage_id, meta)
                 .await;
@@ -521,6 +547,66 @@ impl Store {
         // No multipart upload was started, so there is nothing to abort.
         drop(staging);
         upload.finish().await
+    }
+
+    /// True when [`Self::startup`] saw this endpoint copy an object and
+    /// replace its metadata.
+    ///
+    /// A piece's hash and order limit are metadata on its object, so a
+    /// server-side copy is only usable when the endpoint honors
+    /// `x-amz-metadata-directive: REPLACE`. Some S3 servers copy the source
+    /// metadata whatever the directive says. Those report false here, and
+    /// pieces over [`PART_SIZE`] are streamed through this process instead.
+    pub fn server_copy(&self) -> bool {
+        self.server_copy.load(Ordering::Relaxed)
+    }
+
+    /// Puts a small object on a staging key, copies it with new metadata, and
+    /// reads the copy's metadata back.
+    ///
+    /// Any error is "no". The streamed copy needs nothing this checks.
+    async fn probe_server_copy(&self) -> bool {
+        const NOTE: &str = "copy-probe";
+        const BODY: &[u8] = b"copy-probe";
+        let (Ok(from), Ok(to)) = (
+            stage_key(&self.prefix, "probe-src"),
+            stage_key(&self.prefix, "probe-dst"),
+        ) else {
+            return false;
+        };
+        let replaced = async {
+            self.client
+                .put_object()
+                .bucket(&self.bucket)
+                .key(&from)
+                .body(ByteStream::from_static(BODY))
+                .metadata(NOTE, "source")
+                .send()
+                .await
+                .map_err(map_s3)?;
+            let pairs = vec![(NOTE.to_owned(), "replaced".to_owned())];
+            copy_object(&self.client, &self.bucket, &from, &to, pairs).await?;
+            let head = self
+                .client
+                .head_object()
+                .bucket(&self.bucket)
+                .key(&to)
+                .send()
+                .await
+                .map_err(map_s3)?;
+            let meta = normalize_metadata(head.metadata()).unwrap_or_default();
+            let len = head
+                .content_length()
+                .and_then(|len| u64::try_from(len).ok());
+            Ok::<_, Error>(
+                meta.get(NOTE).map(String::as_str) == Some("replaced")
+                    && len == u64::try_from(BODY.len()).ok(),
+            )
+        }
+        .await;
+        let _ = delete_object(&self.client, &self.bucket, &from).await;
+        let _ = delete_object(&self.client, &self.bucket, &to).await;
+        replaced.unwrap_or(false)
     }
 
     /// Deletes staging objects left by a process that died mid-upload.
@@ -1009,6 +1095,7 @@ impl Store {
             parts: Vec::new(),
             next_part: 1,
             failed: None,
+            source: None,
             index: self.index.clone(),
             commit: Arc::clone(&self.commit),
             locks_key,
@@ -1330,10 +1417,18 @@ pub struct Upload {
     next_part: i32,
     // A failed part must not be completed later as a short or empty object.
     failed: Option<Error>,
+    /// Set by [`Store::publish_staged`]: commit by copying this object on
+    /// the server instead of sending a body.
+    source: Option<CopyFrom>,
     index: index::Index,
     commit: Arc<CommitLocks>,
     locks_key: bool,
     piece: Option<PieceAttempt>,
+}
+
+struct CopyFrom {
+    key: String,
+    size: u64,
 }
 
 struct PieceAttempt {
@@ -1434,6 +1529,10 @@ impl Upload {
     async fn finish_inner(&mut self) -> Result<()> {
         if let Some(err) = &self.failed {
             return Err(err.clone());
+        }
+        if let Some(source) = &self.source {
+            let pairs = metadata_pairs(self.metadata.as_ref())?;
+            return copy_object(&self.client, &self.bucket, &source.key, &self.key, pairs).await;
         }
         if self.upload_id.is_none() {
             self.put_single().await?;
@@ -1662,6 +1761,9 @@ impl Upload {
     }
 
     fn buffered_len(&self) -> u64 {
+        if let Some(source) = &self.source {
+            return source.size;
+        }
         let parts = u64::from(self.next_part.saturating_sub(1).cast_unsigned());
         let part_len = u64::try_from(PART_SIZE).unwrap_or(u64::MAX);
         parts
@@ -1977,6 +2079,44 @@ async fn delete_object(client: &aws_sdk_s3::Client, bucket: &str, key: &str) -> 
     }
 }
 
+/// `CopyObject` within the bucket. The copy gets `pairs` as its user
+/// metadata, not the source's.
+async fn copy_object(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    from: &str,
+    to: &str,
+    pairs: Vec<(String, String)>,
+) -> Result<()> {
+    let mut req = client
+        .copy_object()
+        .bucket(bucket)
+        .key(to)
+        .copy_source(copy_source(bucket, from))
+        .metadata_directive(MetadataDirective::Replace);
+    for (key, value) in pairs {
+        req = req.metadata(key, value);
+    }
+    req.send().await.map_err(map_s3)?;
+    Ok(())
+}
+
+/// `{bucket}/{key}` for `x-amz-copy-source`, which the caller must URL-encode.
+fn copy_source(bucket: &str, key: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(bucket.len() + 1 + key.len());
+    for byte in bucket.bytes().chain([b'/']).chain(key.bytes()) {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~' | b'/') {
+            out.push(char::from(byte));
+        } else {
+            out.push('%');
+            out.push(char::from(HEX[usize::from(byte >> 4)]));
+            out.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+    }
+    out
+}
+
 fn map_s3<E, R>(err: SdkError<E, R>) -> Error
 where
     E: ProvideErrorMetadata,
@@ -2060,6 +2200,18 @@ fn check_id(what: &str, value: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copy_source_is_url_encoded_and_keeps_slashes() {
+        assert_eq!(
+            copy_source("pieces", "pieces/.s00000000000000a1"),
+            "pieces/pieces/.s00000000000000a1"
+        );
+        assert_eq!(
+            copy_source("b", "my prefix/caf\u{e9}+1/.s1"),
+            "b/my%20prefix/caf%C3%A9%2B1/.s1"
+        );
+    }
 
     #[tokio::test]
     async fn commit_locks_are_per_key_and_the_gate_waits_for_all() {

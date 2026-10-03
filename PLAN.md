@@ -46,7 +46,7 @@ SQLite file `pieces.db` on the volume (`rusqlite`, bundled). WAL. It is a cache 
 
 Commit order: insert `writing`, `PutObject` or complete multipart, then mark `live`. Cancel deletes the object and the row. A crash after the put and before `live` leaves an unreferenced object; the node will not serve it. A later upload of the same id overwrites the key.
 
-Pieces under 5 MiB use one `PutObject` (a normal share is about 2 MiB). Larger pieces use multipart, 5 MiB parts, last part may be shorter. Client is `aws-sdk-s3`:
+Pieces under 5 MiB use one `PutObject` (a normal share is about 2 MiB). Larger pieces use multipart, 5 MiB parts, last part may be shorter. The uplink hash arrives after the bytes, so a multipart piece is written to a staging key and then copied to the piece key with its metadata. Startup probes the endpoint: if `CopyObject` with `REPLACE` really replaces the metadata, the server does that copy; if not, the node streams it. Client is `aws-sdk-s3`:
 
 - Endpoint from config. Path-style when the host is not `amazonaws.com`. `path-style` overrides that.
 - Checksum request and response validation `when_required`, so Ceph RGW does not reject the SDK's default CRC32 headers.
