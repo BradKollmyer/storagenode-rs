@@ -1,6 +1,6 @@
 //! Generate check-in, graceful-exit, held-amount, and node-stats messages.
 //!
-//! `proto/` is searched before `storj-uplink/proto`, so this repo's
+//! `proto/` is searched before `uplink-rs/proto`, so this repo's
 //! `contact.proto`, `nodetags.proto`, and `gracefulexit.proto` win.
 //! `nodetags.proto` is package `node` and is compiled in the same `protoc`
 //! run as `contact.proto`, which is what puts `SignedNodeTagSets` on the
@@ -16,7 +16,7 @@ use std::path::PathBuf;
 fn main() -> io::Result<()> {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").map_err(io::Error::other)?);
     let local = manifest.join("../../proto");
-    let uplink = manifest.join("../../../storj-uplink/proto");
+    let uplink = manifest.join("../../../uplink-rs/proto");
     if !local.join("contact.proto").is_file()
         || !local.join("nodetags.proto").is_file()
         || !local.join("gracefulexit.proto").is_file()
@@ -30,7 +30,7 @@ fn main() -> io::Result<()> {
     }
     if !uplink.join("node.proto").is_file() {
         return Err(io::Error::other(format!(
-            "storj-uplink protos not found at {}",
+            "uplink-rs protos not found at {}",
             uplink.display()
         )));
     }

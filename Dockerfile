@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.4
 # Context is the parent of this repo (`docker build -f storagenode-rs/Dockerfile .`).
-# The crate path-depends on storj-uplink, and the UI stage builds storj/web/storagenode.
+# The crate path-depends on uplink-rs, and the UI stage builds storj/web/storagenode.
 # COPY names those trees. The daemon still receives the whole parent context.
 
 ARG NODE_VERSION=24.11.1
@@ -16,7 +16,7 @@ RUN --mount=type=cache,target=/root/.npm npm run build
 FROM rust:1.91.1-bookworm AS rust
 
 WORKDIR /src
-COPY storj-uplink /src/storj-uplink
+COPY uplink-rs /src/uplink-rs
 COPY storagenode-rs/Cargo.toml storagenode-rs/Cargo.lock storagenode-rs/rust-toolchain.toml /src/storagenode-rs/
 COPY storagenode-rs/.cargo /src/storagenode-rs/.cargo
 COPY storagenode-rs/crates /src/storagenode-rs/crates

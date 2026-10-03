@@ -1,37 +1,37 @@
 # Builder notes
 
-Read [PLAN.md](PLAN.md) for what the node does. This file is how, and the traps. Do not re-derive the pins. Do not edit `storj/`, `uplink/`, or `storj-uplink/`. [README.md](README.md) is how to build and run the binary.
+Read [PLAN.md](PLAN.md) for what the node does. This file is how, and the traps. Do not re-derive the pins. Do not edit `storj/`, `uplink/`, or `uplink-rs/`. [README.md](README.md) is how to build and run the binary.
 
 ## Trees
 
 | Path | Role |
 |---|---|
 | `/Volumes/SSD/repos/storj/storagenode-rs` | This project. |
-| `/Volumes/SSD/repos/storj/storj-uplink` | Protocol API. Path-depend. Public crate `storj` does not export identity, frames, or order bytes. |
+| `/Volumes/SSD/repos/storj/uplink-rs` | Protocol API. Path-depend. Public crate `storj` does not export identity, frames, or order bytes. |
 | `/Volumes/SSD/repos/storj/storj` | Go node and `web/storagenode`. Behavior reference and the Vue app. |
 | `/Volumes/SSD/repos/storj/uplink` | Go uplink. Not a dependency. |
 | `/Volumes/SSD/repos/storj-rust` | Early stub. Do not use. |
 | `/Users/bradk/go/pkg/mod/storj.io/common@v0.0.0-20260818140313-d38275a3768b/pb/` | Proto sources at the pin. |
 
-Parent `/Volumes/SSD/repos/storj` is not a git repo. `storj-uplink` is `github.com/BradKollmyer/storj-uplink` (DCO, GitHub PRs). `storj` and `uplink` review on Gerrit.
+Parent `/Volumes/SSD/repos/storj` is not a git repo. `uplink-rs` is `github.com/BradKollmyer/uplink-rs` (DCO, GitHub PRs). `storj` and `uplink` review on Gerrit.
 
-`storj-uplink` style: edition 2024, `MIT OR Apache-2.0`, workspace `crates/*` excluding fuzz. `rust-version` is 1.91.1. Copy `.cargo/config.toml` (aarch64 `aes_armv8` / `polyval_armv8`) if this workspace pulls `aes-gcm`. Docker Rust stage `rust:1.91.1-bookworm`.
+`uplink-rs` style: edition 2024, `MIT OR Apache-2.0`, workspace `crates/*` excluding fuzz. `rust-version` is 1.91.1. Copy `.cargo/config.toml` (aarch64 `aes_armv8` / `polyval_armv8`) if this workspace pulls `aes-gcm`. Docker Rust stage `rust:1.91.1-bookworm`.
 
 Path deps from `crates/storagenode/Cargo.toml` (`crates/s3store` does not need them):
 
 ```
-storj-proto = { path = "../../../storj-uplink/crates/storj-proto" }
-storj-rpc = { path = "../../../storj-uplink/crates/storj-rpc" }
-storj-uplink = { path = "../../../storj-uplink/crates/storj-uplink" }
+storj-proto = { path = "../../../uplink-rs/crates/storj-proto" }
+storj-rpc = { path = "../../../uplink-rs/crates/storj-rpc" }
+storj-uplink = { path = "../../../uplink-rs/crates/storj-uplink" }
 ```
 
-Those relatives resolve from `storagenode-rs/crates/storagenode` to the sibling `storj-uplink`. The crate docs say depend on `storj` instead. This node depends on the internal crates anyway. Docker context is the parent directory so the same relatives still resolve. Copy both trees into the build context.
+Those relatives resolve from `storagenode-rs/crates/storagenode` to the sibling `uplink-rs`. The crate docs say depend on `storj` instead. This node depends on the internal crates anyway. Docker context is the parent directory so the same relatives still resolve. Copy both trees into the build context.
 
 Public helpers, from `storj_uplink`: `encode_order_limit`, `verify_order_limit`, `verify_order`, `sign_piece_hash_node`, `verify_piece_hash_uplink`, `PieceHashAlgo`, `PieceHasher`, `Client`, `PieceConfig`. Identity and TLS: `Identity::{generate, from_pem, from_pem_parts, cert_chain, private_key, hash_and_sign, leaf_der}` and `server_config` in `storj-rpc/src/tls.rs` (requires a client certificate, `with_safe_default_protocol_versions`). `from_pem` wants CERTIFICATE blocks plus one PKCS#8 `PRIVATE KEY` (SEC1 `EC PRIVATE KEY` via `from_pem_parts`). There is no `to_pem`. Persist PEM yourself, leaf first.
 
 ## Protos
 
-Pin, from `storj-uplink/proto/README.md` (same `storj.io/common` pseudoversion as `storj/go.mod`):
+Pin, from `uplink-rs/proto/README.md` (same `storj.io/common` pseudoversion as `storj/go.mod`):
 
 ```
 STORJ_COMMON_SHA=d38275a3768ba356144814f3ec5d62eeca670e49
@@ -40,7 +40,7 @@ STORJ_UPLINK_SHA=2fef38720d8395837567da60ab69016099dca9f5
 
 Already generated in `storj-proto`: piecestore, orders, node (`NodeOperator`, `NodeCapacity`, `NodeVersion`), noise (`NoiseInfo`, `NoiseKeyAttestation`, `NoiseProtocol`). Do not regenerate that crate.
 
-`storj-uplink/proto/node.proto` is byte-identical to the pin (95 lines, compared 2026-10-02). Do not copy a second `node.proto`. The `reserved 3 to 14` line is inside `message Node`. It is not a truncated file.
+`uplink-rs/proto/node.proto` is byte-identical to the pin (95 lines, compared 2026-10-02). Do not copy a second `node.proto`. The `reserved 3 to 14` line is inside `message Node`. It is not a truncated file.
 
 `SignedNodeTagSets` is not in `node.proto`. It is in `nodetags.proto`, which is also `package node`, and which uplink does not vendor. `CheckInRequest.signed_tags` uses that type. `storj_proto::node` was generated from `node.proto` alone, so it has no `SignedNodeTagSets`.
 
@@ -52,7 +52,7 @@ Copy into `storagenode-rs/proto/`, byte-identical, from the module cache. Do not
 - `heldamount.proto`
 - `nodestats.proto`
 
-`prost-build` include dirs: this `proto/` first, then `storj-uplink/proto` (for `node.proto`, `noise.proto`, `gogo.proto`, `orders.proto`, `metainfo.proto`). Compile `nodetags.proto` in the same `protoc` invocation as `contact.proto` so package `node` contains `SignedNodeTagSets`.
+`prost-build` include dirs: this `proto/` first, then `uplink-rs/proto` (for `node.proto`, `noise.proto`, `gogo.proto`, `orders.proto`, `metainfo.proto`). Compile `nodetags.proto` in the same `protoc` invocation as `contact.proto` so package `node` contains `SignedNodeTagSets`.
 
 `extern_path` `.orders`, `.metainfo`, and `.noise` to `::storj_proto::orders`, `::storj_proto::metainfo`, `::storj_proto::noise`. Do not `extern_path` `.node` onto `storj_proto::node`. Check-in uses the locally generated node types (a second `NodeOperator` / `NodeCapacity` / `NodeVersion`). Piecestore keeps using `storj_proto`. If an `extern_path` type is missing a field, drop that extern and translate with `encode_to_vec` / `decode`.
 
@@ -79,7 +79,7 @@ Noise attestation, from `storj.io/common/rpc/noise.GenerateKeyAttestation`: sign
 
 QUIC has no TCP mux header. Model the listener on the private `quic_server` in `storj-rpc/src/transport.rs` (around line 1072): `server_config`, ALPN `storj`, `QuicServerConfig::try_from`, `quinn::Endpoint::server`. Idle timeout 15 minutes, keepalive 15 seconds, same as `quic()` in that file. Uplink rustls features include TLS 1.3 (`QuicClientConfig::try_from` already works).
 
-Upload message order is in `storj-uplink/proto/piecestore2.proto`: OrderLimit, optional hash algorithm (field 5, when not SHA-256), repeated Order+Chunk, then uplink-signed PieceHash. Response is the node-signed PieceHash, plus `node_certchain` on Noise (TLS can take the cert from the connection). Download starts with OrderLimit and a range. `GET_REPAIR` sends the stored hash and the original order limit before the bytes. `GET` and `GET_AUDIT` do not. Actions allowed on download: GET, GET_REPAIR, GET_AUDIT.
+Upload message order is in `uplink-rs/proto/piecestore2.proto`: OrderLimit, optional hash algorithm (field 5, when not SHA-256), repeated Order+Chunk, then uplink-signed PieceHash. Response is the node-signed PieceHash, plus `node_certchain` on Noise (TLS can take the cert from the connection). Download starts with OrderLimit and a range. `GET_REPAIR` sends the stored hash and the original order limit before the bytes. `GET` and `GET_AUDIT` do not. Actions allowed on download: GET, GET_REPAIR, GET_AUDIT.
 
 `Exists` missing is `STORAGE_METHOD_UNSPECIFIED`. Present is `STORAGE_METHOD_PIECESTORE`. The enum lives in `storj.io/common`. Do not extend it.
 
@@ -98,7 +98,7 @@ Noise: `NoiseStream::accept` takes the protocol as an argument. The 8-byte heade
 
 ## Bloom retain
 
-Port `storj/shared/bloomfilter/filter.go`. There is no Rust copy in `storj-uplink`. Wire bytes: version `1`, seed, hashCount, then the table. Reject a version other than 1, a buffer shorter than 3 bytes, or a hashCount of 0.
+Port `storj/shared/bloomfilter/filter.go`. There is no Rust copy in `uplink-rs`. Wire bytes: version `1`, seed, hashCount, then the table. Reject a version other than 1, a buffer shorter than 3 bytes, or a hashCount of 0.
 
 `Contains`: a piece id is 32 bytes, copied twice into a 64-byte buffer. `offset = seed % 32`. `rangeOffset` is `{9, 13, 19, 23}[(seed / 32) % 4]`. For each of `hashCount` hashes: little-endian u64 at `offset`, the next byte is the bit index, `bucket = hash % table_len` (plain modulo; `fastdiv` is only a speed trick), bit is `1 << (bit % 8)`. If that bit is unset, the piece is not in the set, so trash it. Then `offset = (offset + rangeOffset) % 32`. Retain walks live rows for that satellite with `created_at` before the request's `CreatedBefore`.
 
@@ -137,7 +137,7 @@ Trash is only an index flag. A rebuild cannot recover it or the unsent orders. K
 - `storj/storagenode/console/service.go` — `Dashboard` JSON
 - `storj/web/storagenode/src/storagenode/api/storagenode.ts` — fields the page requires
 - `storj/shared/bloomfilter/filter.go` — retain filter
-- `storj-uplink/crates/storj-rpc/src/{conn,noise,tls,transport,identity}.rs` — frames, Noise, QUIC, identity
+- `uplink-rs/crates/storj-rpc/src/{conn,noise,tls,transport,identity}.rs` — frames, Noise, QUIC, identity
 
 ## Build order
 

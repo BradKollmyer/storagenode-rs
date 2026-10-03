@@ -20,9 +20,9 @@ quinn = { version = "0.11", default-features = false, features = ["runtime-tokio
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "aws_lc_rs"] }
 snow = { version = "0.10", default-features = false, features = ["std", "default-resolver", "use-getrandom", "use-curve25519", "use-aes-gcm", "use-chacha20poly1305", "use-blake2"] }
 s3store = { path = "../s3store" }
-storj-proto = { path = "../../../storj-uplink/crates/storj-proto" }
-storj-rpc = { path = "../../../storj-uplink/crates/storj-rpc" }
-storj-uplink = { path = "../../../storj-uplink/crates/storj-uplink" }
+storj-proto = { path = "../../../uplink-rs/crates/storj-proto" }
+storj-rpc = { path = "../../../uplink-rs/crates/storj-rpc" }
+storj-uplink = { path = "../../../uplink-rs/crates/storj-uplink" }
 serde_json = "1"
 time = { version = "0.3", default-features = false, features = ["std", "formatting"] }
 thiserror.workspace = true
