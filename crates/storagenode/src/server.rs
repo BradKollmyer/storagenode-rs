@@ -89,6 +89,9 @@ const SPACE_REFRESH: Duration = Duration::from_secs(60);
 /// clock, which may run ahead of the satellite's.
 const EXPIRATION_GRACE: Duration = Duration::from_secs(48 * 60 * 60);
 
+/// How long a refused RPC waits for the peer to hang up before this side does.
+const ERROR_LINGER: Duration = Duration::from_secs(5);
+
 /// Pause after a failed `accept`, so a full descriptor table is not a busy loop.
 const ACCEPT_RETRY: Duration = Duration::from_millis(250);
 
@@ -438,6 +441,7 @@ impl Node {
             }
             Err(Fail::Proto { code, message }) => {
                 let _ = out.fail(code, &message).await;
+                out.linger(ERROR_LINGER).await;
                 Ok(out.conn.into_inner())
             }
             Err(Fail::Transport(err)) => Err(io_err(err)),
@@ -1413,6 +1417,28 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Out<T> {
 
     async fn fail(&mut self, code: u64, message: &str) -> Result<(), storj_rpc::Error> {
         self.send(Kind::ERROR, &marshal_error(code, message)).await
+    }
+
+    /// Reads and discards until the peer ends the stream, hangs up, or
+    /// `budget` passes.
+    ///
+    /// Closing a socket that still has unread bytes sends a reset, and a
+    /// reset can discard the error packet before the peer has read it. An
+    /// uplink whose upload is refused has chunks in flight, and a satellite
+    /// that audits must see NotFound, not a broken connection.
+    async fn linger(&mut self, budget: Duration) {
+        let _ = tokio::time::timeout(budget, async {
+            loop {
+                match self.conn.read_packet().await {
+                    Ok(pkt) if matches!(pkt.kind, Kind::CLOSE | Kind::CANCEL | Kind::ERROR) => {
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+        })
+        .await;
     }
 
     /// [`Self::recv`] for a packet that has already arrived. `Ok(None)` when
@@ -2725,6 +2751,62 @@ mod tests {
             .unwrap()
             .expect("an order was saved");
         assert_eq!(saved.amount, body.len() as i64);
+    }
+
+    #[tokio::test]
+    async fn refused_upload_still_delivers_its_error_past_unread_chunks() {
+        let satellite = Identity::generate().unwrap();
+        let stranger = Identity::generate().unwrap();
+        let uplink = Identity::generate().unwrap();
+        let harness = Harness::start(std::slice::from_ref(&satellite)).await;
+        let piece_key = PiecePrivateKey::generate();
+        // Signed by a satellite this node does not trust: refused at once.
+        let limit = signed_limit(
+            &stranger,
+            &harness.identity,
+            &piece_key,
+            &[0x62; 32],
+            PieceAction::Put,
+            1 << 30,
+        );
+        let mut conn = harness.conn(&uplink).await;
+        let first = PieceUploadRequest {
+            limit: Some(limit.clone()),
+            ..PieceUploadRequest::default()
+        };
+        let data = vec![7u8; 256 * 1024];
+        let mut packets = vec![
+            (Kind::INVOKE, PIECESTORE_UPLOAD.as_bytes().to_vec()),
+            (Kind::MESSAGE, first.encode_to_vec()),
+        ];
+        // Chunks the node will never read as an upload. They are written
+        // without looking at the socket, as a client busy sending does.
+        for index in 0..16i64 {
+            let chunk = PieceUploadRequest {
+                chunk: Some(piece_upload_request::Chunk {
+                    offset: index * data.len() as i64,
+                    data: data.clone(),
+                }),
+                ..PieceUploadRequest::default()
+            };
+            packets.push((Kind::MESSAGE, chunk.encode_to_vec()));
+        }
+        for (message_id, (kind, data)) in (1u64..).zip(packets) {
+            let packet = Packet {
+                stream_id: 1,
+                message_id,
+                kind,
+                control: false,
+                data,
+            };
+            if conn.write_packet(&packet).await.is_err() {
+                break;
+            }
+        }
+        let reply = conn.read_packet().await.expect("the error packet");
+        assert!(reply.kind == Kind::ERROR, "got {}", reply.kind);
+        let text = String::from_utf8_lossy(&reply.data).into_owned();
+        assert!(text.contains("untrusted satellite"), "{text}");
     }
 
     #[tokio::test]
