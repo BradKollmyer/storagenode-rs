@@ -1,13 +1,15 @@
 //! Storage node process: identity on the volume, DRPC over TLS, pieces in S3.
 //!
-//! This crate serves `Upload`, `Download`, `Exists`, `Retain`, and `RetainBig`.
-//! Noise, QUIC, settlement, and check-in are not in this binary yet.
+//! This crate serves `Upload`, `Download`, `Exists`, `Retain`, and `RetainBig`,
+//! and settles closed bandwidth-order hours with the satellite.
+//! Noise, QUIC, and check-in are not in this binary yet.
 
 #![deny(clippy::undocumented_unsafe_blocks)]
 
 mod bloom;
 mod config;
 mod identity;
+mod orders;
 mod server;
 
 pub use config::Config;
@@ -89,6 +91,7 @@ fn load_satellites(volume: &Path, urls: &[NodeUrl]) -> Result<Vec<TrustedSatelli
         }
         trusted.push(TrustedSatellite {
             id: url.id,
+            address: url.address.clone(),
             leaf_der: certs[0].clone(),
             ca_der: certs[1].clone(),
         });
@@ -102,6 +105,10 @@ pub async fn run(config: Config) -> Result<(), Error> {
     let listener = Node::listen(config.listen).await?;
     let addr = listener.local_addr()?;
     eprintln!("storagenode: node {} listening on {addr}", node.node_id());
+    let settling = Arc::clone(&node);
+    tokio::spawn(async move {
+        settling.serve_orders().await;
+    });
     node.serve(listener).await?;
     Ok(())
 }

@@ -23,7 +23,10 @@
 
 mod index;
 
-pub use index::{HashAlgorithm, PIECES_DB, PieceInfo, PieceMeta, PieceState, Space, TRASH_KEEP};
+pub use index::{
+    HashAlgorithm, OrderRows, PIECES_DB, PieceInfo, PieceMeta, PieceState, Space, StoredOrder,
+    StoredOrderStatus, TRASH_KEEP,
+};
 
 use std::collections::HashMap;
 use std::fmt;
@@ -477,6 +480,11 @@ impl Store {
     ) -> Result<Vec<String>> {
         check_id("satellite id", satellite_id)?;
         self.index.live_before(satellite_id, before)
+    }
+
+    /// Orders table in this store's `pieces.db`.
+    pub fn orders(&self) -> OrderRows {
+        self.index.orders()
     }
 
     /// The index row, including `writing` and `trash`. `Ok(None)` when absent.

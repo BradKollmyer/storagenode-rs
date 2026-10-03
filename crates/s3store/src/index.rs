@@ -4,6 +4,8 @@
 //! Trash lives only here. A missing or unfinished database is rebuilt from
 //! object metadata; every rebuilt row is live. `user_version` stays 0 until
 //! that listing finishes, so a restart does not treat a partial file as done.
+//! Bandwidth orders live in the same file. A second database would not
+//! survive the volume the pieces already use.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -38,6 +40,19 @@ CREATE TABLE IF NOT EXISTS pieces (
 );
 CREATE INDEX IF NOT EXISTS pieces_expires ON pieces (expires_at);
 CREATE INDEX IF NOT EXISTS pieces_trash ON pieces (trashed_at);
+
+CREATE TABLE IF NOT EXISTS orders (
+    satellite TEXT NOT NULL,
+    serial BLOB NOT NULL,
+    window_start INTEGER NOT NULL,
+    limit_blob BLOB NOT NULL,
+    order_blob BLOB NOT NULL,
+    amount INTEGER NOT NULL,
+    status INTEGER,
+    archived_at INTEGER,
+    PRIMARY KEY (satellite, serial)
+);
+CREATE INDEX IF NOT EXISTS orders_window ON orders (satellite, window_start, status);
 ";
 
 /// `PRAGMA user_version` written only after a full prefix listing finishes.
@@ -498,11 +513,179 @@ impl Index {
     }
 
     fn with<T>(&self, f: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> Result<T> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|_| Error::Index("lock poisoned".into()))?;
-        f(&conn).map_err(db_err)
+        with_conn(&self.conn, f)
+    }
+
+    pub(crate) fn orders(&self) -> OrderRows {
+        OrderRows {
+            conn: Arc::clone(&self.conn),
+        }
+    }
+}
+
+fn with_conn<T>(
+    conn: &Mutex<Connection>,
+    f: impl FnOnce(&Connection) -> rusqlite::Result<T>,
+) -> Result<T> {
+    let conn = conn
+        .lock()
+        .map_err(|_| Error::Index("lock poisoned".into()))?;
+    f(&conn).map_err(db_err)
+}
+
+/// One bandwidth order kept for settlement. `status` is unset until the
+/// satellite accepts or rejects the window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredOrder {
+    /// Satellite id, the same text as a piece row.
+    pub satellite: String,
+    /// Uplink serial number.
+    pub serial: Vec<u8>,
+    /// UTC hour of `OrderCreation`, as unix seconds.
+    pub window_start: i64,
+    /// Encoded order limit.
+    pub limit: Vec<u8>,
+    /// Encoded uplink order.
+    pub order: Vec<u8>,
+    /// Signed amount. Only a larger amount replaces an unsent row.
+    pub amount: i64,
+}
+
+/// `status` of one serial. Absent when the row was never saved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoredOrderStatus {
+    /// `None` while unsent. `Some(0)` accepted, `Some(1)` rejected.
+    pub status: Option<i32>,
+    /// Signed amount stored for the serial.
+    pub amount: i64,
+}
+
+/// Orders table in `pieces.db`. Cheap to clone: it shares the index connection.
+#[derive(Clone)]
+pub struct OrderRows {
+    conn: Arc<Mutex<Connection>>,
+}
+
+impl OrderRows {
+    /// Inserts the order, or replaces an unsent row when `amount` is larger.
+    ///
+    /// An archived serial is left alone. Resubmitting it would be a second
+    /// window for a serial the satellite already answered.
+    pub fn save(&self, order: &StoredOrder) -> Result<()> {
+        self.with(|conn| {
+            conn.execute(
+                "INSERT INTO orders (
+                    satellite, serial, window_start, limit_blob, order_blob, amount
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(satellite, serial) DO UPDATE SET
+                    window_start = excluded.window_start,
+                    limit_blob = excluded.limit_blob,
+                    order_blob = excluded.order_blob,
+                    amount = excluded.amount
+                 WHERE orders.status IS NULL AND excluded.amount > orders.amount",
+                params![
+                    order.satellite,
+                    order.serial,
+                    order.window_start,
+                    order.limit,
+                    order.order,
+                    order.amount,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Unsent orders for one satellite hour, oldest serial first.
+    pub fn window(&self, satellite: &str, window_start: i64) -> Result<Vec<StoredOrder>> {
+        self.with(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT serial, limit_blob, order_blob, amount
+                 FROM orders
+                 WHERE status IS NULL AND satellite = ?1 AND window_start = ?2
+                 ORDER BY serial",
+            )?;
+            let rows = stmt.query_map(params![satellite, window_start], |row| {
+                Ok(StoredOrder {
+                    satellite: satellite.to_owned(),
+                    serial: row.get(0)?,
+                    window_start,
+                    limit: row.get(1)?,
+                    order: row.get(2)?,
+                    amount: row.get(3)?,
+                })
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+        })
+    }
+
+    /// One closed-hour candidate per satellite. The caller drops hours that
+    /// are still inside the grace period.
+    pub fn unsent_windows(&self) -> Result<Vec<(String, i64)>> {
+        self.with(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT satellite, window_start
+                 FROM orders
+                 WHERE status IS NULL
+                 ORDER BY window_start, satellite",
+            )?;
+            let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+        })
+    }
+
+    /// Marks one unsent serial. A serial that is already archived is unchanged.
+    pub fn archive(
+        &self,
+        satellite: &str,
+        serial: &[u8],
+        status: i32,
+        at: SystemTime,
+    ) -> Result<()> {
+        let at = system_to_millis(at)?;
+        self.with(|conn| {
+            conn.execute(
+                "UPDATE orders
+                 SET status = ?1, archived_at = ?2
+                 WHERE satellite = ?3 AND serial = ?4 AND status IS NULL",
+                params![status, at, satellite, serial],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Drops archived rows strictly older than `before`.
+    pub fn delete_archived_before(&self, before: SystemTime) -> Result<u64> {
+        let before = system_to_millis(before)?;
+        self.with(|conn| {
+            let n = conn.execute(
+                "DELETE FROM orders
+                 WHERE status IS NOT NULL AND archived_at IS NOT NULL AND archived_at < ?1",
+                params![before],
+            )?;
+            Ok(u64::try_from(n).unwrap_or(0))
+        })
+    }
+
+    /// `Ok(None)` when this serial has no row.
+    pub fn status(&self, satellite: &str, serial: &[u8]) -> Result<Option<StoredOrderStatus>> {
+        self.with(|conn| {
+            conn.query_row(
+                "SELECT status, amount FROM orders WHERE satellite = ?1 AND serial = ?2",
+                params![satellite, serial],
+                |row| {
+                    Ok(StoredOrderStatus {
+                        status: row.get(0)?,
+                        amount: row.get(1)?,
+                    })
+                },
+            )
+            .optional()
+        })
+    }
+
+    fn with<T>(&self, f: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> Result<T> {
+        with_conn(&self.conn, f)
     }
 }
 
@@ -704,6 +887,65 @@ mod tests {
         let index = Index::open(&path).unwrap();
         assert!(index.rebuild_done().unwrap());
         assert!(index.is_expired("sat", "old", expires).unwrap());
+    }
+
+    #[test]
+    fn orders_keep_the_largest_amount_and_expire_after_seven_days() {
+        let (_dir, path) = temp_db();
+        let index = Index::open(&path).unwrap();
+        let orders = index.orders();
+        let window = 1_700_000_000;
+        let mut row = StoredOrder {
+            satellite: "sat".into(),
+            serial: vec![1, 2, 3],
+            window_start: window,
+            limit: b"limit-a".to_vec(),
+            order: b"order-a".to_vec(),
+            amount: 10,
+        };
+        orders.save(&row).unwrap();
+        row.amount = 4;
+        row.order = b"order-smaller".to_vec();
+        orders.save(&row).unwrap();
+        let got = orders.status("sat", &[1, 2, 3]).unwrap().unwrap();
+        assert_eq!(got.status, None);
+        assert_eq!(got.amount, 10);
+        row.amount = 25;
+        row.order = b"order-b".to_vec();
+        row.limit = b"limit-b".to_vec();
+        orders.save(&row).unwrap();
+        let got = orders.status("sat", &[1, 2, 3]).unwrap().unwrap();
+        assert_eq!(got.amount, 25);
+        assert_eq!(
+            orders.window("sat", window).unwrap(),
+            vec![StoredOrder {
+                satellite: "sat".into(),
+                serial: vec![1, 2, 3],
+                window_start: window,
+                limit: b"limit-b".to_vec(),
+                order: b"order-b".to_vec(),
+                amount: 25,
+            }]
+        );
+
+        let archived_at = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        orders.archive("sat", &[1, 2, 3], 0, archived_at).unwrap();
+        row.amount = 90;
+        orders.save(&row).unwrap();
+        let got = orders.status("sat", &[1, 2, 3]).unwrap().unwrap();
+        assert_eq!(got.status, Some(0));
+        assert_eq!(got.amount, 25);
+        assert!(orders.window("sat", window).unwrap().is_empty());
+
+        // The sender passes `now - 7 days`. Equal to the archive time stays.
+        let week = Duration::from_secs(7 * 24 * 60 * 60);
+        let now = archived_at + week;
+        let cutoff = now.checked_sub(week).expect("cutoff");
+        assert_eq!(orders.delete_archived_before(cutoff).unwrap(), 0);
+        let later = now + Duration::from_secs(1);
+        let cutoff = later.checked_sub(week).expect("cutoff");
+        assert_eq!(orders.delete_archived_before(cutoff).unwrap(), 1);
+        assert!(orders.status("sat", &[1, 2, 3]).unwrap().is_none());
     }
 
     /// Tiny temp dir that deletes itself. Avoids a dev-dependency for one test.

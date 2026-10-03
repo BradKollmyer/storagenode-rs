@@ -30,6 +30,8 @@ use storj_uplink::{
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 
+use crate::orders::{self, Orders};
+
 /// DRPC path for `piecestore.Piecestore/Exists`.
 ///
 /// `storj-proto` exports upload and download only.
@@ -40,10 +42,6 @@ pub const PIECESTORE_RETAIN: &str = "/piecestore.Piecestore/Retain";
 
 /// DRPC path for `piecestore.Piecestore/RetainBig`.
 pub const PIECESTORE_RETAIN_BIG: &str = "/piecestore.Piecestore/RetainBig";
-
-/// Order creation further than this from now is rejected (`OrderLimitGracePeriod`).
-/// Piece expiration and order expiration compare the timestamp to now.
-const ORDER_LIMIT_GRACE: Duration = Duration::from_secs(60 * 60);
 
 /// Unix seconds of Go's zero `time.Time` (year 1). Unset on the wire.
 const GO_ZERO_TIME_UNIX: i64 = -62_135_596_800;
@@ -64,6 +62,8 @@ const RPC_UNAUTHENTICATED: u64 = 16;
 pub struct TrustedSatellite {
     /// Satellite node id. Must equal the node id of [`Self::ca_der`].
     pub id: NodeId,
+    /// `host:port` dialed for settlement. Empty when this process does not settle.
+    pub address: String,
     /// Leaf certificate DER passed to `verify_order_limit`.
     pub leaf_der: Vec<u8>,
     /// CA certificate DER.
@@ -81,14 +81,20 @@ pub enum BuildError {
     Satellite(String),
 }
 
+struct KnownSatellite {
+    leaf: Vec<u8>,
+    address: String,
+}
+
 /// TLS piecestore server bound to one identity and one bucket.
 pub struct Node {
     identity: Identity,
     store: Store,
-    /// Satellite id to the leaf that verifies order limits.
-    satellites: HashMap<NodeId, Vec<u8>>,
-    /// Replay window. In memory until orders are persisted.
+    /// Satellite id to the leaf that verifies order limits, and its dial address.
+    satellites: HashMap<NodeId, KnownSatellite>,
+    /// Replay window for this process. Settlement orders are in `pieces.db`.
     serials: Mutex<HashMap<(NodeId, Vec<u8>), SystemTime>>,
+    orders: Orders,
     acceptor: tokio_rustls::TlsAcceptor,
 }
 
@@ -103,13 +109,20 @@ impl Node {
         let mut satellites = HashMap::with_capacity(trusted.len());
         for satellite in trusted {
             let leaf = verified_leaf(&satellite)?;
-            satellites.insert(satellite.id, leaf);
+            satellites.insert(
+                satellite.id,
+                KnownSatellite {
+                    leaf,
+                    address: satellite.address,
+                },
+            );
         }
         Ok(Self {
             identity,
             store,
             satellites,
             serials: Mutex::new(HashMap::new()),
+            orders: Orders::new(),
             acceptor: tokio_rustls::TlsAcceptor::from(Arc::new(config)),
         })
     }
@@ -201,6 +214,9 @@ impl Node {
         let mut staging: Option<(Upload, String)> = None;
         let mut staged: i64 = 0;
         let mut authorized: i64 = 0;
+        // Dropped on every return, including a failed upload, so the hour is
+        // not stuck open and the largest order is still recorded.
+        let mut tracked = None;
 
         loop {
             let Some(bytes) = out.recv().await? else {
@@ -220,6 +236,7 @@ impl Node {
                 // the field at the protobuf zero (SHA-256) even for BLAKE3.
                 hasher = algo.hasher();
                 self.check_limit(&next, true)?;
+                tracked = Some(self.track_order(&next)?);
                 limit = Some(next);
             } else if limit.is_none() {
                 return Err(Fail::proto(
@@ -235,6 +252,9 @@ impl Node {
             };
             if let Some(order) = req.order.as_ref() {
                 authorized = check_order(limit_ref, order, authorized)?;
+                if let Some(tracked) = tracked.as_mut() {
+                    tracked.note(order);
+                }
             }
             if let Some(chunk) = req.chunk.as_ref() {
                 let next_len = check_chunk(staged, limit_ref.limit, authorized, chunk)?;
@@ -373,6 +393,7 @@ impl Node {
         let mut chunk = None;
         let mut authorized: i64 = 0;
         let mut advisory: i32 = 0;
+        let mut tracked = None;
         loop {
             let Some(bytes) = out.recv().await? else {
                 return Err(Fail::proto(
@@ -390,6 +411,7 @@ impl Node {
                     return Err(Fail::proto(RPC_INVALID_ARGUMENT, "duplicate order limit"));
                 }
                 self.check_limit(&next, false)?;
+                tracked = Some(self.track_order(&next)?);
                 limit = Some(next);
             }
             if let Some(order) = req.order {
@@ -397,6 +419,9 @@ impl Node {
                     return Err(Fail::proto(RPC_INVALID_ARGUMENT, "order before limit"));
                 };
                 authorized = check_order(limit_ref, &order, authorized)?;
+                if let Some(tracked) = tracked.as_mut() {
+                    tracked.note(&order);
+                }
             }
             if let Some(next) = req.chunk {
                 chunk = Some(next);
@@ -499,6 +524,9 @@ impl Node {
                     .map_err(|err| Fail::proto(RPC_INVALID_ARGUMENT, err.to_string()))?;
                 if let Some(order) = req.order {
                     authorized = check_order(&limit, &order, authorized)?;
+                    if let Some(tracked) = tracked.as_mut() {
+                        tracked.note(&order);
+                    }
                 }
                 continue;
             }
@@ -727,16 +755,16 @@ impl Node {
             return Err(Fail::proto(RPC_INVALID_ARGUMENT, "missing serial number"));
         }
         let satellite_id = parse_node_id(&limit.satellite_id)?;
-        let Some(leaf) = self.satellites.get(&satellite_id) else {
+        let Some(known) = self.satellites.get(&satellite_id) else {
             return Err(Fail::proto(RPC_PERMISSION_DENIED, "untrusted satellite"));
         };
-        if leaf.is_empty() {
+        if known.leaf.is_empty() {
             return Err(Fail::proto(
                 RPC_UNAUTHENTICATED,
                 "satellite certificate is not known",
             ));
         }
-        verify_order_limit(limit, leaf)
+        verify_order_limit(limit, &known.leaf)
             .map_err(|_| Fail::proto(RPC_UNAUTHENTICATED, "invalid order limit signature"))?;
         self.reserve_serial(
             satellite_id,
@@ -760,6 +788,37 @@ impl Node {
         }
         used.insert(key, deadline);
         Ok(())
+    }
+
+    fn track_order(&self, limit: &OrderLimit) -> Result<orders::OrderGuard, Fail> {
+        let satellite = parse_node_id(&limit.satellite_id)?;
+        let window = order_window(limit)?;
+        Ok(self
+            .orders
+            .begin(self.store.orders(), satellite, window, limit.clone()))
+    }
+
+    /// Settles closed order hours as of `now`. Tests pass a later clock so a
+    /// just-finished hour is closed without waiting.
+    pub(crate) async fn settle_orders(&self, now: SystemTime) {
+        let db = self.store.orders();
+        self.orders
+            .settle(
+                &self.identity,
+                &db,
+                |id| self.satellites.get(&id).map(|sat| sat.address.clone()),
+                now,
+            )
+            .await;
+    }
+
+    /// Once an hour, after a delay of up to 30 seconds, settle closed hours.
+    pub(crate) async fn serve_orders(self: Arc<Self>) {
+        loop {
+            tokio::time::sleep(orders::jitter(self.node_id())).await;
+            self.settle_orders(SystemTime::now()).await;
+            tokio::time::sleep(orders::SEND_INTERVAL).await;
+        }
     }
 }
 
@@ -1118,11 +1177,37 @@ fn creation_ok(ts: Option<&prost_types::Timestamp>, now: SystemTime) -> bool {
     let Some(created) = timestamp_to_system(ts) else {
         return false;
     };
-    let earliest = now.checked_sub(ORDER_LIMIT_GRACE).unwrap_or(UNIX_EPOCH);
-    let Some(latest) = now.checked_add(ORDER_LIMIT_GRACE) else {
+    let earliest = now
+        .checked_sub(orders::ORDER_LIMIT_GRACE)
+        .unwrap_or(UNIX_EPOCH);
+    let Some(latest) = now.checked_add(orders::ORDER_LIMIT_GRACE) else {
         return created >= earliest;
     };
     created >= earliest && created <= latest
+}
+
+/// UTC hour containing `OrderCreation`, as unix seconds.
+fn order_window(limit: &OrderLimit) -> Result<i64, Fail> {
+    let created = limit
+        .order_creation
+        .as_ref()
+        .and_then(timestamp_to_system)
+        .ok_or_else(|| {
+            Fail::proto(
+                RPC_INVALID_ARGUMENT,
+                "order creation is outside the one hour grace",
+            )
+        })?;
+    let secs = created
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| {
+            Fail::proto(
+                RPC_INVALID_ARGUMENT,
+                "order creation is outside the one hour grace",
+            )
+        })?
+        .as_secs();
+    i64::try_from(secs / 3600 * 3600).map_err(|_| Fail::proto(RPC_INTERNAL, "order window"))
 }
 
 fn serial_deadline(limit: &OrderLimit, now: SystemTime) -> SystemTime {
@@ -1142,8 +1227,8 @@ mod tests {
     use std::net::SocketAddr;
     use std::path::{Path, PathBuf};
     use std::process;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -1153,13 +1238,17 @@ mod tests {
     use s3s::service::S3ServiceBuilder;
     use s3s_fs::FileSystem;
     use s3store::{HashAlgorithm, PieceState, Store};
-    use storj_proto::orders::{Order, OrderLimit, PieceAction};
+    use storj_proto::orders::{
+        Order, OrderLimit, PieceAction, SettlementRequest, SettlementWithWindowResponse,
+    };
     use storj_proto::piecestore::{
         ExistsRequest, ExistsResponse, PieceDownloadRequest, PieceDownloadResponse,
         PieceUploadRequest, RetainRequest, RetainResponse, StorageMethod, piece_download_request,
+        piece_upload_request,
     };
     use storj_proto::rpc::{PIECESTORE_DOWNLOAD, PIECESTORE_UPLOAD};
-    use storj_rpc::{Conn, Identity, client_config, write_tls_mux_prefix};
+    use storj_rpc::frame::{Kind, Packet};
+    use storj_rpc::{Conn, Identity, client_config, server_config, write_tls_mux_prefix};
     use storj_uplink::{
         Client, PieceConfig, PieceHashAlgo, PiecePrivateKey, sign_order, sign_order_limit,
     };
@@ -1262,12 +1351,18 @@ mod tests {
 
     impl Harness {
         async fn start(satellites: &[Identity]) -> Self {
+            Self::start_with(satellites, &[]).await
+        }
+
+        async fn start_with(satellites: &[Identity], addresses: &[&str]) -> Self {
             let bucket = TestBucket::start().await;
             let identity = Identity::generate().expect("node identity");
             let trusted = satellites
                 .iter()
-                .map(|sat| TrustedSatellite {
+                .enumerate()
+                .map(|(index, sat)| TrustedSatellite {
                     id: sat.node_id(),
+                    address: addresses.get(index).copied().unwrap_or("").to_owned(),
                     leaf_der: sat.leaf_der().as_ref().to_vec(),
                     ca_der: sat.ca_der().as_ref().to_vec(),
                 })
@@ -1860,18 +1955,21 @@ mod tests {
         let other = Identity::generate().unwrap();
         let ok = TrustedSatellite {
             id: sat.node_id(),
+            address: String::new(),
             leaf_der: sat.leaf_der().as_ref().to_vec(),
             ca_der: sat.ca_der().as_ref().to_vec(),
         };
         assert_eq!(super::verified_leaf(&ok).unwrap(), sat.leaf_der().as_ref());
         let empty = TrustedSatellite {
             id: sat.node_id(),
+            address: String::new(),
             leaf_der: Vec::new(),
             ca_der: sat.ca_der().as_ref().to_vec(),
         };
         assert!(super::verified_leaf(&empty).is_err());
         let mismatch = TrustedSatellite {
             id: sat.node_id(),
+            address: String::new(),
             leaf_der: sat.leaf_der().as_ref().to_vec(),
             ca_der: other.ca_der().as_ref().to_vec(),
         };
@@ -1879,6 +1977,7 @@ mod tests {
         assert!(err.to_string().contains("does not hash"), "{err}");
         let ca_as_leaf = TrustedSatellite {
             id: sat.node_id(),
+            address: String::new(),
             leaf_der: sat.ca_der().as_ref().to_vec(),
             ca_der: sat.ca_der().as_ref().to_vec(),
         };
@@ -1886,6 +1985,7 @@ mod tests {
         assert!(err.to_string().contains("leaf is the CA"), "{err}");
         let unrelated = TrustedSatellite {
             id: sat.node_id(),
+            address: String::new(),
             leaf_der: other.leaf_der().as_ref().to_vec(),
             ca_der: sat.ca_der().as_ref().to_vec(),
         };
@@ -2252,5 +2352,379 @@ mod tests {
             }
         }
         (first.expect("a response"), got)
+    }
+
+    fn pin_creation(limit: &mut OrderLimit, satellite: &Identity, created: prost_types::Timestamp) {
+        limit.order_creation = Some(created);
+        sign_order_limit(limit, satellite).expect("sign limit");
+    }
+
+    async fn wait_in_flight(node: &Node) {
+        for _ in 0..100 {
+            if node.orders.in_flight() > 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("upload did not open an order window");
+    }
+
+    /// The order row is saved when the handler drops its guard, which can be
+    /// just after the client has already observed the response.
+    async fn wait_idle(node: &Node) {
+        for _ in 0..200 {
+            if node.orders.in_flight() == 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("order window stayed open");
+    }
+
+    /// `now` far enough past an order created during this test that its hour is closed.
+    fn closed_now() -> SystemTime {
+        SystemTime::now() + Duration::from_secs(2 * 60 * 60 + 2)
+    }
+
+    struct SettlementLog {
+        windows: Mutex<Vec<Vec<SettlementRequest>>>,
+    }
+
+    impl SettlementLog {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                windows: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn windows(&self) -> Vec<Vec<SettlementRequest>> {
+            self.windows.lock().expect("log").clone()
+        }
+    }
+
+    fn spawn_settlement_satellite(identity: Identity, log: Arc<SettlementLog>) -> SocketAddr {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind satellite");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let addr = listener.local_addr().expect("satellite addr");
+        let listener = TcpListener::from_std(listener).expect("tokio listener");
+        tokio::spawn(async move {
+            let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(
+                server_config(&identity).expect("satellite tls"),
+            ));
+            loop {
+                let Ok((sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let acceptor = acceptor.clone();
+                let log = Arc::clone(&log);
+                tokio::spawn(async move {
+                    if let Err(err) = serve_one_settlement(acceptor, sock, &log).await {
+                        eprintln!("test satellite: {err}");
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    async fn serve_one_settlement(
+        acceptor: tokio_rustls::TlsAcceptor,
+        mut sock: TcpStream,
+        log: &SettlementLog,
+    ) -> Result<(), String> {
+        let _ = sock.set_nodelay(true);
+        let mut prefix = [0u8; 8];
+        sock.read_exact(&mut prefix)
+            .await
+            .map_err(|err| err.to_string())?;
+        if prefix.as_slice() != storj_rpc::DRPC_TLS_MUX_PREFIX {
+            return Err("missing drpc prefix".into());
+        }
+        let tls = acceptor.accept(sock).await.map_err(|err| err.to_string())?;
+        let mut conn = Conn::new(tls);
+        let invoke = conn.read_packet().await.map_err(|err| err.to_string())?;
+        if invoke.kind != Kind::INVOKE {
+            return Err("expected invoke".into());
+        }
+        let path = String::from_utf8(invoke.data).unwrap_or_default();
+        if path != crate::orders::SETTLEMENT_WITH_WINDOW {
+            return Err(format!("unexpected rpc {path}"));
+        }
+        let mut got = Vec::new();
+        loop {
+            let pkt = conn.read_packet().await.map_err(|err| err.to_string())?;
+            if pkt.stream_id != invoke.stream_id {
+                continue;
+            }
+            match pkt.kind {
+                Kind::MESSAGE => {
+                    let req = SettlementRequest::decode(pkt.data.as_slice())
+                        .map_err(|err| err.to_string())?;
+                    got.push(req);
+                }
+                Kind::CLOSE_SEND | Kind::CLOSE => break,
+                Kind::ERROR => return Err("client error".into()),
+                _ => {}
+            }
+        }
+        log.windows.lock().expect("log").push(got);
+        let response = SettlementWithWindowResponse {
+            status: 0,
+            action_settled: std::collections::HashMap::new(),
+        };
+        conn.write_packet(&Packet {
+            stream_id: invoke.stream_id,
+            message_id: 1,
+            kind: Kind::MESSAGE,
+            control: false,
+            data: response.encode_to_vec(),
+        })
+        .await
+        .map_err(|err| err.to_string())?;
+        conn.write_packet(&Packet {
+            stream_id: invoke.stream_id,
+            message_id: 2,
+            kind: Kind::CLOSE,
+            control: false,
+            data: Vec::new(),
+        })
+        .await
+        .map_err(|err| err.to_string())?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn two_finished_orders_in_one_hour_are_settled_then_archived() {
+        let satellite = Identity::generate().unwrap();
+        let uplink = Identity::generate().unwrap();
+        let log = SettlementLog::new();
+        let sat_addr = spawn_settlement_satellite(satellite.clone(), Arc::clone(&log));
+        let harness = Harness::start_with(
+            std::slice::from_ref(&satellite),
+            &[&format!("127.0.0.1:{}", sat_addr.port())],
+        )
+        .await;
+        let created = proto_now();
+        let mut serials = Vec::new();
+        for (byte, body) in [(0x21u8, &b"one"[..]), (0x22, &b"two-two"[..])] {
+            let piece_key = PiecePrivateKey::generate();
+            let mut put = signed_limit(
+                &satellite,
+                &harness.identity,
+                &piece_key,
+                &[byte; 32],
+                PieceAction::Put,
+                body.len() as i64,
+            );
+            pin_creation(&mut put, &satellite, created);
+            serials.push((put.serial_number.clone(), body.len() as i64));
+            let mut client = harness
+                .client(&uplink, &satellite)
+                .await
+                .with_hash_algo(PieceHashAlgo::Sha256);
+            client.upload(&put, &piece_key, body).await.expect("upload");
+        }
+        wait_idle(&harness.node).await;
+
+        // The hour is still open: creation was moments ago.
+        harness.node.settle_orders(SystemTime::now()).await;
+        assert!(log.windows().is_empty(), "open hour must not be sent");
+
+        harness.node.settle_orders(closed_now()).await;
+        let windows = log.windows();
+        assert_eq!(windows.len(), 1, "one SettlementWithWindow call");
+        assert_eq!(windows[0].len(), 2);
+        let mut got: Vec<_> = windows[0]
+            .iter()
+            .map(|req| {
+                let order = req.order.as_ref().expect("order");
+                (order.serial_number.clone(), order.amount)
+            })
+            .collect();
+        got.sort();
+        let mut expect = serials.clone();
+        expect.sort();
+        assert_eq!(got, expect);
+
+        let sat = satellite.node_id().to_string();
+        let db = harness.node.store.orders();
+        for (serial, amount) in &serials {
+            let status = db.status(&sat, serial).unwrap().expect("row");
+            assert_eq!(status.status, Some(0));
+            assert_eq!(status.amount, *amount);
+        }
+
+        harness.node.settle_orders(closed_now()).await;
+        assert_eq!(log.windows().len(), 1, "accepted window is not sent again");
+    }
+
+    #[tokio::test]
+    async fn open_upload_blocks_settlement_of_that_hour() {
+        let satellite = Identity::generate().unwrap();
+        let uplink = Identity::generate().unwrap();
+        let log = SettlementLog::new();
+        let sat_addr = spawn_settlement_satellite(satellite.clone(), Arc::clone(&log));
+        let harness = Harness::start_with(
+            std::slice::from_ref(&satellite),
+            &[&format!("127.0.0.1:{}", sat_addr.port())],
+        )
+        .await;
+        let created = proto_now();
+        let piece_key = PiecePrivateKey::generate();
+        let mut put = signed_limit(
+            &satellite,
+            &harness.identity,
+            &piece_key,
+            &[0x31; 32],
+            PieceAction::Put,
+            4,
+        );
+        pin_creation(&mut put, &satellite, created);
+        let mut client = harness
+            .client(&uplink, &satellite)
+            .await
+            .with_hash_algo(PieceHashAlgo::Sha256);
+        client
+            .upload(&put, &piece_key, b"done")
+            .await
+            .expect("finished upload");
+        wait_idle(&harness.node).await;
+
+        let open_key = PiecePrivateKey::generate();
+        let mut open = signed_limit(
+            &satellite,
+            &harness.identity,
+            &open_key,
+            &[0x32; 32],
+            PieceAction::Put,
+            8,
+        );
+        pin_creation(&mut open, &satellite, created);
+        let mut conn = harness.conn(&uplink).await;
+        let mut stream = conn.open_stream(PIECESTORE_UPLOAD).await.expect("stream");
+        let request = PieceUploadRequest {
+            limit: Some(open.clone()),
+            hash_algorithm: PieceHashAlgo::Sha256.to_i32(),
+            order: Some(order_for(&open, &open_key, 4)),
+            chunk: Some(piece_upload_request::Chunk {
+                offset: 0,
+                data: b"abcd".to_vec(),
+            }),
+            done: None,
+        };
+        conn.send_msg(&mut stream, &request.encode_to_vec())
+            .await
+            .expect("partial upload");
+        wait_in_flight(&harness.node).await;
+
+        harness.node.settle_orders(closed_now()).await;
+        assert!(
+            log.windows().is_empty(),
+            "hour with an open upload is not sent"
+        );
+        let status = harness
+            .node
+            .store
+            .orders()
+            .status(&satellite.node_id().to_string(), &put.serial_number)
+            .unwrap()
+            .expect("finished order");
+        assert_eq!(status.status, None);
+        // `conn` and `stream` stay open through the assertion. Dropping them
+        // earlier would finish the upload and free the hour.
+    }
+
+    #[tokio::test]
+    async fn limit_older_than_one_hour_is_rejected_at_upload() {
+        let satellite = Identity::generate().unwrap();
+        let uplink = Identity::generate().unwrap();
+        let harness = Harness::start(std::slice::from_ref(&satellite)).await;
+        let piece_key = PiecePrivateKey::generate();
+        let mut put = signed_limit(
+            &satellite,
+            &harness.identity,
+            &piece_key,
+            &[0x41; 32],
+            PieceAction::Put,
+            4,
+        );
+        pin_creation(
+            &mut put,
+            &satellite,
+            proto_shift(Duration::from_secs(60 * 60 + 30), false),
+        );
+        let mut client = harness
+            .client(&uplink, &satellite)
+            .await
+            .with_hash_algo(PieceHashAlgo::Sha256);
+        let err = client
+            .upload(&put, &piece_key, b"late")
+            .await
+            .expect_err("stale limit");
+        assert!(
+            err.to_string().contains("one hour"),
+            "upload should reject the limit, got {err}"
+        );
+        assert!(
+            harness
+                .node
+                .store
+                .info(&satellite.node_id().to_string(), &encode_hex(&put.piece_id))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn dial_error_leaves_the_hour_unsent_and_untrusted_is_archived() {
+        let satellite = Identity::generate().unwrap();
+        let uplink = Identity::generate().unwrap();
+        let harness = Harness::start_with(std::slice::from_ref(&satellite), &["127.0.0.1:1"]).await;
+        let piece_key = PiecePrivateKey::generate();
+        let mut put = signed_limit(
+            &satellite,
+            &harness.identity,
+            &piece_key,
+            &[0x51; 32],
+            PieceAction::Put,
+            3,
+        );
+        pin_creation(&mut put, &satellite, proto_now());
+        let mut client = harness
+            .client(&uplink, &satellite)
+            .await
+            .with_hash_algo(PieceHashAlgo::Sha256);
+        client
+            .upload(&put, &piece_key, b"abc")
+            .await
+            .expect("upload");
+        wait_idle(&harness.node).await;
+
+        let stranger = Identity::generate().unwrap();
+        let stranger_id = stranger.node_id().to_string();
+        harness
+            .node
+            .store
+            .orders()
+            .save(&s3store::StoredOrder {
+                satellite: stranger_id.clone(),
+                serial: vec![9, 9, 9],
+                window_start: 1_700_000_000,
+                limit: b"limit".to_vec(),
+                order: b"order".to_vec(),
+                amount: 3,
+            })
+            .unwrap();
+
+        harness.node.settle_orders(closed_now()).await;
+        let db = harness.node.store.orders();
+        let sat = satellite.node_id().to_string();
+        let kept = db.status(&sat, &put.serial_number).unwrap().expect("row");
+        assert_eq!(kept.status, None, "dial failure must leave the hour unsent");
+        let archived = db
+            .status(&stranger_id, &[9, 9, 9])
+            .unwrap()
+            .expect("stranger");
+        assert_eq!(archived.status, Some(1));
     }
 }
