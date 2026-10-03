@@ -1759,11 +1759,22 @@ fn order_window(limit: &OrderLimit) -> Result<i64, Fail> {
     i64::try_from(secs / 3600 * 3600).map_err(|_| Fail::proto(RPC_INTERNAL, "order window"))
 }
 
+/// When the limit's serial can be forgotten: once [`creation_ok`] refuses
+/// the limit for its age, which is [`orders::ORDER_LIMIT_GRACE`] after
+/// `OrderCreation`.
+///
+/// `OrderExpiration` is a day out and would hold every serial that long. It
+/// can also already be in the past for a limit that is still accepted, and a
+/// serial dropped then could be replayed.
 fn serial_deadline(limit: &OrderLimit, now: SystemTime) -> SystemTime {
     limit
-        .order_expiration
+        .order_creation
         .as_ref()
         .and_then(timestamp_to_system)
+        .and_then(|created| created.checked_add(orders::ORDER_LIMIT_GRACE))
+        // `reserve` drops a serial at its deadline; the limit is still
+        // accepted at exactly that instant.
+        .and_then(|until| until.checked_add(Duration::from_secs(1)))
         .unwrap_or(now)
 }
 
@@ -1772,7 +1783,7 @@ mod tests {
     use super::{
         CONTACT_PING_NODE, GO_ZERO_TIME_UNIX, Node, PIECESTORE_EXISTS, PIECESTORE_RESTORE_TRASH,
         PIECESTORE_RETAIN, PIECESTORE_RETAIN_BIG, RETAIN_MAX_TIME_SKEW, Serials, TrustedSatellite,
-        creation_ok, encode_hex, expired, system_to_timestamp,
+        creation_ok, encode_hex, expired, serial_deadline, system_to_timestamp,
     };
     use std::future::Future;
     use std::net::SocketAddr;
@@ -2096,6 +2107,23 @@ mod tests {
         assert!(serials.reserve(sat, b"c", end + Duration::from_secs(1), end));
         assert_eq!(serials.used.len(), 1);
         assert_eq!(serials.by_deadline.len(), 1);
+    }
+
+    #[test]
+    fn serial_is_kept_for_as_long_as_its_limit_is_accepted() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let created = now - Duration::from_secs(10 * 60);
+        let limit = OrderLimit {
+            order_creation: Some(system_to_timestamp(created)),
+            // Already past, as it may be inside the expiration grace.
+            order_expiration: Some(system_to_timestamp(now - Duration::from_secs(60))),
+            ..OrderLimit::default()
+        };
+        let deadline = serial_deadline(&limit, now);
+        let last_accepted = created + crate::orders::ORDER_LIMIT_GRACE;
+        assert!(creation_ok(limit.order_creation.as_ref(), last_accepted));
+        assert!(deadline > last_accepted);
+        assert!(!creation_ok(limit.order_creation.as_ref(), deadline));
     }
 
     #[test]
