@@ -6,7 +6,7 @@ A Rust process stores piece bytes only in an S3 API (AWS S3 or Ceph RGW). Identi
 
 ## Where it lives
 
-This repo sits next to a `storj-uplink` checkout. Edition 2024, license `MIT OR Apache-2.0`, and DCO, same as `storj-uplink`. MSRV is 1.91.1.
+This repo sits next to an `uplink-rs` checkout. Edition 2024, license `MIT OR Apache-2.0`, and DCO, same as `uplink-rs`. MSRV is 1.91.1.
 
 ```
 storagenode-rs/
@@ -22,7 +22,7 @@ storagenode-rs/
 
 ## API
 
-Protocol types and crypto come from `/Volumes/SSD/repos/storj/storj-uplink`. Path-depend on that workspace. Do not copy the crates, and do not add this node to the public `storj` client (`Access`, `Project`).
+Protocol types and crypto come from `/Volumes/SSD/repos/storj/uplink-rs`. Path-depend on that workspace. Do not copy the crates, and do not add this node to the public `storj` client (`Access`, `Project`).
 
 The public `storj` crate does not export identity, frames, or order bytes. The server calls the crates that do:
 
@@ -84,7 +84,7 @@ Dispatch:
 
 Trusted satellites come from config (node URL list). Order limits signed by anyone else are rejected. `storj_rpc::known_ids` covers the well-known public satellites when the operator lists those hostnames.
 
-Check-in is how a satellite learns the node exists, so it is in this binary. `storj-uplink`'s vendored `node.proto` has no `CheckIn` RPC. Copy the `service Node` / `CheckIn` messages from `storj/common` at SHA `d38275a3768ba356144814f3ec5d62eeca670e49` (the pin in `storj-uplink/proto/README.md`) into this repo and generate prost here. Do not change the uplink pin. The loop dials each trusted satellite with `storj-rpc` and sends address, version, operator email and wallet, and capacity. No hashstore feature bits.
+Check-in is how a satellite learns the node exists, so it is in this binary. `uplink-rs`'s vendored `node.proto` has no `CheckIn` RPC. Copy the `service Node` / `CheckIn` messages from `storj/common` at SHA `d38275a3768ba356144814f3ec5d62eeca670e49` (the pin in `uplink-rs/proto/README.md`) into this repo and generate prost here. Do not change the uplink pin. The loop dials each trusted satellite with `storj-rpc` and sends address, version, operator email and wallet, and capacity. No hashstore feature bits.
 
 Identity: on first start, `Identity::generate()` and write the chain and key as PEM on the volume (`cert_chain` and `private_key` are already public). Difficulty defaults to 0. Public satellites reject a low-difficulty id; a private satellite does not. `STORJ_IDENTITY_DIFFICULTY` is left for later, not a grind inside the container start path.
 
@@ -97,7 +97,7 @@ What has to be true before any payment shows up:
 - The satellite accepts the node's identity and check-in. A difficulty-0 id is refused by the public satellites.
 - The node keeps serving `Download` (audits) and applying retain. A disqualified node is not paid.
 - Each upload and download saves the satellite-signed order limit and the final uplink-signed order (the one with the largest amount for that serial). Orders are grouped by satellite and by the hour of `OrderCreation`. A limit whose creation time is more than 1 hour from now is rejected, matching `OrderLimitGracePeriod`.
-- Once an hour, plus a random delay up to 30 seconds, the node dials `Orders.SettlementWithWindow` for each closed hour. That RPC is already in `storj-uplink`'s `orders.proto`. The stream is one `SettlementRequest` per order, then close. `ACCEPTED` and `REJECTED` are both archived. A dial or RPC error leaves the hour unsent and retries next time. An untrusted satellite is archived without sending. A window with an upload or download still open is not sent yet.
+- Once an hour, plus a random delay up to 30 seconds, the node dials `Orders.SettlementWithWindow` for each closed hour. That RPC is already in `uplink-rs`'s `orders.proto`. The stream is one `SettlementRequest` per order, then close. `ACCEPTED` and `REJECTED` are both archived. A dial or RPC error leaves the hour unsent and retries next time. An untrusted satellite is archived without sending. A window with an upload or download still open is not sent yet.
 - Sent orders stay in the archive for 7 days, then the row is deleted.
 
 The satellite turns accepted orders into a monthly paystub and pays the wallet on its own schedule. New nodes have part of the amount held. This binary cannot change that.
@@ -142,7 +142,7 @@ Disk numbers come from the S3 index. JSON `diskSpace.used` is live bytes plus tr
 
 ## Container
 
-`Dockerfile` in `storagenode-rs`. Build context is the parent directory so the image can see `storj-uplink` (path dependencies) and `storj/web/storagenode` (dashboard). Rust stage `rust:1.91.1-bookworm`. UI stage is the Node build already used by `storj/web/storagenode/Dockerfile`. Runtime is `debian:bookworm-slim` plus CA certificates. The image runs `storagenode`. One volume, mounted at `/var/lib/storj`, for the identity, `pieces.db`, and the bandwidth rollup. No piece disk.
+`Dockerfile` in `storagenode-rs`. Build context is the parent directory so the image can see `uplink-rs` (path dependencies) and `storj/web/storagenode` (dashboard). Rust stage `rust:1.91.1-bookworm`. UI stage is the Node build already used by `storj/web/storagenode/Dockerfile`. Runtime is `debian:bookworm-slim` plus CA certificates. The image runs `storagenode`. One volume, mounted at `/var/lib/storj`, for the identity, `pieces.db`, and the bandwidth rollup. No piece disk.
 
 Required environment: `STORJ_S3_ENDPOINT`, `STORJ_S3_BUCKET`, `STORJ_S3_ACCESS_KEY_ID`, `STORJ_S3_SECRET_ACCESS_KEY`, `STORJ_OPERATOR_EMAIL`, `STORJ_OPERATOR_WALLET`, `STORJ_CONTACT_EXTERNAL_ADDRESS`, `STORJ_SATELLITES` (comma-separated node URLs).
 
@@ -167,7 +167,7 @@ Publish 28967/tcp, 28967/udp, and 14002/tcp.
 - Copying pieces off an existing disk node.
 - The old piece-transfer graceful exit (`TransferPiece` / `DeletePiece`).
 - Running Ceph in compose.
-- Changes under `storj/`, `uplink/`, or `storj-uplink/`, other than path-depending on `storj-uplink`.
+- Changes under `storj/`, `uplink/`, or `uplink-rs/`, other than path-depending on `uplink-rs`.
 
 ## Risks
 

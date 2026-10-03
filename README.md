@@ -6,7 +6,7 @@ The node speaks the storagenode piecestore protocol over TLS, Noise, and QUIC. I
 
 [PLAN.md](PLAN.md) is what the node does. [BUILD.md](BUILD.md) is the proto pin, DRPC paths, and the traps in the protocol.
 
-Protocol types and crypto come from a sibling `storj-uplink` checkout (`storj-proto`, `storj-rpc`, `storj-uplink`). The Go node in `storj` is the behavior reference. Neither tree is modified.
+Protocol types and crypto come from a sibling `uplink-rs` checkout (`storj-proto`, `storj-rpc`, `storj-uplink`). The Go node in `storj` is the behavior reference. Neither tree is modified.
 
 License `MIT OR Apache-2.0`. Edition 2024. Rust 1.91.1.
 
@@ -19,7 +19,7 @@ proto/                contact, tags, graceful exit, held amount, node stats
 third_party/s3s/      s3s 0.12 with the crypto pins this MSRV can build
 ```
 
-`crates/storagenode` path-depends on `../../../storj-uplink/crates/{storj-proto,storj-rpc,storj-uplink}`. Clone `storj-uplink` as a sibling of this repo before `cargo build`. `crates/s3store` does not.
+`crates/storagenode` path-depends on `../../../uplink-rs/crates/{storj-proto,storj-rpc,storj-uplink}`. Clone `uplink-rs` as a sibling of this repo before `cargo build`. `crates/s3store` does not.
 
 ## Build and test
 
@@ -80,7 +80,7 @@ Optional:
 
 ## Image
 
-The build context is the parent of this repo, so the image can see `storj-uplink` and `storj/web/storagenode`.
+The build context is the parent of this repo, so the image can see `uplink-rs` and `storj/web/storagenode`.
 
 ```sh
 docker build -f storagenode-rs/Dockerfile .
