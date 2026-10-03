@@ -358,10 +358,16 @@ impl Node {
         T: AsyncRead + AsyncWrite + Unpin,
     {
         let mut conn = Conn::new(io);
-        let invoke = before(deadline, async { conn.read_packet().await.map_err(io_err) }).await?;
-        if invoke.kind != Kind::INVOKE {
-            return Ok(conn.into_inner());
-        }
+        // A Go client whose context carries metadata (a sampled trace) writes
+        // INVOKE_METADATA on the stream before INVOKE. Nothing here reads it.
+        let invoke = loop {
+            let pkt = before(deadline, async { conn.read_packet().await.map_err(io_err) }).await?;
+            match pkt.kind {
+                Kind::INVOKE => break pkt,
+                Kind::INVOKE_METADATA => {}
+                _ => return Ok(conn.into_inner()),
+            }
+        };
         let path = String::from_utf8(invoke.data).unwrap_or_default();
         let mut out = Out {
             conn,
@@ -2460,6 +2466,39 @@ mod tests {
             .expect("connection should close")
             .unwrap();
         assert_eq!(n, 0);
+    }
+
+    #[tokio::test]
+    async fn invoke_metadata_before_the_invoke_is_skipped() {
+        let satellite = Identity::generate().unwrap();
+        let harness = Harness::start(std::slice::from_ref(&satellite)).await;
+        let mut conn = harness.conn(&satellite).await;
+        let request = ExistsRequest {
+            piece_ids: vec![vec![0x11; 32]],
+        }
+        .encode_to_vec();
+        // The Go client's order: metadata, invoke, message, on one stream.
+        let packets = [
+            (Kind::INVOKE_METADATA, b"trace".to_vec()),
+            (Kind::INVOKE, PIECESTORE_EXISTS.as_bytes().to_vec()),
+            (Kind::MESSAGE, request),
+            (Kind::CLOSE_SEND, Vec::new()),
+        ];
+        for (message_id, (kind, data)) in (1u64..).zip(packets) {
+            conn.write_packet(&Packet {
+                stream_id: 1,
+                message_id,
+                kind,
+                control: false,
+                data,
+            })
+            .await
+            .unwrap();
+        }
+        let reply = conn.read_packet().await.unwrap();
+        assert!(reply.kind == Kind::MESSAGE, "got {}", reply.kind);
+        let response = ExistsResponse::decode(reply.data.as_slice()).unwrap();
+        assert_eq!(response.missing, vec![0]);
     }
 
     #[tokio::test]
