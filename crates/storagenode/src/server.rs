@@ -87,7 +87,8 @@ const SPACE_REFRESH: Duration = Duration::from_secs(60);
 /// Pause after a failed `accept`, so a full descriptor table is not a busy loop.
 const ACCEPT_RETRY: Duration = Duration::from_millis(250);
 
-const RPC_CANCELED: u64 = 1;
+// 1 is OK in `rpcstatus`. Canceled is 2.
+const RPC_CANCELED: u64 = 2;
 const RPC_INVALID_ARGUMENT: u64 = 3;
 const RPC_NOT_FOUND: u64 = 5;
 const RPC_PERMISSION_DENIED: u64 = 7;
