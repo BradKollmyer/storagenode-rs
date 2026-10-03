@@ -24,8 +24,8 @@
 mod index;
 
 pub use index::{
-    BandwidthDay, BandwidthKind, CheckInRow, ExitRow, ExitStatus, HashAlgorithm, OrderRows,
-    PIECES_DB, PayStubRow, PaymentRow, PieceInfo, PieceMeta, PieceState, PricingRow,
+    BandwidthDay, BandwidthKind, CheckInRow, EXPIRED_KEEP, ExitRow, ExitStatus, HashAlgorithm,
+    OrderRows, PIECES_DB, PayStubRow, PaymentRow, PieceInfo, PieceMeta, PieceState, PricingRow,
     SatelliteStats, Space, StoredOrder, StoredOrderStatus, TRASH_KEEP,
 };
 
@@ -927,17 +927,22 @@ impl Store {
         self.index.satellite_stats()
     }
 
-    /// Deletes expired pieces, then trash whose `trashed_at` is at least
-    /// [`TRASH_KEEP`] before `now`. Each delete removes the object and the row.
+    /// Deletes pieces that expired at least [`EXPIRED_KEEP`] before `now`,
+    /// then trash whose `trashed_at` is at least [`TRASH_KEEP`] before `now`.
+    /// Each delete removes the object and the row.
     ///
     /// One failed delete does not stop the rest. The first error is returned
     /// after every due piece has been tried, and that piece is due again on
     /// the next run.
     pub async fn run_chore(&self, now: SystemTime) -> Result<()> {
         let mut failed: Option<Error> = None;
-        for (satellite_id, piece_id) in self.index.expired(now)? {
+        let expired_before = now.checked_sub(EXPIRED_KEEP).unwrap_or(UNIX_EPOCH);
+        for (satellite_id, piece_id) in self.index.expired(expired_before)? {
             let _guard = self.lock_piece(&satellite_id, &piece_id).await?;
-            let deleted = match self.index.is_expired(&satellite_id, &piece_id, now) {
+            let deleted = match self
+                .index
+                .is_expired(&satellite_id, &piece_id, expired_before)
+            {
                 Ok(true) => self.delete_stored(&satellite_id, &piece_id).await,
                 Ok(false) => Ok(()),
                 Err(err) => Err(err),
