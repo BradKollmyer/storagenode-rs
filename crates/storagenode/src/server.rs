@@ -1896,11 +1896,19 @@ mod tests {
             .expect("node");
             let node = Arc::new(node);
             node.startup().await.expect("startup");
-            let listener = Node::listen("127.0.0.1:0".parse().unwrap())
-                .await
-                .expect("listen");
-            let addr = listener.local_addr().expect("addr");
-            let quic = node.quic_endpoint(addr).expect("quic");
+            // QUIC takes the UDP port with the TCP port's number. Another
+            // test's QUIC client may hold it; pick a new TCP port then.
+            let (listener, addr, quic) = loop {
+                let listener = Node::listen("127.0.0.1:0".parse().unwrap())
+                    .await
+                    .expect("listen");
+                let addr = listener.local_addr().expect("addr");
+                match node.quic_endpoint(addr) {
+                    Ok(quic) => break (listener, addr, quic),
+                    Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {}
+                    Err(err) => panic!("quic: {err}"),
+                }
+            };
             let serving = Arc::clone(&node);
             tokio::spawn(async move {
                 let _ = serving.serve(listener).await;
