@@ -4,8 +4,9 @@
 //! Trash lives only here. A missing or unfinished database is rebuilt from
 //! object metadata; every rebuilt row is live. `user_version` stays 0 until
 //! that listing finishes, so a restart does not treat a partial file as done.
-//! Bandwidth orders live in the same file. A second database would not
-//! survive the volume the pieces already use.
+//! Bandwidth orders, the daily transfer counter, and the last check-in
+//! summary live in the same file. A second database would not survive the
+//! volume the pieces already use.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -61,6 +62,26 @@ CREATE TABLE IF NOT EXISTS graceful_exits (
     reason TEXT,
     message BLOB,
     pieces_deleted INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS bandwidth_daily (
+    satellite TEXT NOT NULL,
+    day INTEGER NOT NULL,
+    put INTEGER NOT NULL DEFAULT 0,
+    get INTEGER NOT NULL DEFAULT 0,
+    get_audit INTEGER NOT NULL DEFAULT 0,
+    get_repair INTEGER NOT NULL DEFAULT 0,
+    put_repair INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (satellite, day)
+);
+
+CREATE TABLE IF NOT EXISTS checkins (
+    satellite TEXT PRIMARY KEY,
+    checked_in_at INTEGER NOT NULL,
+    quic_ok INTEGER NOT NULL,
+    disqualified_at INTEGER,
+    suspended_at INTEGER,
+    vetted_at INTEGER
 );
 ";
 
@@ -263,6 +284,81 @@ pub struct Space {
     pub trash: u64,
     /// `allocated - used`, or 0 when used is larger.
     pub free: u64,
+}
+
+/// One finished transfer, split the way the dashboard rollup is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BandwidthKind {
+    /// Uplink upload.
+    Put,
+    /// Uplink download.
+    Get,
+    /// Audit download.
+    GetAudit,
+    /// Repair download.
+    GetRepair,
+    /// Repair upload.
+    PutRepair,
+}
+
+/// Bandwidth for one satellite on one UTC day.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BandwidthDay {
+    /// UTC midnight, unix milliseconds.
+    pub day_millis: i64,
+    /// PUT bytes.
+    pub put: u64,
+    /// GET bytes.
+    pub get: u64,
+    /// GET_AUDIT bytes.
+    pub get_audit: u64,
+    /// GET_REPAIR bytes.
+    pub get_repair: u64,
+    /// PUT_REPAIR bytes.
+    pub put_repair: u64,
+}
+
+impl BandwidthDay {
+    /// Every action, including audit and repair.
+    pub fn total(self) -> u64 {
+        self.put
+            .saturating_add(self.get)
+            .saturating_add(self.get_audit)
+            .saturating_add(self.get_repair)
+            .saturating_add(self.put_repair)
+    }
+
+    /// GET, GET_AUDIT, and GET_REPAIR.
+    pub fn egress(self) -> u64 {
+        self.get
+            .saturating_add(self.get_audit)
+            .saturating_add(self.get_repair)
+    }
+
+    /// PUT and PUT_REPAIR.
+    pub fn ingress(self) -> u64 {
+        self.put.saturating_add(self.put_repair)
+    }
+}
+
+/// Last successful check-in for one satellite.
+///
+/// `disqualified_at`, `suspended_at`, and `vetted_at` stay unset when that
+/// response did not carry them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckInRow {
+    /// Satellite id, the same string as `pieces.satellite`.
+    pub satellite_id: String,
+    /// When the check-in was accepted.
+    pub checked_in_at: SystemTime,
+    /// `CheckInResponse.ping_node_success_quic`.
+    pub quic_ok: bool,
+    /// Set only when the response carried a disqualification time.
+    pub disqualified_at: Option<SystemTime>,
+    /// Set only when the response carried a suspension time.
+    pub suspended_at: Option<SystemTime>,
+    /// Set only when the response carried a vetted time.
+    pub vetted_at: Option<SystemTime>,
 }
 
 #[derive(Clone)]
@@ -746,6 +842,174 @@ impl Index {
             Ok(out)
         })
     }
+
+    /// Adds `bytes` to the UTC day of `at`. Zero bytes are not stored.
+    pub(crate) fn add_bandwidth(
+        &self,
+        satellite_id: &str,
+        kind: BandwidthKind,
+        bytes: u64,
+        at: SystemTime,
+    ) -> Result<()> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        let bytes = i64::try_from(bytes)
+            .map_err(|_| Error::Index("bandwidth byte count overflows".into()))?;
+        let day = day_millis(at)?;
+        let (put, get, get_audit, get_repair, put_repair) = match kind {
+            BandwidthKind::Put => (bytes, 0, 0, 0, 0),
+            BandwidthKind::Get => (0, bytes, 0, 0, 0),
+            BandwidthKind::GetAudit => (0, 0, bytes, 0, 0),
+            BandwidthKind::GetRepair => (0, 0, 0, bytes, 0),
+            BandwidthKind::PutRepair => (0, 0, 0, 0, bytes),
+        };
+        self.with(|conn| {
+            conn.execute(
+                "INSERT INTO bandwidth_daily (
+                    satellite, day, put, get, get_audit, get_repair, put_repair
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(satellite, day) DO UPDATE SET
+                    put = put + excluded.put,
+                    get = get + excluded.get,
+                    get_audit = get_audit + excluded.get_audit,
+                    get_repair = get_repair + excluded.get_repair,
+                    put_repair = put_repair + excluded.put_repair",
+                params![
+                    satellite_id,
+                    day,
+                    put,
+                    get,
+                    get_audit,
+                    get_repair,
+                    put_repair
+                ],
+            )
+        })?;
+        Ok(())
+    }
+
+    /// Rows for the UTC month containing `now`, oldest day first.
+    ///
+    /// `satellite_id` `None` sums every satellite into one row per day.
+    pub(crate) fn bandwidth_days(
+        &self,
+        satellite_id: Option<&str>,
+        now: SystemTime,
+    ) -> Result<Vec<BandwidthDay>> {
+        let (start, end) = month_window(now)?;
+        self.with(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT day,
+                        COALESCE(SUM(put), 0),
+                        COALESCE(SUM(get), 0),
+                        COALESCE(SUM(get_audit), 0),
+                        COALESCE(SUM(get_repair), 0),
+                        COALESCE(SUM(put_repair), 0)
+                 FROM bandwidth_daily
+                 WHERE day >= ?1 AND day < ?2 AND (?3 IS NULL OR satellite = ?3)
+                 GROUP BY day
+                 ORDER BY day",
+            )?;
+            let rows = stmt.query_map(params![start, end, satellite_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })?
+        .into_iter()
+        .map(|(day, put, get, audit, repair, put_repair)| {
+            Ok(BandwidthDay {
+                day_millis: day,
+                put: nonneg(put, "put bandwidth")?,
+                get: nonneg(get, "get bandwidth")?,
+                get_audit: nonneg(audit, "audit bandwidth")?,
+                get_repair: nonneg(repair, "repair get bandwidth")?,
+                put_repair: nonneg(put_repair, "repair put bandwidth")?,
+            })
+        })
+        .collect()
+    }
+
+    /// Live piece bytes. `None` is every satellite. `writing` and trash are omitted.
+    pub(crate) fn live_bytes(&self, satellite_id: Option<&str>) -> Result<u64> {
+        let total = self.with(|conn| {
+            conn.query_row(
+                "SELECT COALESCE(SUM(size), 0) FROM pieces
+                 WHERE state = 'live' AND (?1 IS NULL OR satellite = ?1)",
+                params![satellite_id],
+                |row| row.get::<_, i64>(0),
+            )
+        })?;
+        nonneg(total, "live size sum")
+    }
+
+    /// Replaces the stored summary for `row.satellite_id`.
+    pub(crate) fn record_check_in(&self, row: &CheckInRow) -> Result<()> {
+        let at = system_to_millis(row.checked_in_at)?;
+        let disqualified = option_millis(row.disqualified_at)?;
+        let suspended = option_millis(row.suspended_at)?;
+        let vetted = option_millis(row.vetted_at)?;
+        self.with(|conn| {
+            conn.execute(
+                "INSERT INTO checkins (
+                    satellite, checked_in_at, quic_ok, disqualified_at, suspended_at, vetted_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(satellite) DO UPDATE SET
+                    checked_in_at = excluded.checked_in_at,
+                    quic_ok = excluded.quic_ok,
+                    disqualified_at = excluded.disqualified_at,
+                    suspended_at = excluded.suspended_at,
+                    vetted_at = excluded.vetted_at",
+                params![
+                    row.satellite_id,
+                    at,
+                    i64::from(row.quic_ok),
+                    disqualified,
+                    suspended,
+                    vetted,
+                ],
+            )
+        })?;
+        Ok(())
+    }
+
+    /// Every stored check-in, ordered by satellite id.
+    pub(crate) fn check_ins(&self) -> Result<Vec<CheckInRow>> {
+        let rows = self.with(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT satellite, checked_in_at, quic_ok, disqualified_at, suspended_at, vetted_at
+                 FROM checkins
+                 ORDER BY satellite",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok(CheckInStored {
+                    satellite_id: row.get(0)?,
+                    checked_in_at: row.get(1)?,
+                    quic_ok: row.get(2)?,
+                    disqualified_at: row.get(3)?,
+                    suspended_at: row.get(4)?,
+                    vetted_at: row.get(5)?,
+                })
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })?;
+        rows.into_iter().map(CheckInStored::into_row).collect()
+    }
 }
 
 fn with_conn<T>(
@@ -1003,6 +1267,68 @@ fn db_err(err: rusqlite::Error) -> Error {
     Error::Index(err.to_string())
 }
 
+fn nonneg(value: i64, what: &str) -> Result<u64> {
+    u64::try_from(value).map_err(|_| Error::Index(format!("negative {what}")))
+}
+
+struct CheckInStored {
+    satellite_id: String,
+    checked_in_at: i64,
+    quic_ok: i64,
+    disqualified_at: Option<i64>,
+    suspended_at: Option<i64>,
+    vetted_at: Option<i64>,
+}
+
+impl CheckInStored {
+    fn into_row(self) -> Result<CheckInRow> {
+        Ok(CheckInRow {
+            satellite_id: self.satellite_id,
+            checked_in_at: millis_to_system(self.checked_in_at)?,
+            quic_ok: self.quic_ok != 0,
+            disqualified_at: self.disqualified_at.map(millis_to_system).transpose()?,
+            suspended_at: self.suspended_at.map(millis_to_system).transpose()?,
+            vetted_at: self.vetted_at.map(millis_to_system).transpose()?,
+        })
+    }
+}
+
+/// UTC midnight of `at`, as unix milliseconds.
+fn day_millis(at: SystemTime) -> Result<i64> {
+    let millis = system_to_millis(at)?;
+    Ok(millis.div_euclid(86_400_000) * 86_400_000)
+}
+
+/// `[start, end)` unix milliseconds of the UTC month that contains `now`.
+fn month_window(now: SystemTime) -> Result<(i64, i64)> {
+    let millis = system_to_millis(now)?;
+    let secs = millis.div_euclid(1_000);
+    let dt = time::OffsetDateTime::from_unix_timestamp(secs)
+        .map_err(|err| Error::Index(err.to_string()))?;
+    let start_date = dt
+        .date()
+        .replace_day(1)
+        .map_err(|err| Error::Index(err.to_string()))?;
+    let next = start_date
+        .checked_add(time::Duration::days(31))
+        .ok_or_else(|| Error::Index("month overflow".into()))?
+        .replace_day(1)
+        .map_err(|err| Error::Index(err.to_string()))?;
+    let start = start_date
+        .midnight()
+        .assume_utc()
+        .unix_timestamp()
+        .checked_mul(1_000)
+        .ok_or_else(|| Error::Index("month overflow".into()))?;
+    let end = next
+        .midnight()
+        .assume_utc()
+        .unix_timestamp()
+        .checked_mul(1_000)
+        .ok_or_else(|| Error::Index("month overflow".into()))?;
+    Ok((start, end))
+}
+
 /// Adds the uplink-hash columns when `pieces.db` predates them.
 fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     let mut stmt = conn.prepare("PRAGMA table_info(pieces)")?;
@@ -1206,6 +1532,95 @@ mod tests {
         let cutoff = later.checked_sub(week).expect("cutoff");
         assert_eq!(orders.delete_archived_before(cutoff).unwrap(), 1);
         assert!(orders.status("sat", &[1, 2, 3]).unwrap().is_none());
+    }
+
+    #[test]
+    fn bandwidth_counter_survives_reopen_and_ignores_zero() {
+        let (_dir, path) = temp_db();
+        let at = UNIX_EPOCH + Duration::from_secs(1_791_039_845);
+        let index = Index::open(&path).unwrap();
+        index
+            .add_bandwidth("sat", BandwidthKind::Put, 0, at)
+            .unwrap();
+        assert!(index.bandwidth_days(None, at).unwrap().is_empty());
+        index
+            .add_bandwidth("sat", BandwidthKind::Put, 10, at)
+            .unwrap();
+        index
+            .add_bandwidth("sat", BandwidthKind::Get, 4, at)
+            .unwrap();
+        index
+            .add_bandwidth("other", BandwidthKind::GetAudit, 1, at)
+            .unwrap();
+        drop(index);
+
+        let index = Index::open(&path).unwrap();
+        let all = index.bandwidth_days(None, at).unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].day_millis, 1_790_985_600_000);
+        assert_eq!(all[0].put, 10);
+        assert_eq!(all[0].get, 4);
+        assert_eq!(all[0].get_audit, 1);
+        assert_eq!(all[0].total(), 15);
+        let one = index.bandwidth_days(Some("sat"), at).unwrap();
+        assert_eq!(one[0].total(), 14);
+        assert_eq!(one[0].egress(), 4);
+        assert_eq!(one[0].ingress(), 10);
+        let (start, end) = month_window(at).unwrap();
+        assert_eq!(start, 1_790_812_800_000);
+        assert_eq!(end, 1_793_491_200_000);
+        assert!(
+            index
+                .bandwidth_days(Some("missing"), at)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn check_in_summary_keeps_null_reputation_times() {
+        let (_dir, path) = temp_db();
+        let index = Index::open(&path).unwrap();
+        let at = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        index
+            .record_check_in(&CheckInRow {
+                satellite_id: "sat".into(),
+                checked_in_at: at,
+                quic_ok: false,
+                disqualified_at: None,
+                suspended_at: None,
+                vetted_at: None,
+            })
+            .unwrap();
+        let rows = index.check_ins().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].satellite_id, "sat");
+        assert_eq!(rows[0].checked_in_at, at);
+        assert!(!rows[0].quic_ok);
+        assert!(rows[0].disqualified_at.is_none());
+        assert!(rows[0].suspended_at.is_none());
+        assert!(rows[0].vetted_at.is_none());
+
+        let later = at + Duration::from_secs(5);
+        let vetted = at + Duration::from_secs(9);
+        index
+            .record_check_in(&CheckInRow {
+                satellite_id: "sat".into(),
+                checked_in_at: later,
+                quic_ok: true,
+                disqualified_at: None,
+                suspended_at: None,
+                vetted_at: Some(vetted),
+            })
+            .unwrap();
+        drop(index);
+        let index = Index::open(&path).unwrap();
+        let rows = index.check_ins().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].checked_in_at, later);
+        assert!(rows[0].quic_ok);
+        assert_eq!(rows[0].vetted_at, Some(vetted));
+        assert!(rows[0].disqualified_at.is_none());
     }
 
     /// Tiny temp dir that deletes itself. Avoids a dev-dependency for one test.

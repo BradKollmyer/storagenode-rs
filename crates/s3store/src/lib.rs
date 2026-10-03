@@ -24,8 +24,8 @@
 mod index;
 
 pub use index::{
-    ExitRow, ExitStatus, HashAlgorithm, OrderRows, PIECES_DB, PieceInfo, PieceMeta, PieceState,
-    Space, StoredOrder, StoredOrderStatus, TRASH_KEEP,
+    BandwidthDay, BandwidthKind, CheckInRow, ExitRow, ExitStatus, HashAlgorithm, OrderRows,
+    PIECES_DB, PieceInfo, PieceMeta, PieceState, Space, StoredOrder, StoredOrderStatus, TRASH_KEEP,
 };
 
 use std::collections::HashMap;
@@ -586,6 +586,43 @@ impl Store {
             trash,
             free: self.allocated_bytes.saturating_sub(used),
         })
+    }
+
+    /// Adds `bytes` to the UTC daily counter. Zero does not write a row.
+    pub fn add_bandwidth(
+        &self,
+        satellite_id: &str,
+        kind: BandwidthKind,
+        bytes: u64,
+        at: SystemTime,
+    ) -> Result<()> {
+        self.index.add_bandwidth(satellite_id, kind, bytes, at)
+    }
+
+    /// Daily counters for the UTC month that contains `now`.
+    ///
+    /// `satellite_id` `None` sums every satellite. Days with no traffic are omitted.
+    pub fn bandwidth_days(
+        &self,
+        satellite_id: Option<&str>,
+        now: SystemTime,
+    ) -> Result<Vec<BandwidthDay>> {
+        self.index.bandwidth_days(satellite_id, now)
+    }
+
+    /// Live piece bytes. `None` is every satellite.
+    pub fn live_bytes(&self, satellite_id: Option<&str>) -> Result<u64> {
+        self.index.live_bytes(satellite_id)
+    }
+
+    /// Stores the latest check-in summary for one satellite.
+    pub fn record_check_in(&self, row: &CheckInRow) -> Result<()> {
+        self.index.record_check_in(row)
+    }
+
+    /// Stored check-in summaries, ordered by satellite id.
+    pub fn check_ins(&self) -> Result<Vec<CheckInRow>> {
+        self.index.check_ins()
     }
 
     /// Deletes expired pieces, then trash whose `trashed_at` is at least

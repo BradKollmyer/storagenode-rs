@@ -17,7 +17,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use prost::Message;
-use s3store::{HashAlgorithm, PieceBody, PieceMeta, PieceState, Store, Upload};
+use s3store::{BandwidthKind, HashAlgorithm, PieceBody, PieceMeta, PieceState, Store, Upload};
 use storj_proto::orders::{Order, OrderLimit, PieceAction, PieceHash};
 use storj_proto::piecestore::{
     ExistsRequest, ExistsResponse, PieceDownloadRequest, PieceDownloadResponse, PieceUploadRequest,
@@ -551,6 +551,9 @@ impl Node {
             node_certchain: out.node_certchain.clone(),
         };
         out.message(&response.encode_to_vec()).await?;
+        // Count before the next await. The uplink returns as soon as it
+        // reads this hash, and a counter error must not fail the commit.
+        self.note_bandwidth(&sat, limit.action, u64::try_from(piece_size).unwrap_or(0));
         out.close().await?;
         Ok(())
     }
@@ -727,6 +730,10 @@ impl Node {
             sent += n;
             file_off += n;
         }
+        // Same as upload: the counter is updated before the handler awaits
+        // again, so a finished download is visible as soon as the client
+        // observes the last chunk. Zero bytes and an earlier error skip this.
+        self.note_bandwidth(&sat, limit.action, sent);
         out.close().await?;
         Ok(())
     }
@@ -968,6 +975,23 @@ impl Node {
         Ok(())
     }
 
+    /// Records a finished transfer. Zero bytes are ignored. A sqlite error is
+    /// logged so the piece RPC still succeeds.
+    fn note_bandwidth(&self, satellite: &str, action: i32, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        let Some(kind) = bandwidth_kind(action) else {
+            return;
+        };
+        if let Err(err) = self
+            .store
+            .add_bandwidth(satellite, kind, bytes, SystemTime::now())
+        {
+            eprintln!("storagenode: bandwidth counter: {err}");
+        }
+    }
+
     fn track_order(&self, limit: &OrderLimit) -> Result<orders::OrderGuard, Fail> {
         let satellite = parse_node_id(&limit.satellite_id)?;
         let window = order_window(limit)?;
@@ -1168,6 +1192,17 @@ impl From<storj_rpc::Error> for Fail {
 fn next_stage_id() -> String {
     static NEXT: AtomicU64 = AtomicU64::new(1);
     format!("{:016x}", NEXT.fetch_add(1, Ordering::Relaxed))
+}
+
+fn bandwidth_kind(action: i32) -> Option<BandwidthKind> {
+    match PieceAction::try_from(action) {
+        Ok(PieceAction::Put) => Some(BandwidthKind::Put),
+        Ok(PieceAction::Get) => Some(BandwidthKind::Get),
+        Ok(PieceAction::GetAudit) => Some(BandwidthKind::GetAudit),
+        Ok(PieceAction::GetRepair) => Some(BandwidthKind::GetRepair),
+        Ok(PieceAction::PutRepair) => Some(BandwidthKind::PutRepair),
+        _ => None,
+    }
 }
 
 fn store_err(err: s3store::Error) -> Fail {
@@ -2443,6 +2478,7 @@ mod tests {
             contact_external_address: "127.0.0.1:28967".into(),
             satellites: Vec::new(),
             listen: "127.0.0.1:0".parse().unwrap(),
+            dashboard: "0.0.0.0:14002".parse().unwrap(),
         };
         match tokio::time::timeout(Duration::from_secs(20), crate::start(&config)).await {
             Ok(Err(err)) => assert!(matches!(err, crate::Error::Store(_)), "{err}"),
@@ -2505,6 +2541,7 @@ mod tests {
                 address: "127.0.0.1:7777".into(),
             }],
             listen: "127.0.0.1:0".parse().unwrap(),
+            dashboard: "0.0.0.0:14002".parse().unwrap(),
         }
     }
 
@@ -3345,5 +3382,336 @@ mod tests {
         );
         assert_eq!(db.status(&sat, &[7, 7]).unwrap().unwrap().status, Some(1));
         assert_eq!(db.status(&sat, &[8, 8]).unwrap().unwrap().status, Some(1));
+    }
+
+    fn bandwidth_used(node: &Node) -> u64 {
+        node.store
+            .bandwidth_days(None, SystemTime::now())
+            .expect("bandwidth")
+            .iter()
+            .map(|day| day.total())
+            .sum()
+    }
+
+    /// The counter is written after the success bytes, on the server task.
+    /// Another worker can return the client before that write runs.
+    async fn wait_bandwidth(node: &Node, want: u64) {
+        for _ in 0..100 {
+            if bandwidth_used(node) == want {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("bandwidth stayed at {}, want {want}", bandwidth_used(node));
+    }
+
+    #[tokio::test]
+    async fn dashboard_json_reports_disk_bandwidth_and_empty_pages() {
+        let satellite = Identity::generate().unwrap();
+        let uplink = Identity::generate().unwrap();
+        let address = "sat.example:7777";
+        let harness = Harness::start_with(std::slice::from_ref(&satellite), &[address]).await;
+        let ui = harness._root.path().join("no-ui");
+        let dash = crate::dashboard::Dashboard::for_test(Arc::clone(&harness.node), &ui);
+        let allocated = 1u64 << 40;
+
+        let (status, body) = dash.handle("GET", "/").await;
+        assert_eq!(status, 404);
+        let text = String::from_utf8(body).expect("utf8");
+        assert!(text.contains("not installed"), "{text}");
+        let (status, _) = dash.handle("GET", "/static/no-such").await;
+        assert_eq!(status, 404);
+
+        let (status, body) = dash.handle("GET", "/api/sno/").await;
+        assert_eq!(status, 200);
+        let page: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(page["nodeID"], harness.identity.node_id().to_string());
+        assert_eq!(page["wallet"], "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        assert_eq!(page["walletFeatures"][0], "zksync-era");
+        assert_eq!(page["diskSpace"]["used"], 0);
+        assert_eq!(page["diskSpace"]["trash"], 0);
+        assert_eq!(page["diskSpace"]["allocated"], allocated);
+        assert_eq!(page["bandwidth"]["used"], 0);
+        assert_eq!(page["quicStatus"], "");
+        assert_eq!(page["lastPinged"], "0001-01-01T00:00:00Z");
+        assert_eq!(page["lastQuicPingedAt"], "0001-01-01T00:00:00Z");
+        assert_eq!(page["configuredPort"], "28967");
+        assert_eq!(page["startedAt"], "2023-11-14T22:13:20Z");
+        assert_eq!(page["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(page["upToDate"], true);
+        assert!(page["satellites"][0]["disqualified"].is_null());
+        assert!(page["satellites"][0]["suspended"].is_null());
+        assert!(page["satellites"][0]["vettedAt"].is_null());
+        assert_eq!(page["satellites"][0]["url"], address);
+
+        let piece_key = PiecePrivateKey::generate();
+        let piece_a = vec![0x31; 32];
+        let piece_b = vec![0x32; 32];
+        let live = b"live-bytes";
+        let trashed = b"trash!!";
+        let sat = satellite.node_id().to_string();
+        for (piece, body) in [(&piece_a, live.as_slice()), (&piece_b, trashed.as_slice())] {
+            let put = signed_limit(
+                &satellite,
+                &harness.identity,
+                &piece_key,
+                piece,
+                PieceAction::Put,
+                body.len() as i64,
+            );
+            let mut client = harness
+                .client(&uplink, &satellite)
+                .await
+                .with_hash_algo(PieceHashAlgo::Sha256);
+            client.upload(&put, &piece_key, body).await.expect("upload");
+        }
+        wait_bandwidth(&harness.node, (live.len() + trashed.len()) as u64).await;
+        harness
+            .node
+            .store
+            .trash(&sat, &encode_hex(&piece_b), SystemTime::now())
+            .await
+            .expect("trash");
+
+        let get = signed_limit(
+            &satellite,
+            &harness.identity,
+            &piece_key,
+            &piece_a,
+            PieceAction::Get,
+            live.len() as i64,
+        );
+        let mut client = harness.client(&uplink, &satellite).await;
+        let got = client
+            .download(&get, &piece_key, 0, live.len() as i64)
+            .await
+            .expect("download");
+        assert_eq!(got, live);
+        let used_bandwidth = (live.len() + trashed.len() + live.len()) as u64;
+        wait_bandwidth(&harness.node, used_bandwidth).await;
+
+        let missing = signed_limit(
+            &satellite,
+            &harness.identity,
+            &piece_key,
+            &[0x33; 32],
+            PieceAction::Get,
+            4,
+        );
+        let mut client = harness.client(&uplink, &satellite).await;
+        let err = client
+            .download(&missing, &piece_key, 0, 4)
+            .await
+            .expect_err("missing piece");
+        assert!(err.to_string().contains("piece not found"), "{err}");
+        assert_eq!(bandwidth_used(&harness.node), used_bandwidth);
+
+        // Client::download returns locally when size is 0 and never dials.
+        let zero = signed_limit(
+            &satellite,
+            &harness.identity,
+            &piece_key,
+            &piece_a,
+            PieceAction::Get,
+            0,
+        );
+        let mut conn = harness.conn(&uplink).await;
+        let mut stream = conn.open_stream(PIECESTORE_DOWNLOAD).await.expect("stream");
+        let request = PieceDownloadRequest {
+            limit: Some(zero.clone()),
+            order: Some(order_for(&zero, &piece_key, 0)),
+            chunk: Some(piece_download_request::Chunk {
+                offset: 0,
+                chunk_size: 0,
+            }),
+            maximum_chunk_size: 0,
+        };
+        conn.send_msg(&mut stream, &request.encode_to_vec())
+            .await
+            .expect("zero-byte request");
+        let end = conn.recv_msg_opt(&stream).await.expect("zero-byte close");
+        assert!(end.is_none(), "zero-byte download closed with {end:?}");
+        assert_eq!(bandwidth_used(&harness.node), used_bandwidth);
+
+        let (status, body) = dash.handle("GET", "/api/sno").await;
+        assert_eq!(status, 200);
+        let page: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(page["diskSpace"]["used"], live.len() as u64);
+        assert_eq!(page["diskSpace"]["trash"], trashed.len() as u64);
+        assert_eq!(page["diskSpace"]["allocated"], allocated);
+        assert_eq!(
+            page["diskSpace"]["available"],
+            allocated - live.len() as u64
+        );
+        assert_eq!(page["diskSpace"]["overused"], 0);
+        assert_eq!(page["diskSpace"]["reclaimable"], 0);
+        assert_eq!(page["diskSpace"]["reserved"], 0);
+        assert_eq!(page["bandwidth"]["used"], used_bandwidth);
+        assert_eq!(page["bandwidth"]["available"], 0);
+        assert_eq!(page["satellites"][0]["id"], sat);
+
+        let (status, body) = dash.handle("GET", "/api/notifications/list").await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            body,
+            br#"{ "page": { "notifications": [], "pageCount": 0 }, "unreadCount": 0, "totalCount": 0 }"#
+        );
+        let (status, _) = dash.handle("POST", "/api/notifications/abc/read").await;
+        assert_eq!(status, 200);
+        let (status, _) = dash.handle("POST", "/api/notifications/readall").await;
+        assert_eq!(status, 200);
+
+        let (status, body) = dash.handle("GET", "/api/sno/estimated-payout").await;
+        assert_eq!(status, 200);
+        let payout: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        for month in ["currentMonth", "previousMonth"] {
+            for key in [
+                "egressBandwidth",
+                "egressBandwidthPayout",
+                "egressRepairAudit",
+                "egressRepairAuditPayout",
+                "diskSpace",
+                "diskSpacePayout",
+                "heldRate",
+                "payout",
+                "held",
+            ] {
+                assert_eq!(payout[month][key], 0, "{month}.{key}");
+            }
+        }
+        assert_eq!(payout["currentMonthExpectations"], 0);
+
+        let (status, body) = dash
+            .handle("GET", &format!("/api/sno/satellites/{sat}/pricing"))
+            .await;
+        assert_eq!(status, 200);
+        let pricing: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(pricing["satelliteID"], sat);
+        assert_eq!(pricing["egressBandwidth"], 0);
+        assert_eq!(pricing["repairBandwidth"], 0);
+        assert_eq!(pricing["auditBandwidth"], 0);
+        assert_eq!(pricing["diskSpace"], 0);
+
+        let (status, body) = dash.handle("GET", "/api/sno/satellites").await;
+        assert_eq!(status, 200);
+        let list: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(list["storageSummary"], live.len() as u64);
+        assert_eq!(list["bandwidthSummary"], used_bandwidth);
+        assert_eq!(list["egressSummary"], live.len() as u64);
+        assert_eq!(list["ingressSummary"], (live.len() + trashed.len()) as u64);
+        assert_eq!(list["earliestJoinedAt"], "0001-01-01T00:00:00Z");
+        assert!(list["audits"].is_array());
+        assert_eq!(list["audits"][0]["satelliteName"], address);
+        assert_eq!(list["audits"][0]["auditScore"], 0);
+        assert_eq!(list["audits"][0]["suspensionScore"], 0);
+        assert_eq!(list["audits"][0]["onlineScore"], 0);
+        assert_eq!(list["storageDaily"][0]["atRestTotal"], live.len() as u64);
+        assert_eq!(
+            list["bandwidthDaily"][0]["ingress"]["usage"],
+            (live.len() + trashed.len()) as u64
+        );
+        assert_eq!(
+            list["bandwidthDaily"][0]["egress"]["usage"],
+            live.len() as u64
+        );
+
+        let (status, body) = dash
+            .handle("GET", &format!("/api/sno/satellite/{sat}"))
+            .await;
+        assert_eq!(status, 200);
+        let one: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(one["id"], sat);
+        assert_eq!(one["nodeJoinedAt"], "0001-01-01T00:00:00Z");
+        assert!(one["audits"].is_object());
+        assert_eq!(one["audits"]["auditScore"], 0);
+        let (status, body) = dash.handle("GET", "/api/sno/satellite/unknown").await;
+        assert_eq!(status, 200);
+        let unknown: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(unknown["id"], "unknown");
+        assert_eq!(unknown["audits"]["satelliteName"], "");
+        assert_eq!(unknown["storageSummary"], 0);
+
+        for path in [
+            "/api/heldamount/paystubs/2026-10",
+            "/api/heldamount/paystubs/2026-01/2026-10",
+            "/api/heldamount/held-history",
+            "/api/heldamount/periods",
+            "/api/heldamount/payout-history/2026-10",
+        ] {
+            let (status, body) = dash.handle("GET", path).await;
+            assert_eq!(status, 200, "{path}");
+            assert_eq!(body, b"[]", "{path}");
+        }
+
+        std::fs::create_dir_all(ui.join("js")).expect("ui dir");
+        std::fs::write(ui.join("index.html"), b"<html>dash</html>").expect("index");
+        std::fs::write(ui.join("js/app.js"), b"console.log(1)").expect("js");
+        let (status, body) = dash.handle("GET", "/").await;
+        assert_eq!(status, 200);
+        assert_eq!(body, b"<html>dash</html>");
+        let (status, body) = dash.handle("GET", "/payout").await;
+        assert_eq!(status, 200);
+        assert_eq!(body, b"<html>dash</html>");
+        let (status, body) = dash.handle("GET", "/static/js/app.js").await;
+        assert_eq!(status, 200);
+        assert_eq!(body, b"console.log(1)");
+        let (status, _) = dash.handle("GET", "/static/../index.html").await;
+        assert_eq!(status, 404);
+        let (status, _) = dash.handle("GET", "/static/%2e%2e/index.html").await;
+        assert_eq!(status, 404);
+
+        harness
+            .node
+            .store
+            .record_check_in(&s3store::CheckInRow {
+                satellite_id: sat.clone(),
+                checked_in_at: SystemTime::now(),
+                quic_ok: false,
+                disqualified_at: None,
+                suspended_at: None,
+                vetted_at: None,
+            })
+            .expect("check-in");
+        let (status, body) = dash.handle("GET", "/api/sno/").await;
+        assert_eq!(status, 200);
+        let page: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(page["quicStatus"], "Misconfigured");
+        assert_ne!(page["lastPinged"], "0001-01-01T00:00:00Z");
+        assert!(page["satellites"][0]["disqualified"].is_null());
+        assert!(page["satellites"][0]["vettedAt"].is_null());
+
+        harness
+            .node
+            .store
+            .record_check_in(&s3store::CheckInRow {
+                satellite_id: sat,
+                checked_in_at: SystemTime::now(),
+                quic_ok: true,
+                disqualified_at: None,
+                suspended_at: None,
+                vetted_at: None,
+            })
+            .expect("check-in");
+        let (_, body) = dash.handle("GET", "/api/sno/").await;
+        let page: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(page["quicStatus"], "OK");
+        assert_ne!(page["lastQuicPingedAt"], "0001-01-01T00:00:00Z");
+
+        let reopened = Store::new(s3store::Config {
+            endpoint: "http://127.0.0.1:9".to_owned(),
+            bucket: BUCKET.to_owned(),
+            access_key_id: ACCESS_KEY.to_owned(),
+            secret_access_key: SECRET.to_owned(),
+            volume: harness._root.path().join("volume"),
+            ..s3store::Config::default()
+        })
+        .expect("reopen");
+        let total: u64 = reopened
+            .bandwidth_days(None, SystemTime::now())
+            .expect("days")
+            .iter()
+            .map(|day| day.total())
+            .sum();
+        assert_eq!(total, used_bandwidth);
     }
 }

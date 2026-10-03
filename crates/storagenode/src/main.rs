@@ -1,7 +1,8 @@
 //! `storagenode` binary. `HeadBucket` failure exits the process.
 //!
-//! `storagenode` serves. `storagenode exit-satellite <id>` records a pending
-//! exit. `storagenode exit-status` prints the stored rows.
+//! `storagenode` serves DRPC and the dashboard on `0.0.0.0:14002`.
+//! `storagenode exit-satellite <id>` records a pending exit.
+//! `storagenode exit-status` prints the stored rows.
 
 use std::process::ExitCode;
 

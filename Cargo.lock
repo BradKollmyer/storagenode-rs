@@ -3281,6 +3281,10 @@ name = "storagenode"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "bytes",
+ "http 1.5.0",
+ "http-body-util",
+ "hyper 1.11.1",
  "hyper-util",
  "prost",
  "prost-build",
@@ -3291,6 +3295,7 @@ dependencies = [
  "s3s",
  "s3s-fs",
  "s3store",
+ "serde_json",
  "snow",
  "storj-proto",
  "storj-rpc",

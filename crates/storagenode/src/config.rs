@@ -16,6 +16,9 @@ use storj_rpc::{NodeUrl, parse_node_url};
 /// TCP and UDP port for DRPC. UDP is QUIC.
 pub const LISTEN_PORT: u16 = 28967;
 
+/// HTTP port for the Vue dashboard. `0.0.0.0`, not the Go loopback default.
+pub const DASHBOARD_PORT: u16 = 14002;
+
 /// Settings the binary reads once at startup.
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -31,8 +34,10 @@ pub struct Config {
     pub contact_external_address: String,
     /// Trusted satellites from `STORJ_SATELLITES` (comma-separated node URLs).
     pub satellites: Vec<NodeUrl>,
-    /// DRPC listen address. Always `0.0.0.0:28967` from the environment.
+    /// DRPC listen address. Always `0.0.0.0:28967`.
     pub listen: SocketAddr,
+    /// Dashboard listen address. Always `0.0.0.0:14002`.
+    pub dashboard: SocketAddr,
 }
 
 /// Rejected environment.
@@ -124,6 +129,7 @@ impl Config {
             contact_external_address,
             satellites,
             listen: SocketAddr::from((Ipv4Addr::UNSPECIFIED, LISTEN_PORT)),
+            dashboard: SocketAddr::from((Ipv4Addr::UNSPECIFIED, DASHBOARD_PORT)),
         })
     }
 }
@@ -211,6 +217,8 @@ mod tests {
         assert_eq!(config.s3.path_style, Some(true));
         assert_eq!(config.s3.prefix, "custom");
         assert_eq!(config.listen.port(), LISTEN_PORT);
+        assert_eq!(config.dashboard.port(), DASHBOARD_PORT);
+        assert!(config.dashboard.ip().is_unspecified());
         assert_eq!(config.satellites.len(), 1);
         assert!(!config.satellites[0].id.is_zero());
         assert_eq!(

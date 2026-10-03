@@ -2,7 +2,8 @@
 //!
 //! This crate serves `Upload`, `Download`, `Exists`, `Retain`, and `RetainBig`
 //! over TLS, Noise, and QUIC, settles closed bandwidth-order hours, checks in
-//! with each trusted satellite, and dials graceful exit for a pending satellite.
+//! with each trusted satellite, dials graceful exit for a pending satellite,
+//! and serves the Vue dashboard JSON on `0.0.0.0:14002`.
 
 #![deny(clippy::undocumented_unsafe_blocks)]
 
@@ -22,6 +23,7 @@ mod gracefulexit {
 mod bloom;
 mod checkin;
 mod config;
+mod dashboard;
 mod exit;
 mod identity;
 mod noise_key;
@@ -166,10 +168,18 @@ fn load_satellites(volume: &Path, urls: &[NodeUrl]) -> Result<Vec<TrustedSatelli
 /// Starts the node and serves DRPC until the process is killed.
 pub async fn run(config: Config) -> Result<(), Error> {
     let node = start(&config).await?;
+    let dashboard = Arc::new(dashboard::Dashboard::new(Arc::clone(&node), &config));
+    let (dashboard_listener, dashboard_addr) = dashboard::listen().await?;
     let listener = Node::listen(config.listen).await?;
     let addr = listener.local_addr()?;
     let quic = node.quic_endpoint(addr)?;
     eprintln!("storagenode: node {} listening on {addr}", node.node_id());
+    eprintln!("storagenode: dashboard http://{dashboard_addr}");
+    tokio::spawn(async move {
+        if let Err(err) = dashboard.serve(dashboard_listener).await {
+            eprintln!("storagenode: dashboard stopped: {err}");
+        }
+    });
     let quic_node = Arc::clone(&node);
     tokio::spawn(async move {
         let _ = quic_node.serve_quic(quic).await;
