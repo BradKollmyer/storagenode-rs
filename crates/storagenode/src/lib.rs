@@ -1,7 +1,8 @@
 //! Storage node process: identity on the volume, DRPC, pieces in S3.
 //!
-//! This crate serves `Upload`, `Download`, `Exists`, `Retain`, `RetainBig`, and
-//! `RestoreTrash` over TLS, Noise, and QUIC, deletes expired pieces and old
+//! This crate serves `Upload`, `Download`, `Exists`, `Retain`, `RetainBig`,
+//! `RestoreTrash`, and the satellite's `PingNode` over TLS, Noise, and QUIC,
+//! deletes expired pieces and old
 //! trash, settles closed bandwidth-order hours, checks in with each trusted
 //! satellite, dials graceful exit for a pending satellite, polls held amounts
 //! and pricing, and serves the Vue dashboard JSON on `0.0.0.0:14002`.
@@ -45,8 +46,8 @@ pub use config::Config;
 pub use exit::{format_exit_row, format_exit_status};
 pub use identity::{IDENTITY_PEM, load_or_create};
 pub use server::{
-    Node, PIECESTORE_EXISTS, PIECESTORE_RESTORE_TRASH, PIECESTORE_RETAIN, PIECESTORE_RETAIN_BIG,
-    TrustedSatellite,
+    CONTACT_PING_NODE, Node, PIECESTORE_EXISTS, PIECESTORE_RESTORE_TRASH, PIECESTORE_RETAIN,
+    PIECESTORE_RETAIN_BIG, TrustedSatellite,
 };
 
 use std::path::Path;

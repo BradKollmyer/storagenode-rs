@@ -81,6 +81,7 @@ Dispatch:
 - `DeletePieces` — Unimplemented, as in the Go node ("delete pieces is no longer supported"). Deleted data is collected by `Retain`.
 - `Retain` and `RetainBig` — walk this satellite's live rows created before the filter time and trash the ones the bloom filter rejects.
 - `RestoreTrash` — clear trash flags for that satellite.
+- `contact.Contact/PingNode` — empty reply to a trusted satellite. The satellite calls it back inside every check-in, over TCP and then QUIC, and records the node as down when it gets no answer.
 
 Trusted satellites come from config (node URL list). Order limits signed by anyone else are rejected. `storj_rpc::known_ids` covers the well-known public satellites when the operator lists those hostnames.
 
