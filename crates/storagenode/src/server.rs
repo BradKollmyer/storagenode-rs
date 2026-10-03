@@ -84,6 +84,11 @@ const RETAIN_BATCH: usize = 1000;
 /// from the cached figure in between.
 const SPACE_REFRESH: Duration = Duration::from_secs(60);
 
+/// Go `piecestore.Config.ExpirationGracePeriod`. A limit's piece or order
+/// expiration counts as passed only once it is this far behind this node's
+/// clock, which may run ahead of the satellite's.
+const EXPIRATION_GRACE: Duration = Duration::from_secs(48 * 60 * 60);
+
 /// Pause after a failed `accept`, so a full descriptor table is not a busy loop.
 const ACCEPT_RETRY: Duration = Duration::from_millis(250);
 
@@ -1713,8 +1718,10 @@ fn expired(ts: Option<&prost_types::Timestamp>, now: SystemTime) -> bool {
         return false;
     }
     match timestamp_to_system(ts) {
-        // Equal to now is still valid. There is no expiration grace.
-        Some(time) => time < now,
+        // Go: `expiration.Before(now.Add(-ExpirationGracePeriod))`.
+        Some(time) => now
+            .checked_sub(EXPIRATION_GRACE)
+            .is_some_and(|cutoff| time < cutoff),
         None => true,
     }
 }
@@ -1781,9 +1788,10 @@ fn serial_deadline(limit: &OrderLimit, now: SystemTime) -> SystemTime {
 #[cfg(test)]
 mod tests {
     use super::{
-        CONTACT_PING_NODE, GO_ZERO_TIME_UNIX, Node, PIECESTORE_EXISTS, PIECESTORE_RESTORE_TRASH,
-        PIECESTORE_RETAIN, PIECESTORE_RETAIN_BIG, RETAIN_MAX_TIME_SKEW, Serials, TrustedSatellite,
-        creation_ok, encode_hex, expired, serial_deadline, system_to_timestamp,
+        CONTACT_PING_NODE, EXPIRATION_GRACE, GO_ZERO_TIME_UNIX, Node, PIECESTORE_EXISTS,
+        PIECESTORE_RESTORE_TRASH, PIECESTORE_RETAIN, PIECESTORE_RETAIN_BIG, RETAIN_MAX_TIME_SKEW,
+        Serials, TrustedSatellite, creation_ok, encode_hex, expired, serial_deadline,
+        system_to_timestamp,
     };
     use std::future::Future;
     use std::net::SocketAddr;
@@ -2127,7 +2135,7 @@ mod tests {
     }
 
     #[test]
-    fn order_creation_grace_is_one_hour_and_expiration_has_none() {
+    fn order_creation_grace_is_one_hour_and_expiration_grace_is_two_days() {
         let now = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         let at = |delta: Duration, future: bool| {
             let time = if future {
@@ -2158,9 +2166,14 @@ mod tests {
         assert!(!creation_ok(Some(&zero), now));
         assert!(!expired(Some(&zero), now));
         assert!(!expired(None, now));
-        assert!(!expired(Some(&at(Duration::from_secs(0), true)), now));
         assert!(!expired(Some(&at(Duration::from_secs(1), true)), now));
-        assert!(expired(Some(&at(Duration::from_secs(1), false)), now));
+        // Past, but inside the grace: still accepted.
+        assert!(!expired(Some(&at(Duration::from_secs(1), false)), now));
+        assert!(!expired(Some(&at(EXPIRATION_GRACE, false)), now));
+        assert!(expired(
+            Some(&at(EXPIRATION_GRACE + Duration::from_secs(1), false)),
+            now
+        ));
         let bad = prost_types::Timestamp {
             seconds: 1_700_000_000,
             nanos: 1_000_000_000,
