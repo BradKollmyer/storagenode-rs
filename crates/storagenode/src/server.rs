@@ -796,24 +796,37 @@ impl Node {
         let chunk_size = chunk_limit(advisory);
         let mut sent: u64 = 0;
         let mut file_off = offset;
+        // The uplink closed its side of the stream. No further order can come.
+        let mut orders_closed = false;
         while sent < size {
+            // The uplink signs its next order before it needs it. Take every
+            // order that has already arrived, as the Go node's receive loop
+            // does. A download cancelled after this point then settles the
+            // largest order the uplink sent, not the one being worked off.
+            while !orders_closed {
+                match out.recv_ready().await? {
+                    Some(Some(more)) => {
+                        authorized = later_order(&limit, &more, authorized, &mut tracked)?;
+                    }
+                    Some(None) => orders_closed = true,
+                    None => break,
+                }
+            }
             let sent_i =
                 i64::try_from(sent).map_err(|_| Fail::proto(RPC_INTERNAL, "offset overflow"))?;
             if sent_i >= authorized {
-                let Some(more) = out.recv().await? else {
+                let more = if orders_closed {
+                    None
+                } else {
+                    out.recv().await?
+                };
+                let Some(more) = more else {
                     return Err(Fail::proto(
                         RPC_INVALID_ARGUMENT,
                         "order closed before the requested bytes were authorized",
                     ));
                 };
-                let req = PieceDownloadRequest::decode(more.as_slice())
-                    .map_err(|err| Fail::proto(RPC_INVALID_ARGUMENT, err.to_string()))?;
-                if let Some(order) = req.order {
-                    authorized = check_order(&limit, &order, authorized)?;
-                    if let Some(tracked) = tracked.as_mut() {
-                        tracked.note(&order);
-                    }
-                }
+                authorized = later_order(&limit, &more, authorized, &mut tracked)?;
                 continue;
             }
             let room = u64::try_from(authorized - sent_i)
@@ -1402,6 +1415,20 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Out<T> {
         self.send(Kind::ERROR, &marshal_error(code, message)).await
     }
 
+    /// [`Self::recv`] for a packet that has already arrived. `Ok(None)` when
+    /// the peer has sent nothing more yet.
+    ///
+    /// `recv` is polled once and dropped. `Conn::read_packet` keeps a partial
+    /// frame in the connection, so nothing that was read is lost.
+    async fn recv_ready(&mut self) -> Result<Option<Option<Vec<u8>>>, Fail> {
+        let mut recv = std::pin::pin!(self.recv());
+        std::future::poll_fn(|cx| match recv.as_mut().poll(cx) {
+            Poll::Ready(result) => Poll::Ready(result.map(Some)),
+            Poll::Pending => Poll::Ready(Ok(None)),
+        })
+        .await
+    }
+
     async fn recv(&mut self) -> Result<Option<Vec<u8>>, Fail> {
         loop {
             let pkt = self.conn.read_packet().await?;
@@ -1515,6 +1542,26 @@ fn check_order(limit: &OrderLimit, order: &Order, previous: i64) -> Result<i64, 
     verify_order(order, &public)
         .map_err(|_| Fail::proto(RPC_UNAUTHENTICATED, "invalid order signature"))?;
     Ok(order.amount)
+}
+
+/// A download message after the first. Its order raises the authorized
+/// amount and becomes the one to settle.
+fn later_order(
+    limit: &OrderLimit,
+    message: &[u8],
+    authorized: i64,
+    tracked: &mut Option<orders::OrderGuard>,
+) -> Result<i64, Fail> {
+    let req = PieceDownloadRequest::decode(message)
+        .map_err(|err| Fail::proto(RPC_INVALID_ARGUMENT, err.to_string()))?;
+    let Some(order) = req.order else {
+        return Ok(authorized);
+    };
+    let authorized = check_order(limit, &order, authorized)?;
+    if let Some(tracked) = tracked.as_mut() {
+        tracked.note(&order);
+    }
+    Ok(authorized)
 }
 
 fn check_chunk(
@@ -2612,6 +2659,72 @@ mod tests {
         .expect("download did not deadlock")
         .expect("download");
         assert_eq!(got, body[10..910]);
+    }
+
+    #[tokio::test]
+    async fn cancelled_download_settles_an_order_that_arrived_early() {
+        const MIB: usize = 1 << 20;
+        let satellite = Identity::generate().unwrap();
+        let uplink = Identity::generate().unwrap();
+        let harness = Harness::start(std::slice::from_ref(&satellite)).await;
+        let sat = satellite.node_id().to_string();
+        let piece_key = PiecePrivateKey::generate();
+        let piece_id = [0x61; 32];
+        let body = vec![5u8; 16 * MIB];
+        put_piece_at(
+            &harness.node.store,
+            &sat,
+            &piece_id,
+            SystemTime::now(),
+            &body,
+        )
+        .await;
+        let limit = signed_limit(
+            &satellite,
+            &harness.identity,
+            &piece_key,
+            &piece_id,
+            PieceAction::Get,
+            body.len() as i64,
+        );
+
+        let mut conn = harness.conn(&uplink).await;
+        let mut stream = conn.open_stream(PIECESTORE_DOWNLOAD).await.unwrap();
+        let first = PieceDownloadRequest {
+            limit: Some(limit.clone()),
+            order: Some(order_for(&limit, &piece_key, 12 * MIB as i64)),
+            chunk: Some(piece_download_request::Chunk {
+                offset: 0,
+                chunk_size: body.len() as i64,
+            }),
+            maximum_chunk_size: 0,
+        };
+        conn.send_msg(&mut stream, &first.encode_to_vec())
+            .await
+            .unwrap();
+        // The next order goes out before any byte comes back, as the uplink
+        // does. The node has 12 MiB to send before it needs this one.
+        let next = PieceDownloadRequest {
+            order: Some(order_for(&limit, &piece_key, body.len() as i64)),
+            ..PieceDownloadRequest::default()
+        };
+        conn.send_msg(&mut stream, &next.encode_to_vec())
+            .await
+            .unwrap();
+        // One chunk, then hang up: long-tail cancellation.
+        let chunk = conn.recv_msg(&stream).await.unwrap();
+        assert!(!chunk.is_empty());
+        drop(conn);
+
+        wait_idle(&harness.node).await;
+        let saved = harness
+            .node
+            .store
+            .orders()
+            .status(&sat, &limit.serial_number)
+            .unwrap()
+            .expect("an order was saved");
+        assert_eq!(saved.amount, body.len() as i64);
     }
 
     #[tokio::test]
