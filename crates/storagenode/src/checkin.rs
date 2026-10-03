@@ -33,6 +33,16 @@ const TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// check-ins when the second is asked for by a nearly full node.
 const LOW_SPACE_COOLDOWN: Duration = Duration::from_secs(10 * 60);
 
+/// The Go storage node release this node reports to satellites, in the form
+/// Go sends it (`SemVer.VString`).
+///
+/// A satellite with a minimum version selects only nodes at or above it, and
+/// that minimum is a Go release number. This is the release of the Go tree
+/// this node's wire behaviour was checked against. Raise it after checking
+/// against a newer release, not to get past a satellite's minimum: the number
+/// tells the satellite which behaviour to expect.
+pub(crate) const GO_COMPATIBLE_VERSION: &str = "v1.164.1";
+
 /// Go `initialBackOff`.
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 
@@ -233,14 +243,15 @@ fn check_in_request(node: &Node, operator: &Operator, free_disk: i64) -> Result<
 /// The version a satellite stores for this node.
 ///
 /// A satellite that sets a minimum version selects only nodes that report
-/// `release` and a version at or above it. `release` is true for a release
-/// build, as the Go release binaries report. The commit and its time come
-/// from the build script. The version number is this crate's own, not a Go
-/// node release number.
+/// `release` and a version at or above it. The version is
+/// [`GO_COMPATIBLE_VERSION`], not this crate's own number, which no satellite
+/// minimum is expressed in. `release` is true for a release build, as the Go
+/// release binaries report. The commit and its time are this repository's,
+/// from the build script.
 fn node_version() -> crate::node::NodeVersion {
     let commit_unix: i64 = env!("STORAGENODE_COMMIT_UNIX").parse().unwrap_or(0);
     crate::node::NodeVersion {
-        version: env!("CARGO_PKG_VERSION").to_owned(),
+        version: GO_COMPATIBLE_VERSION.to_owned(),
         commit_hash: env!("STORAGENODE_COMMIT").to_owned(),
         timestamp: (commit_unix > 0).then_some(prost_types::Timestamp {
             seconds: commit_unix,
@@ -516,7 +527,17 @@ mod tests {
         assert_eq!(req.debounce_limit, 0);
         assert!(req.signed_tags.is_none());
         let version = req.version.expect("version");
-        assert_eq!(version.version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(version.version, GO_COMPATIBLE_VERSION);
+        // The satellite parses `v<major>.<minor>.<patch>` and compares numbers.
+        let numbers: Vec<u64> = version
+            .version
+            .strip_prefix('v')
+            .expect("Go sends the v prefix")
+            .split('.')
+            .map(|part| part.parse().expect("a number"))
+            .collect();
+        assert_eq!(numbers.len(), 3);
+        assert_eq!(numbers[0], 1, "a Go storage node release is v1.x.y");
         // Tests are a debug build. A release build reports `release`.
         assert_eq!(version.release, !cfg!(debug_assertions));
         assert_eq!(version.commit_hash, env!("STORAGENODE_COMMIT"));

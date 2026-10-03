@@ -91,4 +91,6 @@ docker build -f storagenode-rs/Dockerfile \
 
 The two build arguments are optional. They set the commit the node reports at check-in; the image build has no `.git` to read it from.
 
+At check-in the node reports the Go storage node release it was checked against, `v1.164.1` (`GO_COMPATIBLE_VERSION` in `checkin.rs`), because a satellite's minimum version is a Go release number. A release build also reports `release`. The dashboard shows this crate's own version.
+
 The Rust stage is `rust:1.91.1-bookworm`. The UI stage builds the Vue app and copies `dist/` to `/usr/share/storagenode/ui`. The runtime is `debian:bookworm-slim` with CA certificates. One volume, `/var/lib/storj`. The image publishes `28967/tcp`, `28967/udp`, and `14002/tcp`. Secrets and `STORJ_SATELLITES` are runtime configuration, not baked in. Publish 14002 to `127.0.0.1` on the host. There is no login.
