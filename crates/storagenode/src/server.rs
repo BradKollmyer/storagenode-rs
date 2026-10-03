@@ -21,8 +21,8 @@ use s3store::{BandwidthKind, HashAlgorithm, PieceBody, PieceMeta, PieceState, St
 use storj_proto::orders::{Order, OrderLimit, PieceAction, PieceHash};
 use storj_proto::piecestore::{
     ExistsRequest, ExistsResponse, PieceDownloadRequest, PieceDownloadResponse, PieceUploadRequest,
-    PieceUploadResponse, RetainRequest, RetainResponse, StorageMethod, piece_download_response,
-    piece_upload_request,
+    PieceUploadResponse, RestoreTrashRequest, RestoreTrashResponse, RetainRequest, RetainResponse,
+    StorageMethod, piece_download_response, piece_upload_request,
 };
 use storj_proto::rpc::{PIECESTORE_DOWNLOAD, PIECESTORE_UPLOAD};
 use storj_rpc::frame::{Kind, Packet};
@@ -48,6 +48,9 @@ pub const PIECESTORE_RETAIN: &str = "/piecestore.Piecestore/Retain";
 
 /// DRPC path for `piecestore.Piecestore/RetainBig`.
 pub const PIECESTORE_RETAIN_BIG: &str = "/piecestore.Piecestore/RetainBig";
+
+/// DRPC path for `piecestore.Piecestore/RestoreTrash`.
+pub const PIECESTORE_RESTORE_TRASH: &str = "/piecestore.Piecestore/RestoreTrash";
 
 /// Unix seconds of Go's zero `time.Time` (year 1). Unset on the wire.
 const GO_ZERO_TIME_UNIX: i64 = -62_135_596_800;
@@ -416,6 +419,9 @@ impl Node {
             PIECESTORE_EXISTS => self.exists(out, peer).await,
             PIECESTORE_RETAIN => self.retain(out, peer).await,
             PIECESTORE_RETAIN_BIG => self.retain_big(out, peer).await,
+            PIECESTORE_RESTORE_TRASH => self.restore_trash(out, peer).await,
+            // `DeletePieces` lands here too. The Go node also answers it
+            // with Unimplemented; deleted data is collected by retain.
             _ => Err(Fail::proto(RPC_UNIMPLEMENTED, "unknown rpc")),
         }
     }
@@ -837,7 +843,7 @@ impl Node {
     where
         T: AsyncRead + AsyncWrite + Unpin,
     {
-        let peer = self.trusted_satellite(peer)?;
+        let peer = self.trusted_satellite(peer, "retain")?;
         let Some(bytes) = out.recv().await? else {
             return Err(Fail::proto(RPC_INVALID_ARGUMENT, "missing retain request"));
         };
@@ -851,7 +857,7 @@ impl Node {
     where
         T: AsyncRead + AsyncWrite + Unpin,
     {
-        let peer = self.trusted_satellite(peer)?;
+        let peer = self.trusted_satellite(peer, "retain")?;
         // Same assembly as `RetainRequestFromStream`: chunks concatenate, and
         // the message that carries the hash ends the stream.
         let mut creation_date = None;
@@ -918,7 +924,34 @@ impl Node {
         Ok(())
     }
 
-    fn trusted_satellite(&self, peer: Option<NodeId>) -> Result<NodeId, Fail> {
+    /// Puts every trashed piece of the calling satellite back to live.
+    ///
+    /// This is how a satellite undoes a bad bloom filter. Trash the chore
+    /// already deleted is gone and is not restored.
+    async fn restore_trash<T>(&self, out: &mut Out<T>, peer: Option<NodeId>) -> Result<(), Fail>
+    where
+        T: AsyncRead + AsyncWrite + Unpin,
+    {
+        let peer = self.trusted_satellite(peer, "restore trash")?;
+        let Some(bytes) = out.recv().await? else {
+            return Err(Fail::proto(
+                RPC_INVALID_ARGUMENT,
+                "missing restore trash request",
+            ));
+        };
+        RestoreTrashRequest::decode(bytes.as_slice())
+            .map_err(|err| Fail::proto(RPC_INVALID_ARGUMENT, err.to_string()))?;
+        self.store
+            .restore_trash(&peer.to_string())
+            .await
+            .map_err(store_err)?;
+        out.message(&RestoreTrashResponse {}.encode_to_vec())
+            .await?;
+        out.close().await?;
+        Ok(())
+    }
+
+    fn trusted_satellite(&self, peer: Option<NodeId>, rpc: &str) -> Result<NodeId, Fail> {
         // Same check as Exists: the TLS client is the satellite, not a field.
         let Some(peer) = peer else {
             return Err(Fail::proto(RPC_UNAUTHENTICATED, "missing peer identity"));
@@ -926,7 +959,7 @@ impl Node {
         if !self.satellites.contains_key(&peer) {
             return Err(Fail::proto(
                 RPC_PERMISSION_DENIED,
-                "retain called with untrusted id",
+                format!("{rpc} called with untrusted id"),
             ));
         }
         Ok(peer)
@@ -1586,9 +1619,9 @@ fn serial_deadline(limit: &OrderLimit, now: SystemTime) -> SystemTime {
 #[cfg(test)]
 mod tests {
     use super::{
-        GO_ZERO_TIME_UNIX, Node, PIECESTORE_EXISTS, PIECESTORE_RETAIN, PIECESTORE_RETAIN_BIG,
-        RETAIN_MAX_TIME_SKEW, TrustedSatellite, creation_ok, encode_hex, expired,
-        system_to_timestamp,
+        GO_ZERO_TIME_UNIX, Node, PIECESTORE_EXISTS, PIECESTORE_RESTORE_TRASH, PIECESTORE_RETAIN,
+        PIECESTORE_RETAIN_BIG, RETAIN_MAX_TIME_SKEW, TrustedSatellite, creation_ok, encode_hex,
+        expired, system_to_timestamp,
     };
     use std::future::Future;
     use std::net::SocketAddr;
@@ -1610,8 +1643,8 @@ mod tests {
     };
     use storj_proto::piecestore::{
         ExistsRequest, ExistsResponse, PieceDownloadRequest, PieceDownloadResponse,
-        PieceUploadRequest, RetainRequest, RetainResponse, StorageMethod, piece_download_request,
-        piece_upload_request,
+        PieceUploadRequest, RestoreTrashRequest, RestoreTrashResponse, RetainRequest,
+        RetainResponse, StorageMethod, piece_download_request, piece_upload_request,
     };
     use storj_proto::rpc::{PIECESTORE_DOWNLOAD, PIECESTORE_UPLOAD};
     use storj_rpc::frame::{Kind, Packet};
@@ -2813,6 +2846,51 @@ mod tests {
             .unwrap();
         assert_eq!(later.bytes, b"later");
         assert!(later.restored_from_trash);
+    }
+
+    #[tokio::test]
+    async fn restore_trash_puts_the_calling_satellites_trash_back() {
+        let satellite = Identity::generate().unwrap();
+        let other = Identity::generate().unwrap();
+        let uplink = Identity::generate().unwrap();
+        let harness = Harness::start(&[satellite.clone(), other.clone()]).await;
+        let sat = satellite.node_id().to_string();
+        let other_id = other.node_id().to_string();
+        let created = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let mine = [0x21; 32];
+        let theirs = [0x22; 32];
+        let store = &harness.node.store;
+        put_piece_at(store, &sat, &mine, created, b"mine").await;
+        put_piece_at(store, &other_id, &theirs, created, b"theirs").await;
+        let now = SystemTime::now();
+        store.trash(&sat, &encode_hex(&mine), now).await.unwrap();
+        store
+            .trash(&other_id, &encode_hex(&theirs), now)
+            .await
+            .unwrap();
+        let request = RestoreTrashRequest {}.encode_to_vec();
+
+        let mut stranger = harness.conn(&uplink).await;
+        let denied = stranger
+            .invoke(PIECESTORE_RESTORE_TRASH, &request)
+            .await
+            .expect_err("uplink is not a satellite");
+        assert!(denied.to_string().contains("untrusted"), "{denied}");
+        assert_eq!(piece_state(&harness, &sat, &mine), PieceState::Trash);
+
+        let mut conn = harness.conn(&satellite).await;
+        let reply = conn
+            .invoke(PIECESTORE_RESTORE_TRASH, &request)
+            .await
+            .expect("restore trash");
+        assert_eq!(
+            RestoreTrashResponse::decode(reply.as_slice()).unwrap(),
+            RestoreTrashResponse {}
+        );
+        assert_eq!(piece_state(&harness, &sat, &mine), PieceState::Live);
+        assert!(store.exists(&sat, &encode_hex(&mine)).unwrap());
+        // Another satellite's trash is not this caller's to restore.
+        assert_eq!(piece_state(&harness, &other_id, &theirs), PieceState::Trash);
     }
 
     async fn put_piece_at(

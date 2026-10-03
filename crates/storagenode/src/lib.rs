@@ -1,10 +1,10 @@
 //! Storage node process: identity on the volume, DRPC, pieces in S3.
 //!
-//! This crate serves `Upload`, `Download`, `Exists`, `Retain`, and `RetainBig`
-//! over TLS, Noise, and QUIC, deletes expired pieces and old trash, settles
-//! closed bandwidth-order hours, checks in with each trusted satellite, dials
-//! graceful exit for a pending satellite, polls held amounts and pricing, and
-//! serves the Vue dashboard JSON on `0.0.0.0:14002`.
+//! This crate serves `Upload`, `Download`, `Exists`, `Retain`, `RetainBig`, and
+//! `RestoreTrash` over TLS, Noise, and QUIC, deletes expired pieces and old
+//! trash, settles closed bandwidth-order hours, checks in with each trusted
+//! satellite, dials graceful exit for a pending satellite, polls held amounts
+//! and pricing, and serves the Vue dashboard JSON on `0.0.0.0:14002`.
 
 #![deny(clippy::undocumented_unsafe_blocks)]
 
@@ -44,7 +44,8 @@ pub use config::Config;
 pub use exit::{format_exit_row, format_exit_status};
 pub use identity::{IDENTITY_PEM, load_or_create};
 pub use server::{
-    Node, PIECESTORE_EXISTS, PIECESTORE_RETAIN, PIECESTORE_RETAIN_BIG, TrustedSatellite,
+    Node, PIECESTORE_EXISTS, PIECESTORE_RESTORE_TRASH, PIECESTORE_RETAIN, PIECESTORE_RETAIN_BIG,
+    TrustedSatellite,
 };
 
 use std::path::Path;

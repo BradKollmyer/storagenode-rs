@@ -78,7 +78,7 @@ Dispatch:
 - `Upload` — verify the order limit (satellite signature, this node id, PUT or PUT_REPAIR, not expired), reject a replayed serial, verify each order signature, stream the body to S3, check the uplink piece hash (SHA-256 or BLAKE3), sign the hash with this identity, store the hash and the limit.
 - `Download` — verify a GET or GET_REPAIR limit, range-GET the object, send the stored hash and limit on repair.
 - `Exists` — index lookup. Present maps to `STORAGE_METHOD_PIECESTORE` (the wire value for "present"; the enum lives in `storj.io/common` and is not extended).
-- `DeletePieces` — delete those keys and rows.
+- `DeletePieces` — Unimplemented, as in the Go node ("delete pieces is no longer supported"). Deleted data is collected by `Retain`.
 - `Retain` and `RetainBig` — walk this satellite's live rows created before the filter time and trash the ones the bloom filter rejects.
 - `RestoreTrash` — clear trash flags for that satellite.
 
