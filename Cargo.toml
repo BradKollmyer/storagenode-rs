@@ -19,3 +19,8 @@ missing_docs = "allow"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
+
+# s3s 0.12 pins RustCrypto pre-releases that Cargo will not duplicate next to
+# the stable sha2 0.11 / hmac 0.13 that storj-rpc and storj-uplink require.
+[patch.crates-io]
+s3s = { path = "third_party/s3s" }
