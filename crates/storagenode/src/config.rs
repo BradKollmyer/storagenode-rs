@@ -12,7 +12,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 
 use storj_rpc::{NodeUrl, parse_node_url};
 
-/// TCP port for the DRPC listener. UDP on the same port is QUIC, later.
+/// TCP and UDP port for DRPC. UDP is QUIC.
 pub const LISTEN_PORT: u16 = 28967;
 
 /// Settings the binary reads once at startup.

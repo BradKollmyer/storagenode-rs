@@ -1,15 +1,19 @@
-//! DRPC over TLS. One RPC per connection.
+//! DRPC over TLS, Noise, and QUIC. One RPC per connection.
 //!
-//! TCP is peeked for 8 bytes. [`storj_rpc::DRPC_TLS_MUX_PREFIX`] starts TLS
-//! with the node id pinned. Any other prefix is closed. Noise and QUIC are
-//! later. The server reads with [`Conn::read_packet`]. `invoke` and
-//! `open_stream` are client calls and are not used here.
+//! TCP is read for 8 bytes. [`storj_rpc::DRPC_TLS_MUX_PREFIX`] starts TLS
+//! with the node id pinned. [`storj_rpc::noise::HEADER`] is consumed, then
+//! [`storj_rpc::noise::NoiseStream::accept`] runs with this process's one
+//! protocol. Any other prefix is closed. UDP is QUIC with ALPN `storj` and
+//! has no mux header. The server reads with [`Conn::read_packet`]. `invoke`
+//! and `open_stream` are client calls and are not used here.
 
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use prost::Message;
@@ -27,8 +31,10 @@ use storj_uplink::{
     PieceHashAlgo, PiecePublicKey, sign_piece_hash_node, verify_order, verify_order_limit,
     verify_piece_hash_uplink,
 };
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
+
+use crate::noise_key::{self, Key};
 
 use crate::orders::{self, Orders};
 
@@ -79,6 +85,12 @@ pub enum BuildError {
     /// The leaf was empty, was the CA, or the CA hashed to a different id.
     #[error("{0}")]
     Satellite(String),
+    /// The Noise key could not be generated.
+    #[error(transparent)]
+    Noise(#[from] noise_key::Error),
+    /// The process was asked to accept a protocol other than 1 or 2.
+    #[error("unsupported noise protocol {0}")]
+    NoiseProtocol(i32),
 }
 
 struct KnownSatellite {
@@ -86,7 +98,7 @@ struct KnownSatellite {
     address: String,
 }
 
-/// TLS piecestore server bound to one identity and one bucket.
+/// Piecestore server bound to one identity, one Noise key, and one bucket.
 pub struct Node {
     identity: Identity,
     store: Store,
@@ -96,15 +108,42 @@ pub struct Node {
     serials: Mutex<HashMap<(NodeId, Vec<u8>), SystemTime>>,
     orders: Orders,
     acceptor: tokio_rustls::TlsAcceptor,
+    /// One X25519 key. Clients learn the public half from check-in, later.
+    noise: Key,
+    /// The only Noise IK protocol this process will complete.
+    noise_protocol: i32,
+    /// Leaf then CA, concatenated DER. Sent on Noise uploads, which have no TLS cert.
+    noise_certchain: Vec<u8>,
 }
 
 impl Node {
-    /// Builds a TLS acceptor. Does not contact the bucket or bind a port.
+    /// Builds a TLS acceptor and an ephemeral Noise key for protocol 1.
+    ///
+    /// Does not contact the bucket or bind a port. The binary uses
+    /// [`Self::with_noise`] so the volume key survives a restart.
     pub fn new(
         identity: Identity,
         store: Store,
         trusted: Vec<TrustedSatellite>,
     ) -> Result<Self, BuildError> {
+        let noise = Key::generate()?;
+        Self::with_noise(identity, store, trusted, noise_key::DEFAULT_PROTOCOL, noise)
+    }
+
+    /// `protocol` is the one Noise IK cipher this process accepts.
+    ///
+    /// `1` is `NOISE_IK_25519_CHACHAPOLY_BLAKE2B`. `2` is
+    /// `NOISE_IK_25519_AESGCM_BLAKE2B`. A handshake for the other cipher fails.
+    pub fn with_noise(
+        identity: Identity,
+        store: Store,
+        trusted: Vec<TrustedSatellite>,
+        protocol: i32,
+        noise: Key,
+    ) -> Result<Self, BuildError> {
+        if protocol != noise_key::DEFAULT_PROTOCOL && protocol != noise_key::AES_PROTOCOL {
+            return Err(BuildError::NoiseProtocol(protocol));
+        }
         let config: rustls::ServerConfig = storj_rpc::server_config(&identity)?;
         let mut satellites = HashMap::with_capacity(trusted.len());
         for satellite in trusted {
@@ -117,6 +156,7 @@ impl Node {
                 },
             );
         }
+        let noise_certchain = cert_chain_der(&identity);
         Ok(Self {
             identity,
             store,
@@ -124,7 +164,20 @@ impl Node {
             serials: Mutex::new(HashMap::new()),
             orders: Orders::new(),
             acceptor: tokio_rustls::TlsAcceptor::from(Arc::new(config)),
+            noise,
+            noise_protocol: protocol,
+            noise_certchain,
         })
+    }
+
+    /// Protocol passed to `NoiseStream::accept`. Not a byte after the header.
+    pub fn noise_protocol(&self) -> i32 {
+        self.noise_protocol
+    }
+
+    /// X25519 public key a client passes to `NoiseStream::connect`.
+    pub fn noise_public_key(&self) -> &[u8; 32] {
+        self.noise.public()
     }
 
     /// This node's id.
@@ -156,20 +209,90 @@ impl Node {
         }
     }
 
+    /// QUIC endpoint on `addr` (the same port as TCP). ALPN is `storj`.
+    ///
+    /// Idle timeout is 15 minutes and the keepalive is 15 seconds, matching
+    /// the storj-rpc QUIC client. A quiet connection is not dropped first.
+    pub fn quic_endpoint(&self, addr: SocketAddr) -> io::Result<quinn::Endpoint> {
+        quinn::Endpoint::server(quic_server_config(&self.identity)?, addr)
+    }
+
+    /// Accepts until the endpoint closes. Each connection is one bi-stream RPC.
+    pub async fn serve_quic(self: Arc<Self>, endpoint: quinn::Endpoint) -> io::Result<()> {
+        while let Some(incoming) = endpoint.accept().await {
+            let node = Arc::clone(&self);
+            tokio::spawn(async move {
+                let _ = node.handle_quic(incoming).await;
+            });
+        }
+        Ok(())
+    }
+
     async fn handle(&self, mut sock: TcpStream) -> io::Result<()> {
         let _ = sock.set_nodelay(true);
         let mut prefix = [0u8; 8];
         sock.read_exact(&mut prefix).await?;
-        if prefix.as_slice() != DRPC_TLS_MUX_PREFIX {
-            // Noise (`DRPC!N!1`) and anything else are later.
+        if prefix.as_slice() == DRPC_TLS_MUX_PREFIX {
+            let tls = self.acceptor.accept(sock).await?;
+            let peer = peer_node_id(&tls);
+            self.serve_conn(tls, peer, Vec::new()).await?;
             return Ok(());
         }
-        let tls = self.acceptor.accept(sock).await?;
-        let peer = peer_node_id(&tls);
-        let mut conn = Conn::new(tls);
+        if prefix.as_slice() == storj_rpc::noise::HEADER.as_slice() {
+            // The header does not carry the protocol number. One process, one cipher.
+            let io = storj_rpc::noise::NoiseStream::accept(
+                sock,
+                self.noise_protocol,
+                self.noise.private(),
+            )
+            .await?;
+            self.serve_conn(io, None, self.noise_certchain.clone())
+                .await?;
+            return Ok(());
+        }
+        Ok(())
+    }
+
+    async fn handle_quic(&self, incoming: quinn::Incoming) -> io::Result<()> {
+        let connection = incoming
+            .await
+            .map_err(|err| io::Error::other(err.to_string()))?;
+        let peer = quic_peer_node_id(&connection);
+        let (send, recv) = connection
+            .accept_bi()
+            .await
+            .map_err(|err| io::Error::other(err.to_string()))?;
+        let mut io = self
+            .serve_conn(BiStream { send, recv }, peer, Vec::new())
+            .await?;
+        // RecvStream::drop sends STOP_SENDING unless the peer finished the
+        // stream. The uplink still writes its DRPC close after the response,
+        // then closes the connection instead of finishing the stream.
+        let mut buf = [0u8; 1024];
+        loop {
+            match io.recv.read(&mut buf).await {
+                Ok(Some(0)) | Ok(None) | Err(_) => break,
+                Ok(Some(_)) => {}
+            }
+        }
+        drop(io);
+        connection.closed().await;
+        Ok(())
+    }
+
+    async fn serve_conn<T>(
+        &self,
+        io: T,
+        peer: Option<NodeId>,
+        node_certchain: Vec<u8>,
+    ) -> io::Result<T>
+    where
+        T: AsyncRead + AsyncWrite + Unpin,
+    {
+        let mut conn = Conn::new(io);
         let invoke = conn.read_packet().await.map_err(io_err)?;
         if invoke.kind != Kind::INVOKE {
-            return Ok(());
+            return Ok(conn.into_inner());
         }
         let path = String::from_utf8(invoke.data).unwrap_or_default();
         let mut out = Out {
@@ -177,6 +300,7 @@ impl Node {
             stream_id: invoke.stream_id,
             // The reader starts at message 1 and rejects 0.
             next_id: 1,
+            node_certchain,
         };
         match self.dispatch(&mut out, peer, &path).await {
             Ok(()) => {
@@ -184,22 +308,25 @@ impl Node {
                 // Dropping the socket first turns that write into EPIPE and
                 // fails an RPC that already succeeded.
                 let _ = out.conn.read_packet().await;
-                Ok(())
+                Ok(out.conn.into_inner())
             }
             Err(Fail::Proto { code, message }) => {
                 let _ = out.fail(code, &message).await;
-                Ok(())
+                Ok(out.conn.into_inner())
             }
             Err(Fail::Transport(err)) => Err(io_err(err)),
         }
     }
 
-    async fn dispatch(
+    async fn dispatch<T>(
         &self,
-        out: &mut Out<tokio_rustls::server::TlsStream<TcpStream>>,
+        out: &mut Out<T>,
         peer: Option<NodeId>,
         path: &str,
-    ) -> Result<(), Fail> {
+    ) -> Result<(), Fail>
+    where
+        T: AsyncRead + AsyncWrite + Unpin,
+    {
         match path {
             PIECESTORE_UPLOAD => self.upload(out).await,
             PIECESTORE_DOWNLOAD => self.download(out).await,
@@ -384,7 +511,8 @@ impl Node {
             .map_err(|err| Fail::proto(RPC_INTERNAL, err.to_string()))?;
         let response = PieceUploadResponse {
             done: Some(sn_hash),
-            node_certchain: Vec::new(),
+            // TLS and QUIC take the leaf from the connection. Noise cannot.
+            node_certchain: out.node_certchain.clone(),
         };
         out.message(&response.encode_to_vec()).await?;
         out.close().await?;
@@ -842,6 +970,75 @@ fn peer_node_id(tls: &tokio_rustls::server::TlsStream<TcpStream>) -> Option<Node
     NodeId::from_certificate_der(ca.as_ref()).ok()
 }
 
+fn quic_peer_node_id(connection: &quinn::Connection) -> Option<NodeId> {
+    let certs = connection
+        .peer_identity()?
+        .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+        .ok()?;
+    let ca = certs.get(1)?;
+    NodeId::from_certificate_der(ca.as_ref()).ok()
+}
+
+fn cert_chain_der(identity: &Identity) -> Vec<u8> {
+    let mut chain = Vec::new();
+    for cert in identity.cert_chain() {
+        chain.extend_from_slice(cert.as_ref());
+    }
+    chain
+}
+
+/// QUIC bi-stream as one byte pipe. There is no TCP mux header on this socket.
+struct BiStream {
+    send: quinn::SendStream,
+    recv: quinn::RecvStream,
+}
+
+impl AsyncRead for BiStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().recv).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for BiStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        AsyncWrite::poll_write(Pin::new(&mut self.get_mut().send), cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().send).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().send).poll_shutdown(cx)
+    }
+}
+
+fn quic_server_config(identity: &Identity) -> io::Result<quinn::ServerConfig> {
+    let mut tls =
+        storj_rpc::server_config(identity).map_err(|err| io::Error::other(err.to_string()))?;
+    tls.alpn_protocols = vec![b"storj".to_vec()];
+    let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls)
+        .map_err(|err| io::Error::other(err.to_string()))?;
+    let mut server = quinn::ServerConfig::with_crypto(Arc::new(crypto));
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_idle_timeout(Some(
+        Duration::from_secs(15 * 60)
+            .try_into()
+            .expect("15 minutes fits in a QUIC idle timeout"),
+    ));
+    transport.keep_alive_interval(Some(Duration::from_secs(15)));
+    server.transport_config(Arc::new(transport));
+    Ok(server)
+}
+
 fn io_err(err: storj_rpc::Error) -> io::Error {
     io::Error::other(err.to_string())
 }
@@ -850,6 +1047,8 @@ struct Out<T> {
     conn: Conn<T>,
     stream_id: u64,
     next_id: u64,
+    /// Empty on TLS and QUIC. Noise uploads copy this into `node_certchain`.
+    node_certchain: Vec<u8>,
 }
 
 impl<T: AsyncRead + AsyncWrite + Unpin> Out<T> {
@@ -1238,6 +1437,7 @@ mod tests {
         GO_ZERO_TIME_UNIX, Node, PIECESTORE_EXISTS, PIECESTORE_RETAIN, PIECESTORE_RETAIN_BIG,
         TrustedSatellite, creation_ok, encode_hex, expired, system_to_timestamp,
     };
+    use std::future::Future;
     use std::net::SocketAddr;
     use std::path::{Path, PathBuf};
     use std::process;
@@ -1262,11 +1462,13 @@ mod tests {
     };
     use storj_proto::rpc::{PIECESTORE_DOWNLOAD, PIECESTORE_UPLOAD};
     use storj_rpc::frame::{Kind, Packet};
+    use storj_rpc::noise::NoiseStream;
+    use storj_rpc::transport::{self, TransportKind, TransportMode};
     use storj_rpc::{Conn, Identity, client_config, server_config, write_tls_mux_prefix};
     use storj_uplink::{
         Client, PieceConfig, PieceHashAlgo, PiecePrivateKey, sign_order, sign_order_limit,
     };
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
 
     use crate::Config;
@@ -1369,6 +1571,14 @@ mod tests {
         }
 
         async fn start_with(satellites: &[Identity], addresses: &[&str]) -> Self {
+            Self::open(satellites, addresses, None).await
+        }
+
+        async fn open(
+            satellites: &[Identity],
+            addresses: &[&str],
+            noise: Option<(i32, crate::noise_key::Key)>,
+        ) -> Self {
             let bucket = TestBucket::start().await;
             let identity = Identity::generate().expect("node identity");
             let trusted = satellites
@@ -1381,15 +1591,27 @@ mod tests {
                     ca_der: sat.ca_der().as_ref().to_vec(),
                 })
                 .collect();
-            let node = Arc::new(Node::new(identity.clone(), bucket.store, trusted).expect("node"));
+            let node = match noise {
+                Some((protocol, key)) => {
+                    Node::with_noise(identity.clone(), bucket.store, trusted, protocol, key)
+                }
+                None => Node::new(identity.clone(), bucket.store, trusted),
+            }
+            .expect("node");
+            let node = Arc::new(node);
             node.startup().await.expect("startup");
             let listener = Node::listen("127.0.0.1:0".parse().unwrap())
                 .await
                 .expect("listen");
             let addr = listener.local_addr().expect("addr");
+            let quic = node.quic_endpoint(addr).expect("quic");
             let serving = Arc::clone(&node);
             tokio::spawn(async move {
                 let _ = serving.serve(listener).await;
+            });
+            let serving = Arc::clone(&node);
+            tokio::spawn(async move {
+                let _ = serving.serve_quic(quic).await;
             });
             Self {
                 node,
@@ -1719,6 +1941,159 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upload_download_over_noise_and_quic() {
+        let satellite = Identity::generate().unwrap();
+        let uplink = Identity::generate().unwrap();
+        let harness = Harness::start(std::slice::from_ref(&satellite)).await;
+        assert_eq!(
+            harness.node.noise_protocol(),
+            crate::noise_key::DEFAULT_PROTOCOL
+        );
+        assert_ne!(harness.node.noise_public_key(), &[0; 32]);
+
+        let protocol = harness.node.noise_protocol();
+        let public = *harness.node.noise_public_key();
+        let addr = harness.addr;
+        let sat_leaf = satellite.leaf_der().as_ref().to_vec();
+        // Empty peer cert: the uplink must use node_certchain from the response.
+        upload_and_download(&harness, &satellite, move || {
+            let sat_leaf = sat_leaf.clone();
+            async move {
+                let tcp = TcpStream::connect(addr).await.expect("connect");
+                tcp.set_nodelay(true).expect("nodelay");
+                let io = NoiseStream::connect(tcp, protocol, &public)
+                    .await
+                    .expect("noise");
+                Client::new(Conn::new(io), sat_leaf, Vec::new())
+            }
+        })
+        .await;
+
+        let node_id = harness.identity.node_id();
+        let address = harness.addr.to_string();
+        let sat_leaf = satellite.leaf_der().as_ref().to_vec();
+        let uplink_id = uplink.clone();
+        upload_and_download(&harness, &satellite, move || {
+            let sat_leaf = sat_leaf.clone();
+            let uplink_id = uplink_id.clone();
+            let address = address.clone();
+            async move {
+                let io = transport::dial(
+                    &uplink_id,
+                    node_id,
+                    &address,
+                    TransportMode::Quic,
+                    Duration::from_secs(10),
+                    None,
+                )
+                .await
+                .expect("quic");
+                assert_eq!(io.kind, TransportKind::Quic);
+                assert!(!io.peer_cert.is_empty(), "quic leaf");
+                let peer = io.peer_cert.clone();
+                Client::new(Conn::new(io), sat_leaf, peer)
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn noise_protocol_2_is_the_only_handshake() {
+        let satellite = Identity::generate().unwrap();
+        let key = crate::noise_key::Key::generate().expect("key");
+        let public = *key.public();
+        let harness = Harness::open(
+            std::slice::from_ref(&satellite),
+            &[],
+            Some((crate::noise_key::AES_PROTOCOL, key)),
+        )
+        .await;
+        assert_eq!(
+            harness.node.noise_protocol(),
+            crate::noise_key::AES_PROTOCOL
+        );
+        assert_eq!(harness.node.noise_public_key(), &public);
+
+        let addr = harness.addr;
+        let sat_leaf = satellite.leaf_der().as_ref().to_vec();
+        upload_and_download(&harness, &satellite, move || {
+            let sat_leaf = sat_leaf.clone();
+            async move {
+                let tcp = TcpStream::connect(addr).await.expect("connect");
+                tcp.set_nodelay(true).expect("nodelay");
+                let io = NoiseStream::connect(tcp, crate::noise_key::AES_PROTOCOL, &public)
+                    .await
+                    .expect("protocol 2");
+                Client::new(Conn::new(io), sat_leaf, Vec::new())
+            }
+        })
+        .await;
+
+        let tcp = TcpStream::connect(harness.addr).await.expect("connect");
+        tcp.set_nodelay(true).expect("nodelay");
+        let mismatched = tokio::time::timeout(
+            Duration::from_secs(5),
+            NoiseStream::connect(tcp, crate::noise_key::DEFAULT_PROTOCOL, &public),
+        )
+        .await
+        .expect("other cipher should not hang");
+        assert!(
+            mismatched.is_err(),
+            "protocol 1 must not complete against protocol 2"
+        );
+    }
+
+    async fn upload_and_download<T, F, Fut>(harness: &Harness, satellite: &Identity, mut connect: F)
+    where
+        T: AsyncRead + AsyncWrite + Unpin,
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Client<T>>,
+    {
+        let piece_key = PiecePrivateKey::generate();
+        let n = SERIAL.fetch_add(1, Ordering::Relaxed);
+        let mut piece_id = vec![0u8; 32];
+        piece_id[..8].copy_from_slice(&n.to_be_bytes());
+        let body = b"abcdefghijklmnopqrstuvwxyz".to_vec();
+        let put = signed_limit(
+            satellite,
+            &harness.identity,
+            &piece_key,
+            &piece_id,
+            PieceAction::Put,
+            body.len() as i64,
+        );
+        let mut client = connect().await;
+        let uploaded = client
+            .upload(&put, &piece_key, &body)
+            .await
+            .expect("upload");
+        assert_eq!(uploaded.hash.len(), 32);
+        assert_eq!(uploaded.piece_size, body.len() as i64);
+        let info = harness
+            .node
+            .store
+            .info(&satellite.node_id().to_string(), &encode_hex(&piece_id))
+            .unwrap()
+            .expect("row");
+        assert_eq!(info.hash.as_slice(), uploaded.hash.as_slice());
+
+        let get = signed_limit(
+            satellite,
+            &harness.identity,
+            &piece_key,
+            &piece_id,
+            PieceAction::Get,
+            body.len() as i64,
+        );
+        let mut client = connect().await;
+        let got = client
+            .download(&get, &piece_key, 0, body.len() as i64)
+            .await
+            .expect("download");
+        assert_eq!(got, body);
+    }
+
+    #[tokio::test]
     async fn blake3_put_repair_round_trip() {
         let satellite = Identity::generate().unwrap();
         let uplink = Identity::generate().unwrap();
@@ -1953,7 +2328,7 @@ mod tests {
         let satellite = Identity::generate().unwrap();
         let harness = Harness::start(std::slice::from_ref(&satellite)).await;
         let mut tcp = TcpStream::connect(harness.addr).await.unwrap();
-        tcp.write_all(b"DRPC!N!1").await.unwrap();
+        tcp.write_all(b"DRPC!X!1").await.unwrap();
         tcp.flush().await.unwrap();
         let mut buf = [0u8; 1];
         let n = tokio::time::timeout(Duration::from_secs(2), tcp.read(&mut buf))
@@ -2060,6 +2435,11 @@ mod tests {
             Ok(Ok(_)) => panic!("head bucket succeeded"),
             Err(_) => panic!("head bucket should fail without hanging"),
         }
+        let volume = root.path().join("volume");
+        let bytes = std::fs::read(volume.join(crate::noise_key::FILE_NAME)).expect("noise key");
+        assert_eq!(bytes.len(), 32);
+        let loaded = crate::noise_key::Key::load_or_create(&volume).expect("reload");
+        assert_eq!(loaded.private().as_slice(), bytes.as_slice());
     }
 
     fn node_config(root: &TempRoot, satellite: storj_rpc::NodeId) -> Config {

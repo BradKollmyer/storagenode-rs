@@ -1,14 +1,15 @@
-//! Storage node process: identity on the volume, DRPC over TLS, pieces in S3.
+//! Storage node process: identity on the volume, DRPC, pieces in S3.
 //!
-//! This crate serves `Upload`, `Download`, `Exists`, `Retain`, and `RetainBig`,
-//! and settles closed bandwidth-order hours with the satellite.
-//! Noise, QUIC, and check-in are not in this binary yet.
+//! This crate serves `Upload`, `Download`, `Exists`, `Retain`, and `RetainBig`
+//! over TLS, Noise, and QUIC, and settles closed bandwidth-order hours with
+//! the satellite. Check-in is not in this binary yet.
 
 #![deny(clippy::undocumented_unsafe_blocks)]
 
 mod bloom;
 mod config;
 mod identity;
+mod noise_key;
 mod orders;
 mod server;
 
@@ -32,6 +33,9 @@ pub enum Error {
     /// The volume identity could not be loaded or written.
     #[error(transparent)]
     Identity(#[from] identity::Error),
+    /// The volume Noise key could not be loaded or written.
+    #[error(transparent)]
+    Noise(#[from] noise_key::Error),
     /// A trusted satellite has no leaf whose CA matches its node id.
     #[error("{0}")]
     Satellite(String),
@@ -53,11 +57,12 @@ pub enum Error {
 /// does not dial a satellite.
 pub async fn start(config: &Config) -> Result<Arc<Node>, Error> {
     let identity = load_or_create(&config.s3.volume)?;
+    let noise = noise_key::Key::load_or_create(&config.s3.volume)?;
     // A node URL is an id and an address, not a public key. Refuse to build
     // a node that would listen with an empty leaf.
     let trusted = load_satellites(&config.s3.volume, &config.satellites)?;
     let store = s3store::Store::new(config.s3.clone())?;
-    let node = Node::new(identity, store, trusted)?;
+    let node = Node::with_noise(identity, store, trusted, noise_key::DEFAULT_PROTOCOL, noise)?;
     node.startup().await?;
     Ok(Arc::new(node))
 }
@@ -104,7 +109,12 @@ pub async fn run(config: Config) -> Result<(), Error> {
     let node = start(&config).await?;
     let listener = Node::listen(config.listen).await?;
     let addr = listener.local_addr()?;
+    let quic = node.quic_endpoint(addr)?;
     eprintln!("storagenode: node {} listening on {addr}", node.node_id());
+    let quic_node = Arc::clone(&node);
+    tokio::spawn(async move {
+        let _ = quic_node.serve_quic(quic).await;
+    });
     let settling = Arc::clone(&node);
     tokio::spawn(async move {
         settling.serve_orders().await;

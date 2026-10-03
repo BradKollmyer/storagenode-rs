@@ -11,7 +11,9 @@ publish = false
 base64 = "0.22"
 prost = "0.14"
 prost-types = "0.14"
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "aws_lc_rs"] }
+snow = { version = "0.10", default-features = false, features = ["std", "default-resolver", "use-getrandom", "use-curve25519", "use-aes-gcm", "use-chacha20poly1305", "use-blake2"] }
 s3store = { path = "../s3store" }
 storj-proto = { path = "../../../storj-uplink/crates/storj-proto" }
 storj-rpc = { path = "../../../storj-uplink/crates/storj-rpc" }
