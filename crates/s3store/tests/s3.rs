@@ -57,6 +57,13 @@ struct TestS3 {
     config: Config,
     /// `CopyObject` requests the server has received.
     copies: Arc<AtomicU64>,
+    hold: Arc<Hold>,
+}
+
+/// A `PutObject` whose key ends in `/held` reports in, then waits here.
+struct Hold {
+    arrived: tokio::sync::Semaphore,
+    release: tokio::sync::Semaphore,
 }
 
 impl TestS3 {
@@ -71,10 +78,15 @@ impl TestS3 {
         // s3s-fs CreateBucket is create_dir on the bucket path.
         std::fs::create_dir(root.path().join(BUCKET)).expect("bucket dir");
         let copies = Arc::new(AtomicU64::new(0));
+        let hold = Arc::new(Hold {
+            arrived: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+        });
         let addr = spawn_server(TestFs {
             inner: FileSystem::new(root.path()).expect("s3s filesystem"),
             replace_on_copy,
             copies: Arc::clone(&copies),
+            hold: Arc::clone(&hold),
         });
         let endpoint = format!("http://{addr}");
         let config = Config {
@@ -94,6 +106,7 @@ impl TestS3 {
             endpoint,
             config,
             copies,
+            hold,
         }
     }
 
@@ -123,9 +136,11 @@ struct TestFs {
     inner: FileSystem,
     replace_on_copy: bool,
     copies: Arc<AtomicU64>,
+    hold: Arc<Hold>,
 }
 
-// Everything the store calls goes to s3s-fs unchanged, except CopyObject.
+// Everything the store calls goes to s3s-fs unchanged, except CopyObject and
+// a held PutObject.
 #[async_trait::async_trait]
 impl S3 for TestFs {
     async fn abort_multipart_upload(
@@ -188,6 +203,10 @@ impl S3 for TestFs {
         &self,
         req: S3Request<PutObjectInput>,
     ) -> S3Result<S3Response<PutObjectOutput>> {
+        if req.input.key.ends_with("/held") {
+            self.hold.arrived.add_permits(1);
+            self.hold.release.acquire().await.expect("hold").forget();
+        }
         self.inner.put_object(req).await
     }
 
@@ -1135,6 +1154,48 @@ async fn multipart_stage_is_streamed_when_the_server_keeps_source_metadata() {
         .expect("metadata");
     let hash: String = meta.hash.iter().map(|byte| format!("{byte:02x}")).collect();
     assert_eq!(head.get("piece-hash"), Some(&hash));
+}
+
+#[tokio::test]
+async fn another_piece_commits_while_one_put_is_still_in_flight() {
+    let s3 = TestS3::start().await;
+    let held = s3
+        .store
+        .put_piece("sat-s", "held", b"slow", piece_meta(None, 0x51));
+    tokio::pin!(held);
+    // Drive the first upload until its PutObject is inside the server. It
+    // holds its key's commit lock from here until the server answers.
+    tokio::select! {
+        _ = &mut held => panic!("the held put finished before it was released"),
+        arrived = s3.hold.arrived.acquire() => arrived.expect("hold").forget(),
+    }
+    let row = s3.store.info("sat-s", "held").expect("info").expect("row");
+    assert_eq!(row.state, PieceState::Writing);
+
+    // A second piece goes all the way to live meanwhile. Under one
+    // store-wide commit lock this waited for the first put.
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        s3.store
+            .put_piece("sat-s", "free", b"fast", piece_meta(None, 0x52)),
+    )
+    .await
+    .expect("another key must not wait for the held put")
+    .expect("put");
+    assert!(s3.store.exists("sat-s", "free").expect("exists"));
+    assert_eq!(read_piece(&s3, "sat-s", "free").await, b"fast");
+    let row = s3.store.info("sat-s", "held").expect("info").expect("row");
+    assert_eq!(row.state, PieceState::Writing, "the first put is still out");
+
+    // The held key itself is still exclusive.
+    let same_key =
+        tokio::time::timeout(Duration::from_millis(200), s3.store.delete("sat-s", "held")).await;
+    assert!(same_key.is_err(), "a delete of the held key must wait");
+
+    s3.hold.release.add_permits(1);
+    held.await.expect("held put");
+    assert!(s3.store.exists("sat-s", "held").expect("exists"));
+    assert_eq!(read_piece(&s3, "sat-s", "held").await, b"slow");
 }
 
 #[tokio::test]
