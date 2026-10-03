@@ -271,12 +271,27 @@ impl Node {
     /// An accept error is logged and retried. EMFILE and ECONNABORTED come
     /// from one connection or from load, and returning here exits the node.
     pub async fn serve(self: Arc<Self>, listener: TcpListener) -> io::Result<()> {
+        self.serve_accepted(|| listener.accept(), ACCEPT_RETRY)
+            .await
+    }
+
+    /// The loop behind [`Self::serve`]. `accept` is the listener's, except in
+    /// the test that makes it fail.
+    async fn serve_accepted<F, Fut>(
+        self: Arc<Self>,
+        mut accept: F,
+        retry: Duration,
+    ) -> io::Result<()>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = io::Result<(TcpStream, SocketAddr)>>,
+    {
         loop {
-            let sock = match listener.accept().await {
+            let sock = match accept().await {
                 Ok((sock, _)) => sock,
                 Err(err) => {
                     eprintln!("storagenode: accept: {err}");
-                    tokio::time::sleep(ACCEPT_RETRY).await;
+                    tokio::time::sleep(retry).await;
                     continue;
                 }
             };
@@ -2700,6 +2715,50 @@ mod tests {
         assert!(reply.kind == Kind::MESSAGE, "got {}", reply.kind);
         let response = ExistsResponse::decode(reply.data.as_slice()).unwrap();
         assert_eq!(response.missing, vec![0]);
+    }
+
+    #[tokio::test]
+    async fn accept_errors_are_retried_and_the_next_connection_is_served() {
+        let satellite = Identity::generate().unwrap();
+        let harness = Harness::start(std::slice::from_ref(&satellite)).await;
+        let listener = Arc::new(TcpListener::bind("127.0.0.1:0").await.unwrap());
+        let addr = listener.local_addr().unwrap();
+        let calls = Arc::new(AtomicU64::new(0));
+        // EMFILE three times, as a full descriptor table returns, then the
+        // real listener.
+        let accept = {
+            let listener = Arc::clone(&listener);
+            let calls = Arc::clone(&calls);
+            move || {
+                let listener = Arc::clone(&listener);
+                let call = calls.fetch_add(1, Ordering::Relaxed);
+                async move {
+                    if call < 3 {
+                        return Err(std::io::Error::from_raw_os_error(24));
+                    }
+                    listener.accept().await
+                }
+            }
+        };
+        let node = Arc::clone(&harness.node);
+        let serving =
+            tokio::spawn(
+                async move { node.serve_accepted(accept, Duration::from_millis(1)).await },
+            );
+
+        // The loop is still there to handle this connection: a prefix that
+        // is not DRPC is read and the socket closed.
+        let mut tcp = TcpStream::connect(addr).await.unwrap();
+        tcp.write_all(b"DRPC!X!1").await.unwrap();
+        let mut buf = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(5), tcp.read(&mut buf))
+            .await
+            .expect("the connection after the accept errors is served")
+            .unwrap();
+        assert_eq!(n, 0);
+        assert!(calls.load(Ordering::Relaxed) >= 4);
+        assert!(!serving.is_finished(), "an accept error must not end serve");
+        serving.abort();
     }
 
     #[tokio::test]
