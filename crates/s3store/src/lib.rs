@@ -543,12 +543,6 @@ impl Store {
         self.index.complete_exit(satellite_id, receipt)
     }
 
-    /// Marks a completed exit's pieces deleted. Does not change the receipt.
-    pub fn mark_exit_deleted(&self, satellite_id: &str) -> Result<()> {
-        check_id("satellite id", satellite_id)?;
-        self.index.mark_exit_deleted(satellite_id)
-    }
-
     /// The index row, including `writing` and `trash`. `Ok(None)` when absent.
     pub fn info(&self, satellite_id: &str, piece_id: &str) -> Result<Option<PieceInfo>> {
         check_piece(satellite_id, piece_id)?;
