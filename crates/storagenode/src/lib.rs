@@ -41,6 +41,7 @@ mod orders;
 mod payout;
 mod secret;
 mod server;
+mod wire;
 
 pub use config::Config;
 pub use exit::{format_exit_row, format_exit_status};

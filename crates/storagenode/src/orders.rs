@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use prost::Message;
 use s3store::{OrderRows, StoredOrder};
-use storj_proto::orders::{Order, OrderLimit, SettlementRequest, SettlementWithWindowResponse};
+use storj_proto::orders::{Order, OrderLimit, SettlementWithWindowResponse};
 use storj_rpc::transport::{self, TransportMode};
 use storj_rpc::{Conn, Identity, NodeId};
 
@@ -106,7 +106,7 @@ impl Orders {
         db: OrderRows,
         satellite: NodeId,
         window: i64,
-        limit: OrderLimit,
+        limit: Vec<u8>,
     ) -> OrderGuard {
         self.flight.add(satellite, window);
         OrderGuard {
@@ -233,7 +233,9 @@ pub(crate) struct OrderGuard {
     satellite: NodeId,
     satellite_id: String,
     window: i64,
-    limit: OrderLimit,
+    /// The encoded limit, with any field this build does not know after the
+    /// known ones. The satellite verifies its signature again at settlement.
+    limit: Vec<u8>,
     best: Option<Order>,
 }
 
@@ -263,7 +265,7 @@ impl Drop for OrderGuard {
                 satellite: self.satellite_id.clone(),
                 serial: order.serial_number.clone(),
                 window_start: self.window,
-                limit: self.limit.encode_to_vec(),
+                limit: std::mem::take(&mut self.limit),
                 order: order.encode_to_vec(),
                 amount: order.amount,
             };
@@ -302,7 +304,7 @@ async fn settle_window(
     satellite: NodeId,
     orders: &[StoredOrder],
 ) -> Result<i32, String> {
-    let requests = decode_orders(orders)?;
+    let requests = settlement_requests(orders)?;
     let transport = transport::dial(
         identity,
         satellite,
@@ -319,7 +321,7 @@ async fn settle_window(
         .await
         .map_err(|err| err.to_string())?;
     for request in &requests {
-        conn.send_msg(&mut stream, &request.encode_to_vec())
+        conn.send_msg(&mut stream, request)
             .await
             .map_err(|err| err.to_string())?;
     }
@@ -354,15 +356,20 @@ fn split_decodable(orders: Vec<StoredOrder>) -> (Vec<StoredOrder>, Vec<StoredOrd
     (good, bad)
 }
 
-fn decode_orders(orders: &[StoredOrder]) -> Result<Vec<SettlementRequest>, String> {
+/// One encoded `SettlementRequest` per stored order.
+///
+/// The stored limit and order are embedded as they are, not decoded and
+/// encoded again. That is the same bytes for a limit this build knows in
+/// full, and it keeps a field it does not know, which the satellite signed.
+fn settlement_requests(orders: &[StoredOrder]) -> Result<Vec<Vec<u8>>, String> {
     let mut requests = Vec::with_capacity(orders.len());
     for order in orders {
-        let limit = OrderLimit::decode(order.limit.as_slice()).map_err(|err| err.to_string())?;
-        let signed = Order::decode(order.order.as_slice()).map_err(|err| err.to_string())?;
-        requests.push(SettlementRequest {
-            limit: Some(limit),
-            order: Some(signed),
-        });
+        OrderLimit::decode(order.limit.as_slice()).map_err(|err| err.to_string())?;
+        Order::decode(order.order.as_slice()).map_err(|err| err.to_string())?;
+        let mut request = Vec::with_capacity(order.limit.len() + order.order.len() + 8);
+        crate::wire::put_embedded(&mut request, 1, &order.limit);
+        crate::wire::put_embedded(&mut request, 2, &order.order);
+        requests.push(request);
     }
     Ok(requests)
 }
