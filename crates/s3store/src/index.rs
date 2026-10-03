@@ -1,8 +1,9 @@
 //! SQLite cache of piece metadata (`pieces.db` on the volume).
 //!
 //! The bucket is the source of the bytes, the hash, and the order limit.
-//! Trash lives only here. A missing database is rebuilt from object metadata;
-//! every rebuilt row is live.
+//! Trash lives only here. A missing or unfinished database is rebuilt from
+//! object metadata; every rebuilt row is live. `user_version` stays 0 until
+//! that listing finishes, so a restart does not treat a partial file as done.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -35,6 +36,9 @@ CREATE TABLE IF NOT EXISTS pieces (
 CREATE INDEX IF NOT EXISTS pieces_expires ON pieces (expires_at);
 CREATE INDEX IF NOT EXISTS pieces_trash ON pieces (trashed_at);
 ";
+
+/// `PRAGMA user_version` written only after a full prefix listing finishes.
+const REBUILD_VERSION: i64 = 1;
 
 /// `sha256` or `blake3`. Both hashes are 32 bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,29 +181,43 @@ pub(crate) struct Index {
 impl Index {
     /// Opens `pieces.db`, creating it and the schema if needed.
     ///
-    /// The bool is true when the file was absent. Callers list the bucket
-    /// and rebuild only in that case. Trash is not on the object, so a
-    /// rebuild marks every row live.
-    pub(crate) fn open(path: &Path) -> Result<(Self, bool)> {
+    /// Creating the file is not a finished rebuild. [`Self::rebuild_done`]
+    /// stays false until [`Self::mark_rebuild_done`].
+    pub(crate) fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent)
                     .map_err(|err| Error::Index(format!("create {}: {err}", parent.display())))?;
             }
         }
-        let missing = !path.exists();
         let conn = Connection::open(path).map_err(db_err)?;
-        // One writer. WAL lets a reader take a snapshot without blocking it.
+        // WAL is crash durability for this file. This process takes `conn`
+        // for every call, so a reader does not overlap the writer.
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(db_err)?;
-        conn.busy_timeout(Duration::from_secs(5)).map_err(db_err)?;
+        // A foreign lock should fail the call, not park a worker for seconds.
+        conn.busy_timeout(Duration::from_millis(250))
+            .map_err(db_err)?;
         conn.execute_batch(SCHEMA).map_err(db_err)?;
-        Ok((
-            Self {
-                conn: Arc::new(Mutex::new(conn)),
-            },
-            missing,
-        ))
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
+    }
+
+    /// True after a prefix listing has been fully applied.
+    ///
+    /// `user_version` is 0 on a new file and on a file whose rebuild was
+    /// interrupted. File existence is not this bit.
+    pub(crate) fn rebuild_done(&self) -> Result<bool> {
+        let version = self
+            .with(|conn| conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)))?;
+        Ok(version >= REBUILD_VERSION)
+    }
+
+    /// Records that the listing finished. Not set from the schema itself.
+    pub(crate) fn mark_rebuild_done(&self) -> Result<()> {
+        // `user_version` does not accept a bound parameter.
+        self.with(|conn| conn.pragma_update(None, "user_version", REBUILD_VERSION))
     }
 
     pub(crate) fn upsert(&self, info: &PieceInfo) -> Result<()> {
@@ -328,6 +346,8 @@ impl Index {
         u64::try_from(changed).map_err(|_| Error::Index("restore count overflow".into()))
     }
 
+    /// `(live, trash)`. `writing` is omitted, so an in-flight overwrite drops
+    /// the previous size from `live` until that row is live again.
     pub(crate) fn sums(&self) -> Result<(u64, u64)> {
         let (used, trash) = self.with(|conn| {
             conn.query_row(
@@ -518,8 +538,8 @@ mod tests {
     #[test]
     fn wal_round_trip_trash_and_expiry() {
         let (_dir, path) = temp_db();
-        let (index, missing) = Index::open(&path).unwrap();
-        assert!(missing);
+        let index = Index::open(&path).unwrap();
+        assert!(!index.rebuild_done().unwrap());
         let mode: String = index
             .with(|conn| conn.query_row("PRAGMA journal_mode", [], |row| row.get(0)))
             .unwrap();
@@ -569,6 +589,14 @@ mod tests {
         assert_eq!(due, vec![("sat".to_owned(), "old".to_owned())]);
         assert!(index.is_expired("sat", "old", expires).unwrap());
         assert!(!index.is_expired("sat", "piece", expires).unwrap());
+
+        assert!(!index.rebuild_done().unwrap());
+        index.mark_rebuild_done().unwrap();
+        assert!(index.rebuild_done().unwrap());
+        drop(index);
+        let index = Index::open(&path).unwrap();
+        assert!(index.rebuild_done().unwrap());
+        assert!(index.is_expired("sat", "old", expires).unwrap());
     }
 
     /// Tiny temp dir that deletes itself. Avoids a dev-dependency for one test.

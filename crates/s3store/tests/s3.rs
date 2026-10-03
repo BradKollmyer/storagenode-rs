@@ -825,7 +825,7 @@ async fn rebuild_from_object_metadata() {
     assert!(s3.store.info("sat-r", "plain").expect("info").is_none());
     assert!(!s3.store.exists("sat-r", "plain").expect("plain"));
 
-    // The database file exists now, so startup must not rebuild trash away.
+    // The rebuild marker is set, so startup must not turn trash back into live.
     s3.store
         .trash("sat-r", "piece", created)
         .await
@@ -839,4 +839,32 @@ async fn rebuild_from_object_metadata() {
             .state,
         PieceState::Trash
     );
+}
+
+#[tokio::test]
+async fn unfinished_database_rebuilds_after_restart() {
+    let s3 = TestS3::start().await;
+    let body = b"still-here";
+    s3.store
+        .put_piece("sat-i", "piece", body, piece_meta(None, 0x11))
+        .await
+        .expect("put");
+
+    // `Store::new` creates pieces.db before startup. Drop that store with
+    // the file left in place, then open it again. Nothing is deleted.
+    let mut config = s3.config.clone();
+    config.volume = s3.root.path().join("partial-volume");
+    let abandoned = Store::new(config.clone()).expect("create db");
+    drop(abandoned);
+    assert!(config.volume.join(PIECES_DB).is_file());
+
+    let store = Store::new(config).expect("restart");
+    store.startup().await.expect("rebuild");
+    let info = store.info("sat-i", "piece").expect("info").expect("row");
+    assert_eq!(info.state, PieceState::Live);
+    assert_eq!(info.hash, [0x11; 32]);
+    assert_eq!(info.size, u64::try_from(body.len()).unwrap());
+    let download = store.download("sat-i", "piece", None).await.expect("bytes");
+    assert_eq!(download.bytes, body);
+    assert!(!download.restored_from_trash);
 }

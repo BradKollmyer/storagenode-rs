@@ -27,7 +27,6 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aws_sdk_s3::config::{
@@ -109,11 +108,11 @@ pub struct Store {
     prefix: String,
     index: index::Index,
     allocated_bytes: u64,
-    /// File was absent at open. [`Store::startup`] lists the bucket once.
-    needs_rebuild: AtomicBool,
-    /// Held across a piece commit and across each chore delete, so GC cannot
-    /// remove an object a commit just replaced. One lock for the bucket;
-    /// split per piece if a GC pass blocks uploads.
+    /// One startup at a time. A second caller waits, then sees the marker.
+    startup: tokio::sync::Mutex<()>,
+    /// Held across a piece commit, including the object put, and across each
+    /// chore delete. GC must not delete an object this commit just replaced,
+    /// and a download must not drop a row this commit just published.
     commit: Arc<tokio::sync::Mutex<()>>,
 }
 
@@ -179,7 +178,7 @@ impl Store {
     /// Builds a client and opens `pieces.db`.
     ///
     /// Does not contact the bucket. [`Store::startup`] does, and rebuilds the
-    /// index when the database file was missing.
+    /// index when the file is missing or the rebuild marker is unset.
     pub fn new(config: Config) -> Result<Self> {
         if config.endpoint.is_empty() {
             return Err(Error::Config("endpoint is required"));
@@ -227,14 +226,14 @@ impl Store {
             .response_checksum_validation(ResponseChecksumValidation::WhenRequired)
             .build();
 
-        let (index, missing) = index::Index::open(&config.volume.join(PIECES_DB))?;
+        let index = index::Index::open(&config.volume.join(PIECES_DB))?;
         Ok(Self {
             client: aws_sdk_s3::Client::from_conf(sdk),
             bucket: config.bucket,
             prefix,
             index,
             allocated_bytes: config.allocated_bytes,
-            needs_rebuild: AtomicBool::new(missing),
+            startup: tokio::sync::Mutex::new(()),
             commit: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
@@ -253,20 +252,24 @@ impl Store {
             .map_err(|err| Error::S3(err.to_string()))
     }
 
-    /// Checks the bucket, then rebuilds the index if `pieces.db` was missing.
+    /// Checks the bucket, then rebuilds the index when the rebuild marker is unset.
     ///
-    /// Rebuild lists the prefix and inserts a live row for every object whose
-    /// user metadata has the piece fields. Trash is not on the object, so
-    /// every rebuilt row is live.
+    /// Opening the database creates the file, so existence is not completion.
+    /// The marker is written only after the prefix listing finishes. A restart
+    /// with an unfinished file lists again. One startup runs at a time; a
+    /// second caller waits and then sees the marker.
+    ///
+    /// Rebuild inserts a live row for every object whose user metadata has the
+    /// piece fields. Trash is not on the object, so every rebuilt row is live.
+    /// A missing bucket fails this call and leaves the marker unset.
     pub async fn startup(&self) -> Result<()> {
+        let _guard = self.startup.lock().await;
         self.head_bucket().await?;
-        if self.needs_rebuild.swap(false, Ordering::AcqRel)
-            && let Err(err) = self.rebuild().await
-        {
-            self.needs_rebuild.store(true, Ordering::Release);
-            return Err(err);
+        if self.index.rebuild_done()? {
+            return Ok(());
         }
-        Ok(())
+        self.rebuild().await?;
+        self.index.mark_rebuild_done()
     }
 
     /// Writes a piece: insert `writing`, put the object, then mark `live`.
@@ -332,7 +335,24 @@ impl Store {
                 restored_from_trash: restored,
             }),
             Err(Error::NotFound) => {
-                if self.index.get(satellite_id, piece_id)?.as_ref() == Some(&info) {
+                // `finish` holds `commit` across the put and the live upsert.
+                // Recheck the row and the object under that lock so this
+                // delete cannot remove a row a concurrent put just published.
+                // PieceInfo equality is not a generation: the same bytes
+                // compare equal, so the object must still be absent.
+                let _guard = self.commit.lock().await;
+                let still_same = self.index.get(satellite_id, piece_id)?.as_ref() == Some(&info);
+                // A head error is not absence. Return it and leave the row.
+                let absent = if still_same {
+                    match self.head(satellite_id, piece_id).await {
+                        Err(Error::NotFound) => true,
+                        Ok(_) => false,
+                        Err(err) => return Err(err),
+                    }
+                } else {
+                    false
+                };
+                if absent {
                     self.index.delete(satellite_id, piece_id)?;
                 }
                 Err(Error::NotFound)
@@ -377,6 +397,11 @@ impl Store {
     }
 
     /// Allocation, live bytes, trash bytes, and free space (`allocated - live`).
+    ///
+    /// `used` counts live rows only. A `writing` row is omitted until it
+    /// becomes live, so during an overwrite free space can be high by the
+    /// previous object's size. Check-in ignores that uncommitted window.
+    /// Trash is a separate total and is not subtracted from free space.
     pub fn space(&self) -> Result<Space> {
         let (used, trash) = self.index.sums()?;
         Ok(Space {
@@ -560,14 +585,15 @@ impl Store {
         let mut start_after: Option<String> = None;
         loop {
             let page = self.list_page(&prefix, start_after.as_deref()).await?;
-            if page.keys.is_empty() {
+            if page.objects.is_empty() {
                 break;
             }
-            for key in &page.keys {
-                let Some((satellite_id, piece_id)) = split_object_key(&self.prefix, key) else {
+            for object in &page.objects {
+                let Some((satellite_id, piece_id)) = split_object_key(&self.prefix, &object.key)
+                else {
                     continue;
                 };
-                let Some((size, meta)) = self.head_listed(key).await? else {
+                let Some((size, meta)) = self.head_listed(&object.key, object.size).await? else {
                     continue;
                 };
                 let Some(info) = piece_from_metadata(&satellite_id, &piece_id, size, &meta) else {
@@ -581,13 +607,13 @@ impl Store {
             }
             // s3s-fs pages with start_after and is_truncated. It does not
             // return a continuation token.
-            let Some(last) = page.keys.last() else {
+            let Some(last) = page.objects.last() else {
                 break;
             };
-            if start_after.as_deref() == Some(last.as_str()) {
+            if start_after.as_deref() == Some(last.key.as_str()) {
                 break;
             }
-            start_after = Some(last.clone());
+            start_after = Some(last.key.clone());
         }
         Ok(count)
     }
@@ -605,18 +631,29 @@ impl Store {
             req = req.start_after(start_after);
         }
         let out = req.send().await.map_err(map_s3)?;
-        let keys = out
+        let objects = out
             .contents()
             .iter()
-            .filter_map(|obj| obj.key().map(str::to_owned))
+            .filter_map(|obj| {
+                let key = obj.key()?.to_owned();
+                let size = obj
+                    .size()
+                    .and_then(|size| u64::try_from(size).ok())
+                    .unwrap_or(0);
+                Some(ListedObject { key, size })
+            })
             .collect();
         Ok(ListPage {
-            keys,
+            objects,
             truncated: out.is_truncated().unwrap_or(false),
         })
     }
 
-    async fn head_listed(&self, key: &str) -> Result<Option<(u64, HashMap<String, String>)>> {
+    async fn head_listed(
+        &self,
+        key: &str,
+        listed_size: u64,
+    ) -> Result<Option<(u64, HashMap<String, String>)>> {
         match self
             .client
             .head_object()
@@ -626,14 +663,27 @@ impl Store {
             .await
         {
             Ok(out) => {
-                let size = out.content_length().unwrap_or(0);
-                let size = u64::try_from(size).unwrap_or(0);
+                let size = out
+                    .content_length()
+                    .and_then(|size| u64::try_from(size).ok())
+                    .unwrap_or(listed_size);
                 let meta = normalize_metadata(out.metadata()).unwrap_or_default();
                 Ok(Some((size, meta)))
             }
-            Err(err) if is_missing_code(err.code()) || err.code() == Some("NoSuchBucket") => {
-                Ok(None)
-            }
+            Err(err) if is_missing_code(err.code()) => Ok(None),
+            // Same probe as `Store::head`. Skip the key only when GET says it
+            // is missing. A missing bucket must fail startup so the rebuild
+            // marker stays unset. s3s-fs maps a missing bucket directory to
+            // NoSuchKey on GetObject, so HeadBucket is the check on that server.
+            Err(err) if err.code() == Some("NoSuchBucket") => match self.probe_object(key, 0).await
+            {
+                Err(Error::NotFound) => {
+                    self.head_bucket().await?;
+                    Ok(None)
+                }
+                Ok(meta) => Ok(Some((listed_size, meta.unwrap_or_default()))),
+                Err(err) => Err(err),
+            },
             Err(err) => Err(map_s3(err)),
         }
     }
@@ -670,8 +720,13 @@ struct PieceAttempt {
     committed: bool,
 }
 
+struct ListedObject {
+    key: String,
+    size: u64,
+}
+
 struct ListPage {
-    keys: Vec<String>,
+    objects: Vec<ListedObject>,
     truncated: bool,
 }
 
@@ -704,10 +759,13 @@ impl Upload {
         let _guard = commit.lock().await;
         self.reserve_piece()?;
         if let Err(err) = self.finish_inner().await {
-            // Put did not return success. Restore the previous row so a failed
-            // overwrite does not hide that piece. A crash skips this and leaves
-            // `writing`, which is not served.
-            self.rollback_piece()?;
+            // The put did not succeed. Restore the previous row, and leave
+            // `reserved` set when that write fails so Drop retries it.
+            // A crash still leaves `writing`: startup must not guess whether
+            // the process died before or after the put.
+            if let Err(rollback_err) = self.rollback_piece() {
+                return Err(chain_restore(err, rollback_err));
+            }
             return Err(err);
         }
         // Complete already published the object. Do not abort it on drop.
@@ -892,21 +950,31 @@ impl Upload {
     }
 
     fn rollback_piece(&mut self) -> Result<()> {
-        let Some(piece) = self.piece.as_mut() else {
-            return Ok(());
+        let (previous, satellite_id, piece_id) = {
+            let Some(piece) = self.piece.as_ref() else {
+                return Ok(());
+            };
+            if !piece.reserved || piece.committed {
+                return Ok(());
+            }
+            (
+                piece.previous.clone(),
+                piece.satellite_id.clone(),
+                piece.piece_id.clone(),
+            )
         };
-        if !piece.reserved || piece.committed {
-            return Ok(());
-        }
-        let previous = piece.previous.clone();
-        let satellite_id = piece.satellite_id.clone();
-        let piece_id = piece.piece_id.clone();
-        piece.reserved = false;
+        // Clear `reserved` only after the restore write returns. A failure
+        // leaves it set so Drop retries instead of keeping a `writing` row
+        // over the object that is still in the bucket.
         if let Some(previous) = previous {
-            self.index.upsert(&previous)
+            self.index.upsert(&previous)?;
         } else {
-            self.index.delete(&satellite_id, &piece_id)
+            self.index.delete(&satellite_id, &piece_id)?;
         }
+        if let Some(piece) = self.piece.as_mut() {
+            piece.reserved = false;
+        }
+        Ok(())
     }
 
     fn mark_piece_live(&mut self) -> Result<()> {
@@ -958,6 +1026,19 @@ impl Drop for Upload {
                     .send()
                     .await;
             });
+        }
+    }
+}
+
+fn chain_restore(err: Error, rollback: Error) -> Error {
+    let text = format!("{err}; restore previous row: {rollback}");
+    match err {
+        Error::S3(_) => Error::S3(text),
+        Error::Index(_) => Error::Index(text),
+        Error::Metadata(_) => Error::Metadata(text),
+        Error::InvalidKey(_) => Error::InvalidKey(text),
+        Error::Config(_) | Error::Endpoint | Error::Range { .. } | Error::NotFound => {
+            Error::S3(text)
         }
     }
 }
