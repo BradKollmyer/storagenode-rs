@@ -3,13 +3,11 @@
 //! `Identity` has no PEM encoder. The file is leaf certificate, CA, then one
 //! PKCS#8 `PRIVATE KEY`, which is what [`storj_rpc::Identity::from_pem`] reads.
 
-use std::fs;
-use std::io::{self, Write};
-use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use std::fs;
+use std::io;
+use std::path::Path;
 use storj_rpc::Identity;
 
 /// File name of the PEM identity inside the volume directory.
@@ -40,7 +38,7 @@ pub fn load_or_create(volume: &Path) -> Result<Identity, Error> {
     }
     let identity = Identity::generate()?;
     let pem = encode_pem(&identity);
-    match publish_secret(volume, &path, pem.as_bytes()) {
+    match crate::secret::publish(volume, &path, pem.as_bytes()) {
         Ok(()) => Ok(identity),
         Err(err) if err.kind() == io::ErrorKind::AlreadyExists => read_identity(&path)?
             .ok_or_else(|| {
@@ -117,49 +115,6 @@ fn read_identity(path: &Path) -> Result<Option<Identity>, Error> {
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(err.into()),
     }
-}
-
-/// Writes `bytes` to a temp file in `volume`, syncs it, then links `path`.
-///
-/// `rename` would replace an identity the other start already published.
-/// `hard_link` fails with [`io::ErrorKind::AlreadyExists`] instead, and the
-/// loser reads `path` only after that link exists. The directory entry is
-/// synced before return so a crash cannot drop it and mint a new id.
-fn publish_secret(volume: &Path, path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|dur| dur.as_nanos())
-        .unwrap_or(0);
-    let tmp = volume.join(format!(
-        ".{IDENTITY_PEM}.{}.{nanos}.tmp",
-        std::process::id()
-    ));
-    let mut opts = fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut file = opts.open(&tmp)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    drop(file);
-    // Link, don't rename over a file the other start already published.
-    // Sync the directory before dropping the temp name: that name is the
-    // other directory entry for the same inode.
-    let linked = fs::hard_link(&tmp, path);
-    if linked.is_ok() {
-        sync_dir(volume)?;
-    }
-    let _ = fs::remove_file(&tmp);
-    linked
-}
-
-fn sync_dir(dir: &Path) -> io::Result<()> {
-    let file = fs::File::open(dir)?;
-    file.sync_all()?;
-    Ok(())
 }
 
 #[cfg(test)]

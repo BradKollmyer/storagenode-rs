@@ -15,7 +15,7 @@ use storj_rpc::{Conn, Error as RpcError, NodeId};
 
 use crate::gracefulexit::SatelliteMessage;
 use crate::gracefulexit::satellite_message::Message as SatelliteMessageKind;
-use crate::server::Node;
+use crate::server::{Node, encode_hex};
 
 /// `/gracefulexit.SatelliteGracefulExit/Process`.
 pub(crate) const PROCESS: &str = "/gracefulexit.SatelliteGracefulExit/Process";
@@ -225,25 +225,15 @@ fn exit_detail(row: &ExitRow) -> String {
     match row.status {
         ExitStatus::Pending => String::new(),
         ExitStatus::Failed => {
-            let encoded = hex(&row.message);
+            let encoded = encode_hex(&row.message);
             if row.reason.is_empty() {
                 encoded
             } else {
                 format!("{} {encoded}", row.reason)
             }
         }
-        ExitStatus::Completed => hex(&row.message),
+        ExitStatus::Completed => encode_hex(&row.message),
     }
-}
-
-fn hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(char::from(HEX[usize::from(byte >> 4)]));
-        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    out
 }
 
 #[cfg(test)]
@@ -753,7 +743,10 @@ mod tests {
         assert!(text.contains(&sat), "{text}");
         assert!(text.contains("\t4\tfailed\t"), "{text}");
         assert!(text.contains("INACTIVE_TIMEFRAME_EXCEEDED"), "{text}");
-        assert!(text.contains(&hex(&failed.encode_to_vec())), "{text}");
+        assert!(
+            text.contains(&encode_hex(&failed.encode_to_vec())),
+            "{text}"
+        );
         let got = node
             .piece_store()
             .download(&sat, "live", None)
