@@ -529,11 +529,11 @@ impl Index {
     /// Creating the file is not a finished rebuild. [`Self::rebuild_done`]
     /// stays false until [`Self::mark_rebuild_done`].
     pub(crate) fn open(path: &Path) -> Result<Self> {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|err| Error::Index(format!("create {}: {err}", parent.display())))?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)
+                .map_err(|err| Error::Index(format!("create {}: {err}", parent.display())))?;
         }
         let conn = Connection::open(path).map_err(db_err)?;
         // WAL is crash durability for this file. This process takes `conn`

@@ -4,15 +4,16 @@ members = ["crates/*"]
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.91.1"
 license = "MIT OR Apache-2.0"
 version = "0.1.0"
 
 [workspace.dependencies]
-# 1.123 raises MSRV past 1.88. Exact pin: caret 1.122 still allows 1.129.
+# 1.138 needs Rust 1.94. 1.137 is the newest 1.91.1 release, and it
+# depends on aws-smithy-json ^0.62.7 (GHSA-8ffr-xgwf-xj56).
 # `rustls` is the legacy hyper 0.14 connector (rustls 0.21, webpki 0.101).
 # HTTPS uses `default-https-client` (rustls 0.23).
-aws-sdk-s3 = { version = "=1.122.0", default-features = false, features = [
+aws-sdk-s3 = { version = "=1.137.0", default-features = false, features = [
     "sigv4a",
     "http-1x",
     "default-https-client",

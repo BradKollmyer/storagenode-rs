@@ -6,7 +6,7 @@ A Rust process stores piece bytes only in an S3 API (AWS S3 or Ceph RGW). Identi
 
 ## Where it lives
 
-This repo sits next to a `storj-uplink` checkout. Edition 2024, MSRV 1.88, license `MIT OR Apache-2.0`, DCO, same as `storj-uplink`.
+This repo sits next to a `storj-uplink` checkout. Edition 2024, license `MIT OR Apache-2.0`, and DCO, same as `storj-uplink`. MSRV is 1.91.1.
 
 ```
 storagenode-rs/
@@ -142,7 +142,7 @@ Disk numbers come from the S3 index. JSON `diskSpace.used` is live bytes plus tr
 
 ## Container
 
-`Dockerfile` in `storagenode-rs`. Build context is the parent directory so the image can see `storj-uplink` (path dependencies) and `storj/web/storagenode` (dashboard). Rust stage `rust:1.88-bookworm`. UI stage is the Node build already used by `storj/web/storagenode/Dockerfile`. Runtime is `debian:bookworm-slim` plus CA certificates. The image runs `storagenode`. One volume, mounted at `/var/lib/storj`, for the identity, `pieces.db`, and the bandwidth rollup. No piece disk.
+`Dockerfile` in `storagenode-rs`. Build context is the parent directory so the image can see `storj-uplink` (path dependencies) and `storj/web/storagenode` (dashboard). Rust stage `rust:1.91.1-bookworm`. UI stage is the Node build already used by `storj/web/storagenode/Dockerfile`. Runtime is `debian:bookworm-slim` plus CA certificates. The image runs `storagenode`. One volume, mounted at `/var/lib/storj`, for the identity, `pieces.db`, and the bandwidth rollup. No piece disk.
 
 Required environment: `STORJ_S3_ENDPOINT`, `STORJ_S3_BUCKET`, `STORJ_S3_ACCESS_KEY_ID`, `STORJ_S3_SECRET_ACCESS_KEY`, `STORJ_OPERATOR_EMAIL`, `STORJ_OPERATOR_WALLET`, `STORJ_CONTACT_EXTERNAL_ADDRESS`, `STORJ_SATELLITES` (comma-separated node URLs).
 
