@@ -28,8 +28,8 @@ use storj_proto::rpc::{PIECESTORE_DOWNLOAD, PIECESTORE_UPLOAD};
 use storj_rpc::frame::{Kind, Packet};
 use storj_rpc::{Conn, DRPC_TLS_MUX_PREFIX, Identity, NodeId, marshal_error};
 use storj_uplink::{
-    PieceHashAlgo, PiecePublicKey, sign_piece_hash_node, verify_order, verify_order_limit,
-    verify_piece_hash_uplink,
+    PieceHashAlgo, PiecePublicKey, encode_order_limit, sign_piece_hash_node, verify_order,
+    verify_order_limit, verify_piece_hash_uplink,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
@@ -37,6 +37,7 @@ use tokio::net::{TcpListener, TcpStream};
 use crate::noise_key::{self, Key};
 
 use crate::orders::{self, Orders};
+use crate::wire;
 
 /// DRPC path for `piecestore.Piecestore/Exists`.
 ///
@@ -539,6 +540,8 @@ impl Node {
         T: AsyncRead + AsyncWrite + Unpin,
     {
         let mut limit: Option<OrderLimit> = None;
+        // The limit as stored: its known fields, then any this build lacks.
+        let mut limit_bytes = Vec::new();
         let mut algo = PieceHashAlgo::Sha256;
         let mut hasher = PieceHashAlgo::Sha256.hasher();
         let mut staging: Option<(Upload, String)> = None;
@@ -568,9 +571,11 @@ impl Node {
                 // The first message carries the algorithm. Later messages leave
                 // the field at the protobuf zero (SHA-256) even for BLAKE3.
                 hasher = algo.hasher();
-                self.check_limit(&next, true)?;
+                let unknown = limit_unknown(&bytes);
+                self.check_limit(&next, true, &unknown)?;
                 self.check_space(&next)?;
-                tracked = Some(self.track_order(&next)?);
+                limit_bytes = encode_limit(&next, &unknown);
+                tracked = Some(self.track_order(&next, limit_bytes.clone())?);
                 usage.satellite = parse_node_id(&next.satellite_id)?.to_string();
                 usage.action = next.action;
                 limit = Some(next);
@@ -615,7 +620,14 @@ impl Node {
                 };
                 let digest = hasher.finalize();
                 return self
-                    .commit_upload(out, &limit, algo, (staging, staged), &digest, &done)
+                    .commit_upload(
+                        out,
+                        (&limit, limit_bytes),
+                        algo,
+                        (staging, staged),
+                        &digest,
+                        &done,
+                    )
                     .await;
             }
         }
@@ -624,7 +636,7 @@ impl Node {
     async fn commit_upload<T>(
         &self,
         out: &mut Out<T>,
-        limit: &OrderLimit,
+        limit: (&OrderLimit, Vec<u8>),
         algo: PieceHashAlgo,
         spill: (Option<(Upload, String)>, i64),
         digest: &[u8],
@@ -633,6 +645,7 @@ impl Node {
     where
         T: AsyncRead + AsyncWrite + Unpin,
     {
+        let (limit, limit_bytes) = limit;
         // The Go endpoint wraps a failed piece-hash check, and a changed hash
         // algorithm, as Internal. The size check below stays InvalidArgument.
         if done.piece_id != limit.piece_id {
@@ -678,7 +691,7 @@ impl Node {
                 .piece_expiration
                 .as_ref()
                 .and_then(timestamp_to_system),
-            order_limit: limit.encode_to_vec(),
+            order_limit: limit_bytes,
             hash_signature: done.signature.clone(),
             hash_timestamp: done
                 .timestamp
@@ -761,8 +774,9 @@ impl Node {
                 if limit.is_some() {
                     return Err(Fail::proto(RPC_INVALID_ARGUMENT, "duplicate order limit"));
                 }
-                self.check_limit(&next, false)?;
-                tracked = Some(self.track_order(&next)?);
+                let unknown = limit_unknown(&bytes);
+                self.check_limit(&next, false, &unknown)?;
+                tracked = Some(self.track_order(&next, encode_limit(&next, &unknown))?);
                 limit = Some(next);
             }
             if let Some(order) = req.order {
@@ -850,6 +864,11 @@ impl Node {
         if limit.action == PieceAction::GetRepair as i32 {
             let stored_limit = OrderLimit::decode(info.order_limit.as_slice())
                 .map_err(|err| Fail::proto(RPC_INTERNAL, err.to_string()))?;
+            // The repairer verifies the satellite's signature on this limit.
+            // A stored field this build does not know is part of what was
+            // signed, so such a limit goes out as the stored bytes.
+            let keeps_unknown = wire::unknown_fields(&info.order_limit, wire::ORDER_LIMIT_FIELDS)
+                .is_some_and(|unknown| !unknown.is_empty());
             let header = PieceDownloadResponse {
                 hash: Some(PieceHash {
                     piece_id: limit.piece_id.clone(),
@@ -861,11 +880,15 @@ impl Node {
                     signature: info.hash_signature.clone(),
                     hash_algorithm: algo_i32(info.algorithm),
                 }),
-                limit: Some(stored_limit),
+                limit: (!keeps_unknown).then_some(stored_limit),
                 restored_from_trash: restored,
                 chunk: None,
             };
-            out.message(&header.encode_to_vec()).await?;
+            let mut header = header.encode_to_vec();
+            if keeps_unknown {
+                wire::put_embedded(&mut header, 3, &info.order_limit);
+            }
+            out.message(&header).await?;
         } else if restored {
             let header = PieceDownloadResponse {
                 restored_from_trash: true,
@@ -1147,7 +1170,8 @@ impl Node {
         Ok(peer)
     }
 
-    fn check_limit(&self, limit: &OrderLimit, upload: bool) -> Result<(), Fail> {
+    /// `unknown` is [`limit_unknown`] of the message that carried `limit`.
+    fn check_limit(&self, limit: &OrderLimit, upload: bool, unknown: &[u8]) -> Result<(), Fail> {
         let allowed = if upload {
             limit.action == PieceAction::Put as i32 || limit.action == PieceAction::PutRepair as i32
         } else {
@@ -1231,8 +1255,23 @@ impl Node {
                 "satellite certificate is not known",
             ));
         }
-        verify_order_limit(limit, &leaf)
-            .map_err(|_| Fail::proto(RPC_UNAUTHENTICATED, "invalid order limit signature"))?;
+        let signed = if unknown.is_empty() {
+            verify_order_limit(limit, &leaf).is_ok()
+        } else {
+            // The satellite signed a field this build does not have. Go
+            // verifies over the known fields followed by the unknown ones,
+            // which is the satellite's own encoding as long as new fields
+            // take higher numbers.
+            let mut bytes = encode_order_limit(limit);
+            bytes.extend_from_slice(unknown);
+            storj_rpc::hash_and_verify(&leaf, &bytes, &limit.satellite_signature).is_ok()
+        };
+        if !signed {
+            return Err(Fail::proto(
+                RPC_UNAUTHENTICATED,
+                "invalid order limit signature",
+            ));
+        }
         self.reserve_serial(
             satellite_id,
             &limit.serial_number,
@@ -1319,12 +1358,17 @@ impl Node {
         }
     }
 
-    fn track_order(&self, limit: &OrderLimit) -> Result<orders::OrderGuard, Fail> {
+    /// `encoded` is [`encode_limit`] of `limit`, saved with the order.
+    fn track_order(
+        &self,
+        limit: &OrderLimit,
+        encoded: Vec<u8>,
+    ) -> Result<orders::OrderGuard, Fail> {
         let satellite = parse_node_id(&limit.satellite_id)?;
         let window = order_window(limit)?;
         Ok(self
             .orders
-            .begin(self.store.orders(), satellite, window, limit.clone()))
+            .begin(self.store.orders(), satellite, window, encoded))
     }
 
     /// Settles closed order hours as of `now`. Tests pass a later clock so a
@@ -1707,6 +1751,23 @@ fn check_order(limit: &OrderLimit, order: &Order, previous: i64) -> Result<i64, 
     verify_order(order, &public)
         .map_err(|_| Fail::proto(RPC_UNAUTHENTICATED, "invalid order signature"))?;
     Ok(order.amount)
+}
+
+/// The fields of a request's order limit that this build's `OrderLimit` does
+/// not have, as they came off the wire. The limit is field 1 of both the
+/// upload and the download request. Empty for every limit of today.
+fn limit_unknown(request: &[u8]) -> Vec<u8> {
+    wire::embedded(request, 1)
+        .and_then(|limit| wire::unknown_fields(limit, wire::ORDER_LIMIT_FIELDS))
+        .unwrap_or_default()
+}
+
+/// The limit as the Go node would marshal it again: the known fields, then
+/// the unknown ones. This is what is stored, returned on repair, and settled.
+fn encode_limit(limit: &OrderLimit, unknown: &[u8]) -> Vec<u8> {
+    let mut bytes = limit.encode_to_vec();
+    bytes.extend_from_slice(unknown);
+    bytes
 }
 
 /// The Go download wraps whatever its send and receive loops return,
@@ -3733,6 +3794,124 @@ mod tests {
             rotated.leaf_der().as_ref()
         );
         assert!(harness.node.satellite_leaf(rotated.node_id()).is_none());
+    }
+
+    #[tokio::test]
+    async fn order_limit_field_this_build_lacks_is_verified_kept_and_returned() {
+        let satellite = Identity::generate().unwrap();
+        let uplink = Identity::generate().unwrap();
+        let harness = Harness::start(std::slice::from_ref(&satellite)).await;
+        let sat = satellite.node_id().to_string();
+        let piece_key = PiecePrivateKey::generate();
+        let piece_id = [0x91; 32];
+        let body = b"repair me";
+        let size = body.len() as i64;
+
+        // Field 16: one a newer satellite added. It signs every field.
+        let mut extra = Vec::new();
+        crate::wire::put_embedded(&mut extra, 16, b"future");
+        let limit_with_extra = |action: PieceAction| {
+            let mut limit = signed_limit(
+                &satellite,
+                &harness.identity,
+                &piece_key,
+                &piece_id,
+                action,
+                size,
+            );
+            let mut signed = storj_uplink::encode_order_limit(&limit);
+            signed.extend_from_slice(&extra);
+            limit.satellite_signature = satellite.hash_and_sign(&signed).unwrap();
+            let mut wire = limit.encode_to_vec();
+            wire.extend_from_slice(&extra);
+            (limit, wire)
+        };
+        let request_with = |limit: &OrderLimit, limit_wire: &[u8]| {
+            let rest = PieceDownloadRequest {
+                limit: None,
+                order: Some(order_for(limit, &piece_key, size)),
+                chunk: Some(piece_download_request::Chunk {
+                    offset: 0,
+                    chunk_size: size,
+                }),
+                maximum_chunk_size: 0,
+            };
+            let mut request = Vec::new();
+            crate::wire::put_embedded(&mut request, 1, limit_wire);
+            request.extend_from_slice(&rest.encode_to_vec());
+            request
+        };
+
+        // The piece was uploaded under such a limit.
+        let (_, stored) = limit_with_extra(PieceAction::Put);
+        let meta = s3store::PieceMeta {
+            hash: [0xab; 32],
+            algorithm: HashAlgorithm::Sha256,
+            created: SystemTime::now(),
+            expires: None,
+            order_limit: stored.clone(),
+            hash_signature: b"sig".to_vec(),
+            hash_timestamp: None,
+        };
+        harness
+            .node
+            .store
+            .put_piece(&sat, &encode_hex(&piece_id), body, meta)
+            .await
+            .unwrap();
+
+        // The field is on the wire but the signature does not cover it.
+        let plain = signed_limit(
+            &satellite,
+            &harness.identity,
+            &piece_key,
+            &piece_id,
+            PieceAction::GetRepair,
+            size,
+        );
+        let mut tampered = plain.encode_to_vec();
+        tampered.extend_from_slice(&extra);
+        let mut conn = harness.conn(&uplink).await;
+        let err = conn
+            .invoke(PIECESTORE_DOWNLOAD, &request_with(&plain, &tampered))
+            .await
+            .expect_err("the extra field is not signed");
+        assert!(
+            err.to_string().contains("invalid order limit signature"),
+            "{err}"
+        );
+
+        let (get, get_wire) = limit_with_extra(PieceAction::GetRepair);
+        let mut conn = harness.conn(&uplink).await;
+        let mut stream = conn.open_stream(PIECESTORE_DOWNLOAD).await.unwrap();
+        conn.send_msg(&mut stream, &request_with(&get, &get_wire))
+            .await
+            .unwrap();
+        // The repairer gets the stored limit back with the field it signed.
+        let header = conn.recv_msg(&stream).await.unwrap();
+        assert_eq!(
+            crate::wire::embedded(&header, 3).unwrap(),
+            stored.as_slice()
+        );
+        let decoded = PieceDownloadResponse::decode(header.as_slice()).unwrap();
+        assert!(decoded.hash.is_some());
+        let chunk = PieceDownloadResponse::decode(conn.recv_msg(&stream).await.unwrap().as_slice())
+            .unwrap();
+        assert_eq!(chunk.chunk.unwrap().data, body);
+        drop(conn);
+
+        // The order is settled with the limit as the satellite signed it.
+        wait_idle(&harness.node).await;
+        let orders = harness.node.store.orders();
+        let saved: Vec<_> = orders
+            .unsent_windows()
+            .unwrap()
+            .into_iter()
+            .flat_map(|(satellite, window)| orders.window(&satellite, window).unwrap())
+            .filter(|order| order.serial == get.serial_number)
+            .collect();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].limit, get_wire);
     }
 
     #[tokio::test]
