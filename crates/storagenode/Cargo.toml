@@ -27,5 +27,9 @@ hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
 s3s = "0.12"
 s3s-fs = "0.12"
 
+[build-dependencies]
+prost-build = "=0.14.4"
+protoc-bin-vendored = "3"
+
 [lints]
 workspace = true

@@ -6,7 +6,8 @@
 //!
 //! Optional: `STORJ_S3_REGION` (`us-east-1`), `STORJ_S3_PREFIX` (`pieces`),
 //! `STORJ_S3_PATH_STYLE` (`true` or `false`), `STORJ_ALLOCATED_BYTES`,
-//! `STORJ_VOLUME` (`/var/lib/storj`).
+//! `STORJ_VOLUME` (`/var/lib/storj`), `STORJ_OPERATOR_WALLET_FEATURES`
+//! (comma-separated).
 
 use std::net::{Ipv4Addr, SocketAddr};
 
@@ -24,7 +25,9 @@ pub struct Config {
     pub operator_email: String,
     /// `STORJ_OPERATOR_WALLET`. `0x` plus 40 hex characters.
     pub operator_wallet: String,
-    /// `STORJ_CONTACT_EXTERNAL_ADDRESS`. Advertised later, at check-in.
+    /// `STORJ_OPERATOR_WALLET_FEATURES`. Empty when the variable is unset.
+    pub wallet_features: Vec<String>,
+    /// `STORJ_CONTACT_EXTERNAL_ADDRESS`. Sent as the check-in address.
     pub contact_external_address: String,
     /// Trusted satellites from `STORJ_SATELLITES` (comma-separated node URLs).
     pub satellites: Vec<NodeUrl>,
@@ -75,6 +78,15 @@ impl Config {
             return Err(Error::Wallet);
         }
         let contact_external_address = required(&get, "STORJ_CONTACT_EXTERNAL_ADDRESS")?;
+        let wallet_features = optional(&get, "STORJ_OPERATOR_WALLET_FEATURES")
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(|part| part.trim().to_owned())
+                    .filter(|part| !part.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
         let satellites = parse_satellites(&required(&get, "STORJ_SATELLITES")?)?;
 
         let region = optional(&get, "STORJ_S3_REGION").unwrap_or_else(|| "us-east-1".to_owned());
@@ -108,6 +120,7 @@ impl Config {
             },
             operator_email,
             operator_wallet,
+            wallet_features,
             contact_external_address,
             satellites,
             listen: SocketAddr::from((Ipv4Addr::UNSPECIFIED, LISTEN_PORT)),
@@ -193,6 +206,7 @@ mod tests {
         ])
         .expect("config");
         assert_eq!(config.operator_email, "op@example.com");
+        assert!(config.wallet_features.is_empty());
         assert_eq!(config.s3.allocated_bytes, 1000);
         assert_eq!(config.s3.path_style, Some(true));
         assert_eq!(config.s3.prefix, "custom");
@@ -217,5 +231,15 @@ mod tests {
         assert!(matches!(err, Error::PathStyle));
         let err = sample(&[("STORJ_SATELLITES", "us1.storj.io:7777")]).unwrap_err();
         assert!(matches!(err, Error::Satellite { .. }), "{err}");
+    }
+
+    #[test]
+    fn splits_wallet_features_and_keeps_known_satellite_ids() {
+        let config =
+            sample(&[("STORJ_OPERATOR_WALLET_FEATURES", "alpha, beta,, gamma ")]).expect("config");
+        assert_eq!(config.wallet_features, ["alpha", "beta", "gamma"]);
+        let config = sample(&[("STORJ_SATELLITES", "saltlake.tardigrade.io:7777")]).expect("known");
+        assert!(!config.satellites[0].id.is_zero());
+        assert_eq!(config.satellites[0].address, "saltlake.tardigrade.io:7777");
     }
 }

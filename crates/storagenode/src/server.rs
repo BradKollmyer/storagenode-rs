@@ -108,7 +108,7 @@ pub struct Node {
     serials: Mutex<HashMap<(NodeId, Vec<u8>), SystemTime>>,
     orders: Orders,
     acceptor: tokio_rustls::TlsAcceptor,
-    /// One X25519 key. Clients learn the public half from check-in, later.
+    /// One X25519 key. Check-in attests the public half.
     noise: Key,
     /// The only Noise IK protocol this process will complete.
     noise_protocol: i32,
@@ -178,6 +178,32 @@ impl Node {
     /// X25519 public key a client passes to `NoiseStream::connect`.
     pub fn noise_public_key(&self) -> &[u8; 32] {
         self.noise.public()
+    }
+
+    /// Leaf private key and certificate chain. Check-in signs with this.
+    pub(crate) fn identity(&self) -> &Identity {
+        &self.identity
+    }
+
+    /// Leaf then CA. `NoiseKeyAttestation.node_certchain` is these bytes.
+    pub(crate) fn noise_certchain(&self) -> &[u8] {
+        &self.noise_certchain
+    }
+
+    /// Trusted satellite id and the address check-in dials.
+    ///
+    /// Only satellites that passed the leaf-signed-by-CA check are present.
+    pub(crate) fn contact_targets(&self) -> Vec<(NodeId, String)> {
+        self.satellites
+            .iter()
+            .map(|(id, sat)| (*id, sat.address.clone()))
+            .collect()
+    }
+
+    /// Free disk reported at check-in: allocation minus the sum of live sizes.
+    pub(crate) fn free_disk(&self) -> Result<i64, s3store::Error> {
+        let free = self.store.space()?.free;
+        Ok(i64::try_from(free).unwrap_or(i64::MAX))
     }
 
     /// This node's id.
@@ -2396,6 +2422,7 @@ mod tests {
             },
             operator_email: "op@example.com".into(),
             operator_wallet: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            wallet_features: Vec::new(),
             contact_external_address: "127.0.0.1:28967".into(),
             satellites: Vec::new(),
             listen: "127.0.0.1:0".parse().unwrap(),
@@ -2454,6 +2481,7 @@ mod tests {
             },
             operator_email: "op@example.com".into(),
             operator_wallet: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            wallet_features: Vec::new(),
             contact_external_address: "127.0.0.1:28967".into(),
             satellites: vec![storj_rpc::NodeUrl {
                 id: satellite,

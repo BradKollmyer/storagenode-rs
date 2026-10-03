@@ -1,12 +1,22 @@
 //! Storage node process: identity on the volume, DRPC, pieces in S3.
 //!
 //! This crate serves `Upload`, `Download`, `Exists`, `Retain`, and `RetainBig`
-//! over TLS, Noise, and QUIC, and settles closed bandwidth-order hours with
-//! the satellite. Check-in is not in this binary yet.
+//! over TLS, Noise, and QUIC, settles closed bandwidth-order hours, and
+//! checks in with each trusted satellite.
 
 #![deny(clippy::undocumented_unsafe_blocks)]
 
+#[allow(clippy::all, dead_code, unused_imports)]
+mod contact {
+    include!(concat!(env!("OUT_DIR"), "/contact.rs"));
+}
+#[allow(clippy::all, dead_code, unused_imports)]
+mod node {
+    include!(concat!(env!("OUT_DIR"), "/node.rs"));
+}
+
 mod bloom;
+mod checkin;
 mod config;
 mod identity;
 mod noise_key;
@@ -118,6 +128,11 @@ pub async fn run(config: Config) -> Result<(), Error> {
     let settling = Arc::clone(&node);
     tokio::spawn(async move {
         settling.serve_orders().await;
+    });
+    let checking = Arc::clone(&node);
+    let operator = checkin::Operator::from_config(&config);
+    tokio::spawn(async move {
+        checkin::serve(checking, operator).await;
     });
     node.serve(listener).await?;
     Ok(())
