@@ -1,10 +1,10 @@
 //! Storage node process: identity on the volume, DRPC, pieces in S3.
 //!
 //! This crate serves `Upload`, `Download`, `Exists`, `Retain`, and `RetainBig`
-//! over TLS, Noise, and QUIC, settles closed bandwidth-order hours, checks in
-//! with each trusted satellite, dials graceful exit for a pending satellite,
-//! polls held amounts and pricing, and serves the Vue dashboard JSON on
-//! `0.0.0.0:14002`.
+//! over TLS, Noise, and QUIC, deletes expired pieces and old trash, settles
+//! closed bandwidth-order hours, checks in with each trusted satellite, dials
+//! graceful exit for a pending satellite, polls held amounts and pricing, and
+//! serves the Vue dashboard JSON on `0.0.0.0:14002`.
 
 #![deny(clippy::undocumented_unsafe_blocks)]
 
@@ -55,7 +55,8 @@ use storj_rpc::{NodeId, NodeUrl};
 /// What the binary should do. No arguments serves the node.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
-    /// Serve DRPC, settlement, check-in, payout polling, and graceful exit.
+    /// Serve DRPC, the piece chore, settlement, check-in, payout polling, and
+    /// graceful exit.
     Run,
     /// Record a pending exit for one trusted satellite id.
     ExitSatellite(String),
@@ -197,6 +198,10 @@ pub async fn run(config: Config) -> Result<(), Error> {
     let settling = Arc::clone(&node);
     tokio::spawn(async move {
         settling.serve_orders().await;
+    });
+    let collecting = Arc::clone(&node);
+    tokio::spawn(async move {
+        collecting.serve_chore().await;
     });
     let checking = Arc::clone(&node);
     let operator = checkin::Operator::from_config(&config);
