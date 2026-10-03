@@ -236,9 +236,10 @@ pub async fn run(config: Config) -> Result<(), Error> {
 /// Records a pending exit for a trusted satellite and the bytes live for it.
 ///
 /// The satellite must be in the configured set and its leaf must be signed by
-/// the CA that hashes to that id. This does not dial the satellite and does
-/// not delete pieces.
-pub fn request_exit(config: &Config, satellite_id: &str) -> Result<s3store::ExitRow, Error> {
+/// the CA that hashes to that id. The satellite is asked first whether this
+/// node is old enough to exit; a refusal, or no answer, records nothing. This
+/// does not delete pieces.
+pub async fn request_exit(config: &Config, satellite_id: &str) -> Result<s3store::ExitRow, Error> {
     let id = NodeId::from_string(satellite_id.trim())
         .map_err(|_| Error::Satellite(format!("satellite id {satellite_id:?} is not a node id")))?;
     if id.is_zero() {
@@ -254,6 +255,14 @@ pub fn request_exit(config: &Config, satellite_id: &str) -> Result<s3store::Exit
     };
     server::accept_satellite(satellite)?;
     let store = s3store::Store::new(config.s3.clone())?;
+    // A second request fails in `begin_exit`. Do not dial for it.
+    if store.exit_row(&id.to_string())?.is_none() {
+        let identity = identity::load(&config.s3.volume)?
+            .ok_or_else(|| Error::Satellite("this volume has no identity to exit with".into()))?;
+        exit::check_feasibility(&identity, id, &satellite.address)
+            .await
+            .map_err(Error::Satellite)?;
+    }
     Ok(store.begin_exit(&id.to_string())?)
 }
 
