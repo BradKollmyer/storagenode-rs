@@ -52,6 +52,14 @@ pub const PIECESTORE_RETAIN_BIG: &str = "/piecestore.Piecestore/RetainBig";
 /// Unix seconds of Go's zero `time.Time` (year 1). Unset on the wire.
 const GO_ZERO_TIME_UNIX: i64 = -62_135_596_800;
 
+/// Budget for the 8-byte prefix, the TLS, Noise, or QUIC handshake, and the
+/// invoke packet. A connection that has not named an RPC by then is closed.
+/// After the invoke, [`Conn`] bounds each read and write on its own.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Pause after a failed `accept`, so a full descriptor table is not a busy loop.
+const ACCEPT_RETRY: Duration = Duration::from_millis(250);
+
 const RPC_CANCELED: u64 = 1;
 const RPC_INVALID_ARGUMENT: u64 = 3;
 const RPC_NOT_FOUND: u64 = 5;
@@ -234,13 +242,23 @@ impl Node {
         TcpListener::bind(addr).await
     }
 
-    /// Accepts until the listener fails. Each connection is one RPC.
+    /// Accepts until the task is dropped. Each connection is one RPC.
+    ///
+    /// An accept error is logged and retried. EMFILE and ECONNABORTED come
+    /// from one connection or from load, and returning here exits the node.
     pub async fn serve(self: Arc<Self>, listener: TcpListener) -> io::Result<()> {
         loop {
-            let (sock, _) = listener.accept().await?;
+            let sock = match listener.accept().await {
+                Ok((sock, _)) => sock,
+                Err(err) => {
+                    eprintln!("storagenode: accept: {err}");
+                    tokio::time::sleep(ACCEPT_RETRY).await;
+                    continue;
+                }
+            };
             let node = Arc::clone(&self);
             tokio::spawn(async move {
-                let _ = node.handle(sock).await;
+                let _ = node.handle(sock, HANDSHAKE_TIMEOUT).await;
             });
         }
     }
@@ -258,48 +276,61 @@ impl Node {
         while let Some(incoming) = endpoint.accept().await {
             let node = Arc::clone(&self);
             tokio::spawn(async move {
-                let _ = node.handle_quic(incoming).await;
+                let _ = node.handle_quic(incoming, HANDSHAKE_TIMEOUT).await;
             });
         }
         Ok(())
     }
 
-    async fn handle(&self, mut sock: TcpStream) -> io::Result<()> {
+    /// `handshake` is the budget up to and including the invoke packet. A
+    /// peer that connects and sends nothing must not hold a descriptor.
+    async fn handle(&self, mut sock: TcpStream, handshake: Duration) -> io::Result<()> {
         let _ = sock.set_nodelay(true);
+        let deadline = tokio::time::Instant::now() + handshake;
         let mut prefix = [0u8; 8];
-        sock.read_exact(&mut prefix).await?;
+        before(deadline, sock.read_exact(&mut prefix)).await?;
         if prefix.as_slice() == DRPC_TLS_MUX_PREFIX {
-            let tls = self.acceptor.accept(sock).await?;
+            let tls = before(deadline, self.acceptor.accept(sock)).await?;
             let peer = peer_node_id(&tls);
-            self.serve_conn(tls, peer, Vec::new()).await?;
+            self.serve_conn(tls, peer, Vec::new(), deadline).await?;
             return Ok(());
         }
         if prefix.as_slice() == storj_rpc::noise::HEADER.as_slice() {
             // The header does not carry the protocol number. One process, one cipher.
-            let io = storj_rpc::noise::NoiseStream::accept(
-                sock,
-                self.noise_protocol,
-                self.noise.private(),
+            let io = before(
+                deadline,
+                storj_rpc::noise::NoiseStream::accept(
+                    sock,
+                    self.noise_protocol,
+                    self.noise.private(),
+                ),
             )
             .await?;
-            self.serve_conn(io, None, self.noise_certchain.clone())
+            self.serve_conn(io, None, self.noise_certchain.clone(), deadline)
                 .await?;
             return Ok(());
         }
         Ok(())
     }
 
-    async fn handle_quic(&self, incoming: quinn::Incoming) -> io::Result<()> {
-        let connection = incoming
-            .await
-            .map_err(|err| io::Error::other(err.to_string()))?;
+    async fn handle_quic(&self, incoming: quinn::Incoming, handshake: Duration) -> io::Result<()> {
+        let deadline = tokio::time::Instant::now() + handshake;
+        let connection = before(deadline, async {
+            incoming
+                .await
+                .map_err(|err| io::Error::other(err.to_string()))
+        })
+        .await?;
         let peer = quic_peer_node_id(&connection);
-        let (send, recv) = connection
-            .accept_bi()
-            .await
-            .map_err(|err| io::Error::other(err.to_string()))?;
+        let (send, recv) = before(deadline, async {
+            connection
+                .accept_bi()
+                .await
+                .map_err(|err| io::Error::other(err.to_string()))
+        })
+        .await?;
         let mut io = self
-            .serve_conn(BiStream { send, recv }, peer, Vec::new())
+            .serve_conn(BiStream { send, recv }, peer, Vec::new(), deadline)
             .await?;
         // RecvStream::drop sends STOP_SENDING unless the peer finished the
         // stream. The uplink still writes its DRPC close after the response,
@@ -321,12 +352,13 @@ impl Node {
         io: T,
         peer: Option<NodeId>,
         node_certchain: Vec<u8>,
+        deadline: tokio::time::Instant,
     ) -> io::Result<T>
     where
         T: AsyncRead + AsyncWrite + Unpin,
     {
         let mut conn = Conn::new(io);
-        let invoke = conn.read_packet().await.map_err(io_err)?;
+        let invoke = before(deadline, async { conn.read_packet().await.map_err(io_err) }).await?;
         if invoke.kind != Kind::INVOKE {
             return Ok(conn.into_inner());
         }
@@ -1097,6 +1129,20 @@ fn quic_server_config(identity: &Identity) -> io::Result<quinn::ServerConfig> {
     transport.keep_alive_interval(Some(Duration::from_secs(15)));
     server.transport_config(Arc::new(transport));
     Ok(server)
+}
+
+/// `fut`, or `TimedOut` once `deadline` passes.
+async fn before<T>(
+    deadline: tokio::time::Instant,
+    fut: impl Future<Output = io::Result<T>>,
+) -> io::Result<T> {
+    match tokio::time::timeout_at(deadline, fut).await {
+        Ok(result) => result,
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "handshake timed out",
+        )),
+    }
 }
 
 fn io_err(err: storj_rpc::Error) -> io::Error {
@@ -2414,6 +2460,32 @@ mod tests {
             .expect("connection should close")
             .unwrap();
         assert_eq!(n, 0);
+    }
+
+    #[tokio::test]
+    async fn silent_connection_is_closed_after_the_handshake_budget() {
+        let satellite = Identity::generate().unwrap();
+        let harness = Harness::start(std::slice::from_ref(&satellite)).await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let budget = Duration::from_millis(50);
+
+        // Nothing at all, then the TLS prefix with no ClientHello after it.
+        for prefix in [None, Some(storj_rpc::DRPC_TLS_MUX_PREFIX)] {
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            if let Some(prefix) = prefix {
+                client.write_all(prefix).await.unwrap();
+            }
+            let (sock, _) = listener.accept().await.unwrap();
+            let err =
+                tokio::time::timeout(Duration::from_secs(5), harness.node.handle(sock, budget))
+                    .await
+                    .expect("the handler must not wait for the peer")
+                    .expect_err("handshake budget");
+            assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "{err}");
+            let mut buf = [0u8; 1];
+            assert_eq!(client.read(&mut buf).await.unwrap(), 0);
+        }
     }
 
     #[test]
