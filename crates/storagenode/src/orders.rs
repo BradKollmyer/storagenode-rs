@@ -165,9 +165,28 @@ impl Orders {
                     failed.insert(satellite);
                 }
                 Some(address) => {
-                    match settle_window(identity, &address, satellite, &orders).await {
-                        Ok(status) => self.archive(db, &orders, status, now),
-                        Err(err) => {
+                    // One corrupt blob is this node's row, not a satellite
+                    // outage. Archiving it here lets the rest of the hour,
+                    // and every later hour, still be sent.
+                    let (good, bad) = split_decodable(orders);
+                    if !bad.is_empty() {
+                        eprintln!(
+                            "storagenode: archived {} undecodable order(s) for {satellite} hour {window}",
+                            bad.len()
+                        );
+                        self.archive(db, &bad, REJECTED, now);
+                    }
+                    if good.is_empty() {
+                        continue;
+                    }
+                    match settle_window(identity, &address, satellite, &good).await {
+                        Ok(status) => self.archive(db, &good, status, now),
+                        Err(SettleError::Decode(err)) => {
+                            eprintln!(
+                                "storagenode: undecodable order for {satellite} hour {window} left unsent: {err}"
+                            );
+                        }
+                        Err(SettleError::Remote(err)) => {
                             eprintln!(
                                 "storagenode: settlement for {satellite} hour {window} left unsent: {err}"
                             );
@@ -282,12 +301,19 @@ fn window_closed(window_start: i64, now: SystemTime) -> bool {
     now > deadline
 }
 
+enum SettleError {
+    /// The stored protobuf cannot be read. The satellite was not dialed.
+    Decode(String),
+    /// Dial or RPC failed. The hour stays unsent.
+    Remote(String),
+}
+
 async fn settle_window(
     identity: &Identity,
     address: &str,
     satellite: NodeId,
     orders: &[StoredOrder],
-) -> Result<i32, String> {
+) -> Result<i32, SettleError> {
     let requests = decode_orders(orders)?;
     let transport = transport::dial(
         identity,
@@ -298,37 +324,57 @@ async fn settle_window(
         None,
     )
     .await
-    .map_err(|err| err.to_string())?;
+    .map_err(|err| SettleError::Remote(err.to_string()))?;
     let mut conn = Conn::new(transport);
     let mut stream = conn
         .open_stream(SETTLEMENT_WITH_WINDOW)
         .await
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| SettleError::Remote(err.to_string()))?;
     for request in &requests {
         conn.send_msg(&mut stream, &request.encode_to_vec())
             .await
-            .map_err(|err| err.to_string())?;
+            .map_err(|err| SettleError::Remote(err.to_string()))?;
     }
     conn.close_send(&mut stream)
         .await
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| SettleError::Remote(err.to_string()))?;
     let bytes = conn
         .recv_msg(&stream)
         .await
-        .map_err(|err| err.to_string())?;
-    let response =
-        SettlementWithWindowResponse::decode(bytes.as_slice()).map_err(|err| err.to_string())?;
+        .map_err(|err| SettleError::Remote(err.to_string()))?;
+    let response = SettlementWithWindowResponse::decode(bytes.as_slice())
+        .map_err(|err| SettleError::Remote(err.to_string()))?;
     match response.status {
         ACCEPTED | REJECTED => Ok(response.status),
-        other => Err(format!("unexpected settlement status {other}")),
+        other => Err(SettleError::Remote(format!(
+            "unexpected settlement status {other}"
+        ))),
     }
 }
 
-fn decode_orders(orders: &[StoredOrder]) -> Result<Vec<SettlementRequest>, String> {
+/// Corrupt rows are separated so one of them cannot hold the satellite's later hours.
+fn split_decodable(orders: Vec<StoredOrder>) -> (Vec<StoredOrder>, Vec<StoredOrder>) {
+    let mut good = Vec::new();
+    let mut bad = Vec::new();
+    for order in orders {
+        let limit_ok = OrderLimit::decode(order.limit.as_slice()).is_ok();
+        let order_ok = Order::decode(order.order.as_slice()).is_ok();
+        if limit_ok && order_ok {
+            good.push(order);
+        } else {
+            bad.push(order);
+        }
+    }
+    (good, bad)
+}
+
+fn decode_orders(orders: &[StoredOrder]) -> Result<Vec<SettlementRequest>, SettleError> {
     let mut requests = Vec::with_capacity(orders.len());
     for order in orders {
-        let limit = OrderLimit::decode(order.limit.as_slice()).map_err(|err| err.to_string())?;
-        let signed = Order::decode(order.order.as_slice()).map_err(|err| err.to_string())?;
+        let limit = OrderLimit::decode(order.limit.as_slice())
+            .map_err(|err| SettleError::Decode(err.to_string()))?;
+        let signed = Order::decode(order.order.as_slice())
+            .map_err(|err| SettleError::Decode(err.to_string()))?;
         requests.push(SettlementRequest {
             limit: Some(limit),
             order: Some(signed),

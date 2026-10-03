@@ -179,7 +179,13 @@ impl Node {
             next_id: 1,
         };
         match self.dispatch(&mut out, peer, &path).await {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                // The client writes Close only after reading the response.
+                // Dropping the socket first turns that write into EPIPE and
+                // fails an RPC that already succeeded.
+                let _ = out.conn.read_packet().await;
+                Ok(())
+            }
             Err(Fail::Proto { code, message }) => {
                 let _ = out.fail(code, &message).await;
                 Ok(())
@@ -393,7 +399,10 @@ impl Node {
         let mut chunk = None;
         let mut authorized: i64 = 0;
         let mut advisory: i32 = 0;
+        // The guard holds the hour shut for this RPC. The order is noted only
+        // after the piece is readable, so a missing piece is not settled.
         let mut tracked = None;
+        let mut early_orders = Vec::new();
         loop {
             let Some(bytes) = out.recv().await? else {
                 return Err(Fail::proto(
@@ -419,9 +428,7 @@ impl Node {
                     return Err(Fail::proto(RPC_INVALID_ARGUMENT, "order before limit"));
                 };
                 authorized = check_order(limit_ref, &order, authorized)?;
-                if let Some(tracked) = tracked.as_mut() {
-                    tracked.note(&order);
-                }
+                early_orders.push(order);
             }
             if let Some(next) = req.chunk {
                 chunk = Some(next);
@@ -475,6 +482,13 @@ impl Node {
                     .map_err(store_err)?,
             )
         };
+        // A later failure can still save the largest order. Nothing before
+        // this point transferred a byte, so those orders are discarded.
+        if let Some(tracked) = tracked.as_mut() {
+            for order in &early_orders {
+                tracked.note(order);
+            }
+        }
         let mut pending = Vec::new();
 
         // GET and GET_AUDIT do not send the hash. GET_REPAIR does, before bytes.
@@ -2726,5 +2740,185 @@ mod tests {
             .unwrap()
             .expect("stranger");
         assert_eq!(archived.status, Some(1));
+    }
+
+    #[tokio::test]
+    async fn download_before_the_piece_is_readable_is_not_settled() {
+        let satellite = Identity::generate().unwrap();
+        let uplink = Identity::generate().unwrap();
+        let harness = Harness::start(std::slice::from_ref(&satellite)).await;
+        let piece_key = PiecePrivateKey::generate();
+        let piece_id = vec![0x61; 32];
+        let body = b"abcd";
+        let put = signed_limit(
+            &satellite,
+            &harness.identity,
+            &piece_key,
+            &piece_id,
+            PieceAction::Put,
+            body.len() as i64,
+        );
+        let mut client = harness
+            .client(&uplink, &satellite)
+            .await
+            .with_hash_algo(PieceHashAlgo::Sha256);
+        client.upload(&put, &piece_key, body).await.expect("upload");
+        wait_idle(&harness.node).await;
+
+        let missing = signed_limit(
+            &satellite,
+            &harness.identity,
+            &piece_key,
+            &[0x62; 32],
+            PieceAction::Get,
+            4,
+        );
+        let mut client = harness.client(&uplink, &satellite).await;
+        let err = client
+            .download(&missing, &piece_key, 0, 4)
+            .await
+            .expect_err("missing piece");
+        assert!(err.to_string().contains("piece not found"), "{err}");
+
+        let past_end = signed_limit(
+            &satellite,
+            &harness.identity,
+            &piece_key,
+            &piece_id,
+            PieceAction::Get,
+            8,
+        );
+        let mut client = harness.client(&uplink, &satellite).await;
+        let err = client
+            .download(&past_end, &piece_key, 0, 8)
+            .await
+            .expect_err("past end");
+        assert!(
+            err.to_string().contains("more data than available"),
+            "{err}"
+        );
+
+        let over = signed_limit(
+            &satellite,
+            &harness.identity,
+            &piece_key,
+            &piece_id,
+            PieceAction::Get,
+            4,
+        );
+        let mut conn = harness.conn(&uplink).await;
+        let mut stream = conn.open_stream(PIECESTORE_DOWNLOAD).await.expect("stream");
+        let request = PieceDownloadRequest {
+            limit: Some(over.clone()),
+            order: Some(order_for(&over, &piece_key, 4)),
+            chunk: Some(piece_download_request::Chunk {
+                offset: 0,
+                chunk_size: 8,
+            }),
+            maximum_chunk_size: 0,
+        };
+        conn.send_msg(&mut stream, &request.encode_to_vec())
+            .await
+            .expect("oversize request");
+        let err = conn.recv_msg(&stream).await.expect_err("oversize");
+        assert!(err.to_string().contains("order limit"), "{err}");
+        wait_idle(&harness.node).await;
+
+        let sat = satellite.node_id().to_string();
+        let db = harness.node.store.orders();
+        assert!(db.status(&sat, &missing.serial_number).unwrap().is_none());
+        assert!(db.status(&sat, &past_end.serial_number).unwrap().is_none());
+        assert!(db.status(&sat, &over.serial_number).unwrap().is_none());
+
+        let get = signed_limit(
+            &satellite,
+            &harness.identity,
+            &piece_key,
+            &piece_id,
+            PieceAction::Get,
+            body.len() as i64,
+        );
+        let mut client = harness.client(&uplink, &satellite).await;
+        let got = client
+            .download(&get, &piece_key, 0, body.len() as i64)
+            .await
+            .expect("get");
+        assert_eq!(got, body);
+        wait_idle(&harness.node).await;
+        let saved = db
+            .status(&sat, &get.serial_number)
+            .unwrap()
+            .expect("get order");
+        assert_eq!(saved.status, None);
+        assert_eq!(saved.amount, body.len() as i64);
+    }
+
+    #[tokio::test]
+    async fn undecodable_order_does_not_block_later_hours() {
+        let satellite = Identity::generate().unwrap();
+        let uplink = Identity::generate().unwrap();
+        let log = SettlementLog::new();
+        let sat_addr = spawn_settlement_satellite(satellite.clone(), Arc::clone(&log));
+        let harness = Harness::start_with(
+            std::slice::from_ref(&satellite),
+            &[&format!("127.0.0.1:{}", sat_addr.port())],
+        )
+        .await;
+        let created = proto_now();
+        let piece_key = PiecePrivateKey::generate();
+        let body = b"paid";
+        let mut put = signed_limit(
+            &satellite,
+            &harness.identity,
+            &piece_key,
+            &[0x71; 32],
+            PieceAction::Put,
+            body.len() as i64,
+        );
+        pin_creation(&mut put, &satellite, created);
+        let mut client = harness
+            .client(&uplink, &satellite)
+            .await
+            .with_hash_algo(PieceHashAlgo::Sha256);
+        client.upload(&put, &piece_key, body).await.expect("upload");
+        wait_idle(&harness.node).await;
+
+        let sat = satellite.node_id().to_string();
+        let window = created.seconds / 3600 * 3600;
+        let db = harness.node.store.orders();
+        db.save(&s3store::StoredOrder {
+            satellite: sat.clone(),
+            serial: vec![7, 7],
+            window_start: window,
+            limit: b"not-a-limit".to_vec(),
+            order: b"not-an-order".to_vec(),
+            amount: 1,
+        })
+        .unwrap();
+        db.save(&s3store::StoredOrder {
+            satellite: sat.clone(),
+            serial: vec![8, 8],
+            window_start: 1_700_000_000,
+            limit: b"not-a-limit".to_vec(),
+            order: b"not-an-order".to_vec(),
+            amount: 1,
+        })
+        .unwrap();
+
+        harness.node.settle_orders(closed_now()).await;
+        let windows = log.windows();
+        assert_eq!(windows.len(), 1, "the readable order is still sent");
+        assert_eq!(windows[0].len(), 1);
+        let sent = windows[0][0].order.as_ref().expect("order");
+        assert_eq!(sent.serial_number, put.serial_number);
+        assert_eq!(sent.amount, body.len() as i64);
+
+        let db = harness.node.store.orders();
+        assert_eq!(
+            db.status(&sat, &put.serial_number).unwrap().unwrap().status,
+            Some(0)
+        );
+        assert_eq!(db.status(&sat, &[7, 7]).unwrap().unwrap().status, Some(1));
+        assert_eq!(db.status(&sat, &[8, 8]).unwrap().unwrap().status, Some(1));
     }
 }
