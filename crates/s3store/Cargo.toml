@@ -10,6 +10,7 @@ publish = false
 [dependencies]
 aws-sdk-s3.workspace = true
 base64 = "0.22"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 thiserror.workspace = true
 time = { version = "0.3", default-features = false, features = ["std", "formatting", "parsing"] }
