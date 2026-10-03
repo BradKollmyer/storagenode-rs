@@ -855,7 +855,11 @@ async fn read_piece(body: &mut PieceBody, pending: &mut Vec<u8>, n: u64) -> Resu
     Ok(pending.drain(..n).collect())
 }
 
-/// The leaf `verify_order_limit` uses, after the CA hashes to the trusted id.
+/// The leaf `verify_order_limit` uses.
+///
+/// The CA must hash to the trusted id and must have signed the leaf.
+/// A leaf whose id is the CA id is rejected even when that certificate is
+/// self-signed.
 fn verified_leaf(satellite: &TrustedSatellite) -> Result<Vec<u8>, BuildError> {
     if satellite.leaf_der.is_empty() || satellite.ca_der.is_empty() {
         return Err(BuildError::Satellite(format!(
@@ -879,7 +883,16 @@ fn verified_leaf(satellite: &TrustedSatellite) -> Result<Vec<u8>, BuildError> {
             satellite.id
         )));
     }
-    Ok(satellite.leaf_der.clone())
+    let mut chain = Vec::with_capacity(satellite.leaf_der.len() + satellite.ca_der.len());
+    chain.extend_from_slice(&satellite.leaf_der);
+    chain.extend_from_slice(&satellite.ca_der);
+    let leaf = storj_rpc::identity::verified_leaf(&chain, satellite.id).map_err(|err| {
+        BuildError::Satellite(format!(
+            "satellite {} leaf is not signed by its CA: {err}",
+            satellite.id
+        ))
+    })?;
+    Ok(leaf.to_vec())
 }
 
 /// Go uses 1 MiB unless the uplink asked for a size strictly between 1 KiB and 1 MiB.
@@ -1719,6 +1732,13 @@ mod tests {
         };
         let err = super::verified_leaf(&ca_as_leaf).unwrap_err();
         assert!(err.to_string().contains("leaf is the CA"), "{err}");
+        let unrelated = TrustedSatellite {
+            id: sat.node_id(),
+            leaf_der: other.leaf_der().as_ref().to_vec(),
+            ca_der: sat.ca_der().as_ref().to_vec(),
+        };
+        let err = super::verified_leaf(&unrelated).unwrap_err();
+        assert!(err.to_string().contains("not signed by its CA"), "{err}");
     }
 
     #[tokio::test]

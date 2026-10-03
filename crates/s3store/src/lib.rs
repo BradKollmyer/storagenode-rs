@@ -420,7 +420,8 @@ impl Store {
     /// the caller has the uplink hash. The copy uses [`Upload::write`]. It
     /// does not build one `Vec` of the piece. The piece commit lock stays
     /// inside [`Upload::finish`]. This function does not delete the piece key
-    /// and does not roll back the row after that lock is released.
+    /// and does not roll back the row after that lock is released. Once the
+    /// piece commit has succeeded, a staging `DeleteObject` error is ignored.
     pub async fn commit_staged_piece(
         &self,
         satellite_id: &str,
@@ -450,14 +451,13 @@ impl Store {
             },
             Err(err) => Err(err),
         };
-        // The staging key is not the piece. Dropping it does not touch the
-        // index. A failed `finish` already restored its own writing row
-        // while it held `commit`.
-        let dropped = delete_object(&self.client, &self.bucket, &stage_key).await;
-        match copied {
-            Ok(()) => dropped,
-            Err(err) => Err(err),
-        }
+        // The piece is live once `finish` returns. The spill delete is
+        // best-effort so a `DeleteObject` error still lets the caller send
+        // the node-signed hash. The key is the staging object. A failed
+        // `finish` already restored its own writing row while it held
+        // `commit`, and that error is the one returned below.
+        let _ = delete_object(&self.client, &self.bucket, &stage_key).await;
+        copied
     }
 
     /// True only for a `live` row.
