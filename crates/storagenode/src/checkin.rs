@@ -10,7 +10,7 @@
 //! (1, unless a test built the node with protocol 2).
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use prost::Message;
 use storj_proto::noise::NoiseKeyAttestation;
@@ -28,6 +28,10 @@ const INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 /// Go `contact.Config.CheckInTimeout` release default.
 const TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+/// Go `monitor.Config.NotifyLowDiskCooldown`. The least time between two
+/// check-ins when the second is asked for by a nearly full node.
+const LOW_SPACE_COOLDOWN: Duration = Duration::from_secs(10 * 60);
 
 /// Go `initialBackOff`.
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
@@ -91,9 +95,29 @@ pub(crate) async fn serve(node: Arc<Node>, operator: Operator) {
                     Ok(free) => retry(&node, &operator, id, &address, free).await,
                     Err(err) => eprintln!("storagenode: check-in {id} disk space: {err}"),
                 }
-                tokio::time::sleep(INTERVAL).await;
+                next_check_in(&node, Instant::now(), INTERVAL, LOW_SPACE_COOLDOWN).await;
             }
         });
+    }
+}
+
+/// Waits out `interval` after the check-in at `last`. Returns sooner when an
+/// upload finds the node low on space, but not within `cooldown` of `last`.
+///
+/// The satellite learns the free space only at check-in. Without this a full
+/// node stays selected, and refuses uploads, for up to the whole interval.
+pub(crate) async fn next_check_in(
+    node: &Node,
+    last: Instant,
+    interval: Duration,
+    cooldown: Duration,
+) {
+    tokio::select! {
+        () = tokio::time::sleep(interval) => {}
+        () = node.low_space() => {
+            let wait = cooldown.saturating_sub(last.elapsed());
+            tokio::time::sleep(wait).await;
+        }
     }
 }
 

@@ -79,6 +79,11 @@ const CHORE_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// Rows retain trashes per sqlite transaction. Other RPCs run in between.
 const RETAIN_BATCH: usize = 1000;
 
+/// Go `piecestore.Config.ReportCapacityThreshold`. An upload that finds less
+/// free space than this asks for a check-in now, so the satellite stops
+/// selecting a node that is about to refuse uploads.
+const REPORT_CAPACITY_THRESHOLD: u64 = 5_000_000_000;
+
 /// How long an upload trusts the last free-space read. The read sums the
 /// index, so it is not repeated per upload; finished uploads are subtracted
 /// from the cached figure in between.
@@ -153,6 +158,8 @@ pub struct Node {
     serials: Mutex<Serials>,
     /// Free allocation as of the last index read, less uploads stored since.
     free_space: Mutex<Option<(Instant, u64)>>,
+    /// Wakes the check-in loops when an upload finds the node low on space.
+    low_space: tokio::sync::Notify,
     orders: Orders,
     acceptor: tokio_rustls::TlsAcceptor,
     /// One X25519 key. Check-in attests the public half.
@@ -210,6 +217,7 @@ impl Node {
             satellites,
             serials: Mutex::new(Serials::default()),
             free_space: Mutex::new(None),
+            low_space: tokio::sync::Notify::new(),
             orders: Orders::new(),
             acceptor: tokio_rustls::TlsAcceptor::from(Arc::new(config)),
             noise,
@@ -256,6 +264,11 @@ impl Node {
             .iter()
             .map(|(id, sat)| (*id, sat.address.clone()))
             .collect()
+    }
+
+    /// Resolves when an upload next finds the node low on space.
+    pub(crate) async fn low_space(&self) {
+        self.low_space.notified().await;
     }
 
     /// Free disk reported at check-in: allocation minus the sum of live sizes.
@@ -1200,6 +1213,9 @@ impl Node {
                 }
             }
         };
+        if free < REPORT_CAPACITY_THRESHOLD {
+            self.low_space.notify_waiters();
+        }
         let need = u64::try_from(limit.limit).unwrap_or(u64::MAX);
         if need > free {
             return Err(Fail::proto(
@@ -3554,6 +3570,54 @@ mod tests {
                 assert!(message.contains("missing piece id"), "{message}");
             }
             other => panic!("expected a status, got {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn low_space_brings_the_next_check_in_forward() {
+        let satellite = Identity::generate().unwrap();
+        let uplink = Identity::generate().unwrap();
+        let piece_key = PiecePrivateKey::generate();
+        let hour = Duration::from_secs(60 * 60);
+        let cooldown = Duration::from_millis(300);
+        // Plenty of space, then an allocation under the 5 GB threshold.
+        for (allocated, woken) in [(1u64 << 40, false), (1 << 30, true)] {
+            let harness =
+                Harness::open_allocated(std::slice::from_ref(&satellite), &[], None, allocated)
+                    .await;
+            let node = Arc::clone(&harness.node);
+            let last = std::time::Instant::now();
+            let waiting = tokio::spawn(async move {
+                crate::checkin::next_check_in(&node, last, hour, cooldown).await;
+            });
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(!waiting.is_finished());
+
+            let put = signed_limit(
+                &satellite,
+                &harness.identity,
+                &piece_key,
+                &[0x71; 32],
+                PieceAction::Put,
+                4,
+            );
+            let mut client = harness.client(&uplink, &satellite).await;
+            client
+                .upload(&put, &piece_key, b"abcd")
+                .await
+                .expect("upload");
+
+            if woken {
+                tokio::time::timeout(Duration::from_secs(5), waiting)
+                    .await
+                    .expect("the upload asked for a check-in")
+                    .unwrap();
+                assert!(last.elapsed() >= cooldown, "the cooldown still applies");
+            } else {
+                tokio::time::sleep(cooldown + Duration::from_millis(200)).await;
+                assert!(!waiting.is_finished(), "no early check-in with space left");
+                waiting.abort();
+            }
         }
     }
 
