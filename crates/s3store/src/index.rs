@@ -19,6 +19,13 @@ use crate::{Error, Result};
 /// How long a trashed piece keeps its object before the chore deletes it.
 pub const TRASH_KEEP: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
+/// How long an expired piece keeps its object before the chore deletes it.
+///
+/// Go `collector.Config.ExpirationGracePeriod`. The satellite and the node do
+/// not share a clock, and a piece deleted before the satellite considers it
+/// expired is a failed audit.
+pub const EXPIRED_KEEP: Duration = Duration::from_secs(60 * 60);
+
 /// File name of the index inside the volume directory.
 pub const PIECES_DB: &str = "pieces.db";
 

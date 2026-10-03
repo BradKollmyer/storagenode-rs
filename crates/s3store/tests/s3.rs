@@ -18,7 +18,8 @@ use s3s::service::S3ServiceBuilder;
 use s3s::{S3, S3Request, S3Response, S3Result, s3_error};
 use s3s_fs::FileSystem;
 use s3store::{
-    Config, Error, HashAlgorithm, PART_SIZE, PIECES_DB, PieceMeta, PieceState, Store, TRASH_KEEP,
+    Config, EXPIRED_KEEP, Error, HashAlgorithm, PART_SIZE, PIECES_DB, PieceMeta, PieceState, Store,
+    TRASH_KEEP,
 };
 
 const ACCESS_KEY: &str = "test-access-key";
@@ -828,13 +829,17 @@ async fn chore_deletes_expired_pieces() {
         .await
         .expect("forever");
 
+    // Expired, but inside the grace the collector leaves for clock skew.
     store
-        .run_chore(expires - Duration::from_secs(1))
+        .run_chore(expires + EXPIRED_KEEP - Duration::from_secs(1))
         .await
-        .expect("before expiry");
+        .expect("inside the grace");
     assert!(store.exists("sat-e", "old").expect("not yet"));
 
-    store.run_chore(expires).await.expect("expire");
+    store
+        .run_chore(expires + EXPIRED_KEEP)
+        .await
+        .expect("expire");
     assert!(store.info("sat-e", "old").expect("info").is_none());
     assert!(matches!(
         store.get("sat-e", "old", None).await,
@@ -844,7 +849,7 @@ async fn chore_deletes_expired_pieces() {
     assert!(store.exists("sat-e", "forever").expect("forever"));
 
     store
-        .run_chore(expires + Duration::from_secs(50))
+        .run_chore(expires + EXPIRED_KEEP + Duration::from_secs(50))
         .await
         .expect("later");
     assert!(store.info("sat-e", "keep").expect("info").is_none());
