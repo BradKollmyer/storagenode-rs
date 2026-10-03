@@ -24,8 +24,8 @@
 mod index;
 
 pub use index::{
-    HashAlgorithm, OrderRows, PIECES_DB, PieceInfo, PieceMeta, PieceState, Space, StoredOrder,
-    StoredOrderStatus, TRASH_KEEP,
+    ExitRow, ExitStatus, HashAlgorithm, OrderRows, PIECES_DB, PieceInfo, PieceMeta, PieceState,
+    Space, StoredOrder, StoredOrderStatus, TRASH_KEEP,
 };
 
 use std::collections::HashMap;
@@ -487,6 +487,68 @@ impl Store {
         self.index.orders()
     }
 
+    /// Records a pending exit and the bytes live for `satellite_id` right now.
+    ///
+    /// Does not delete objects. A second record for the same satellite is an
+    /// error, so a stored receipt is not replaced.
+    pub fn begin_exit(&self, satellite_id: &str) -> Result<ExitRow> {
+        check_id("satellite id", satellite_id)?;
+        self.index.begin_exit(satellite_id)
+    }
+
+    /// Every stored exit, ordered by satellite id.
+    pub fn exit_rows(&self) -> Result<Vec<ExitRow>> {
+        self.index.exit_rows()
+    }
+
+    /// One exit row, or `Ok(None)` when this satellite has none.
+    pub fn exit_row(&self, satellite_id: &str) -> Result<Option<ExitRow>> {
+        check_id("satellite id", satellite_id)?;
+        self.index.exit_row(satellite_id)
+    }
+
+    /// Pending exits. Failed and completed rows are not dialed again.
+    pub fn pending_exits(&self) -> Result<Vec<ExitRow>> {
+        Ok(self
+            .exit_rows()?
+            .into_iter()
+            .filter(|row| row.status == ExitStatus::Pending)
+            .collect())
+    }
+
+    /// Completed exits whose pieces have not been deleted yet.
+    pub fn exits_to_delete(&self) -> Result<Vec<ExitRow>> {
+        Ok(self
+            .exit_rows()?
+            .into_iter()
+            .filter(|row| row.status == ExitStatus::Completed && !row.pieces_deleted)
+            .collect())
+    }
+
+    /// Drops a pending row. The satellite refused the exit.
+    pub fn cancel_exit(&self, satellite_id: &str) -> Result<()> {
+        check_id("satellite id", satellite_id)?;
+        self.index.cancel_exit(satellite_id)
+    }
+
+    /// Stores the failure reason and the encoded `ExitFailed` message.
+    pub fn fail_exit(&self, satellite_id: &str, reason: &str, message: &[u8]) -> Result<()> {
+        check_id("satellite id", satellite_id)?;
+        self.index.fail_exit(satellite_id, reason, message)
+    }
+
+    /// Stores the completion receipt. Does not delete pieces.
+    pub fn complete_exit(&self, satellite_id: &str, receipt: &[u8]) -> Result<()> {
+        check_id("satellite id", satellite_id)?;
+        self.index.complete_exit(satellite_id, receipt)
+    }
+
+    /// Marks a completed exit's pieces deleted. Does not change the receipt.
+    pub fn mark_exit_deleted(&self, satellite_id: &str) -> Result<()> {
+        check_id("satellite id", satellite_id)?;
+        self.index.mark_exit_deleted(satellite_id)
+    }
+
     /// The index row, including `writing` and `trash`. `Ok(None)` when absent.
     pub fn info(&self, satellite_id: &str, piece_id: &str) -> Result<Option<PieceInfo>> {
         check_piece(satellite_id, piece_id)?;
@@ -548,6 +610,83 @@ impl Store {
             }
         }
         Ok(())
+    }
+
+    /// Deletes this satellite's objects and index rows.
+    ///
+    /// The receipt must already be stored. A pending or failed exit returns
+    /// an error and deletes nothing. Trash and live rows both go. Another
+    /// satellite's keys are not listed. One object error does not put a
+    /// deleted row back and does not stop the rest of this satellite.
+    pub async fn delete_satellite(&self, satellite_id: &str) -> Result<()> {
+        check_id("satellite id", satellite_id)?;
+        match self.index.exit_row(satellite_id)? {
+            Some(row) if row.status == ExitStatus::Completed => {}
+            _ => {
+                return Err(Error::Index(
+                    "refusing to delete pieces before the exit receipt is stored".into(),
+                ));
+            }
+        }
+        let mut failed: Option<Error> = None;
+        for piece_id in self.index.piece_ids(satellite_id)? {
+            if let Err(err) = self.delete_exit_piece(satellite_id, &piece_id).await {
+                if failed.is_none() {
+                    failed = Some(err);
+                }
+            }
+        }
+        let prefix = satellite_list_prefix(&self.prefix, satellite_id)?;
+        let mut start_after: Option<String> = None;
+        loop {
+            let page = match self.list_page(&prefix, start_after.as_deref()).await {
+                Ok(page) => page,
+                Err(err) => {
+                    if failed.is_none() {
+                        failed = Some(err);
+                    }
+                    break;
+                }
+            };
+            if page.objects.is_empty() {
+                break;
+            }
+            for object in &page.objects {
+                let Some((sat, piece_id)) = split_object_key(&self.prefix, &object.key) else {
+                    continue;
+                };
+                if sat != satellite_id {
+                    continue;
+                }
+                if let Err(err) = self.delete_exit_piece(satellite_id, &piece_id).await {
+                    if failed.is_none() {
+                        failed = Some(err);
+                    }
+                }
+            }
+            if !page.truncated {
+                break;
+            }
+            let Some(last) = page.objects.last() else {
+                break;
+            };
+            if start_after.as_deref() == Some(last.key.as_str()) {
+                break;
+            }
+            start_after = Some(last.key.clone());
+        }
+        match failed {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
+
+    /// Object and row, while this task holds the commit lock the next writer needs.
+    async fn delete_exit_piece(&self, satellite_id: &str, piece_id: &str) -> Result<()> {
+        let _guard = self.commit.lock().await;
+        let key = object_key(&self.prefix, satellite_id, piece_id)?;
+        delete_object(&self.client, &self.bucket, &key).await?;
+        self.index.delete(satellite_id, piece_id)
     }
 
     /// Starts an upload.
@@ -1420,6 +1559,12 @@ fn from_hex(byte: u8) -> Option<u8> {
     }
 }
 
+/// `{prefix}/{satellite}/`. The trailing slash keeps a longer id out of the list.
+fn satellite_list_prefix(prefix: &str, satellite_id: &str) -> Result<String> {
+    check_id("satellite id", satellite_id)?;
+    Ok(format!("{}{satellite_id}/", list_prefix(prefix)))
+}
+
 fn list_prefix(prefix: &str) -> String {
     let prefix = prefix.trim_matches('/');
     if prefix.is_empty() {
@@ -1595,6 +1740,21 @@ mod tests {
         assert!(!path_style_for("http://127.0.0.1:9000", Some(false)).unwrap());
         assert!(path_style_for("https://s3.amazonaws.com.cn", None).unwrap());
         assert!(path_style_for("not a url", None).is_err());
+    }
+
+    #[test]
+    fn satellite_prefix_does_not_cover_another_id() {
+        assert_eq!(
+            satellite_list_prefix("pieces", "sat").unwrap(),
+            "pieces/sat/"
+        );
+        assert_eq!(
+            split_object_key("pieces", "pieces/sat/piece").unwrap().0,
+            "sat"
+        );
+        assert!(
+            !"pieces/sat-other/piece".starts_with(&satellite_list_prefix("pieces", "sat").unwrap())
+        );
     }
 
     #[test]

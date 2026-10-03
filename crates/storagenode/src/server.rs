@@ -185,6 +185,16 @@ impl Node {
         &self.identity
     }
 
+    /// Piece bucket and `pieces.db`, including graceful-exit rows.
+    pub(crate) fn piece_store(&self) -> &Store {
+        &self.store
+    }
+
+    /// Dial address for a satellite that passed [`accept_satellite`].
+    pub(crate) fn satellite_address(&self, id: NodeId) -> Option<String> {
+        self.satellites.get(&id).map(|sat| sat.address.clone())
+    }
+
     /// Leaf then CA. `NoiseKeyAttestation.node_certchain` is these bytes.
     pub(crate) fn noise_certchain(&self) -> &[u8] {
         &self.noise_certchain
@@ -1257,6 +1267,13 @@ async fn read_piece(body: &mut PieceBody, pending: &mut Vec<u8>, n: u64) -> Resu
         return Err(Fail::proto(RPC_INTERNAL, "short piece read"));
     }
     Ok(pending.drain(..n).collect())
+}
+
+/// The same leaf-signed-by-CA check as check-in. `exit-satellite` calls this
+/// before it records a row.
+pub(crate) fn accept_satellite(satellite: &TrustedSatellite) -> Result<(), BuildError> {
+    verified_leaf(satellite)?;
+    Ok(())
 }
 
 /// The leaf `verify_order_limit` uses.

@@ -53,6 +53,15 @@ CREATE TABLE IF NOT EXISTS orders (
     PRIMARY KEY (satellite, serial)
 );
 CREATE INDEX IF NOT EXISTS orders_window ON orders (satellite, window_start, status);
+
+CREATE TABLE IF NOT EXISTS graceful_exits (
+    satellite TEXT PRIMARY KEY,
+    live_bytes INTEGER NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'failed', 'completed')),
+    reason TEXT,
+    message BLOB,
+    pieces_deleted INTEGER NOT NULL DEFAULT 0
+);
 ";
 
 /// `PRAGMA user_version` written only after a full prefix listing finishes.
@@ -189,6 +198,58 @@ impl PieceInfo {
             state,
         }
     }
+}
+
+/// Pending, failed, or completed graceful exit for one satellite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitStatus {
+    /// `exit-satellite` recorded the row. The chore may dial.
+    Pending,
+    /// The satellite sent `ExitFailed`. Pieces stay. Do not dial again.
+    Failed,
+    /// The satellite sent `ExitCompleted`. The receipt is [`ExitRow::message`].
+    Completed,
+}
+
+impl ExitStatus {
+    /// Value stored in `graceful_exits.status` and printed by `exit-status`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Failed => "failed",
+            Self::Completed => "completed",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "failed" => Ok(Self::Failed),
+            "completed" => Ok(Self::Completed),
+            _ => Err(Error::Index(format!("unknown exit status {value}"))),
+        }
+    }
+}
+
+/// One graceful-exit row. `live_bytes` is the live sum at request time.
+///
+/// [`Self::message`] is the encoded `ExitFailed` or `ExitCompleted`. It stays
+/// after a later object delete fails. [`Self::pieces_deleted`] is set only
+/// once that delete finishes, so a restart can retry it without dialing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExitRow {
+    /// Satellite id, the same string as `pieces.satellite`.
+    pub satellite_id: String,
+    /// Live piece bytes when the exit was requested. Trash is not included.
+    pub live_bytes: u64,
+    /// Pending, failed, or completed.
+    pub status: ExitStatus,
+    /// `ExitFailed.Reason` name. Empty unless [`Self::status`] is failed.
+    pub reason: String,
+    /// Encoded failure or the completion receipt. Empty while pending.
+    pub message: Vec<u8>,
+    /// The satellite prefix and its rows were deleted after the receipt.
+    pub pieces_deleted: bool,
 }
 
 /// Configured allocation and index totals.
@@ -521,6 +582,170 @@ impl Index {
             conn: Arc::clone(&self.conn),
         }
     }
+
+    /// Records a pending exit and the live bytes for `satellite_id` right now.
+    ///
+    /// A second request is an error so a stored failure or receipt is not
+    /// replaced. Failed precondition deletes the row; that satellite can be
+    /// requested again.
+    pub(crate) fn begin_exit(&self, satellite_id: &str) -> Result<ExitRow> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| Error::Index("lock poisoned".into()))?;
+        let exists: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM graceful_exits WHERE satellite = ?1",
+                params![satellite_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(db_err)?;
+        if exists.is_some() {
+            return Err(Error::Index(format!(
+                "graceful exit for {satellite_id} is already recorded"
+            )));
+        }
+        let live: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(size), 0) FROM pieces
+                 WHERE satellite = ?1 AND state = 'live'",
+                params![satellite_id],
+                |row| row.get(0),
+            )
+            .map_err(db_err)?;
+        let live_bytes =
+            u64::try_from(live).map_err(|_| Error::Index("negative live size sum".into()))?;
+        conn.execute(
+            "INSERT INTO graceful_exits (
+                satellite, live_bytes, status, reason, message, pieces_deleted
+             ) VALUES (?1, ?2, 'pending', NULL, NULL, 0)",
+            params![satellite_id, live],
+        )
+        .map_err(db_err)?;
+        Ok(ExitRow {
+            satellite_id: satellite_id.to_owned(),
+            live_bytes,
+            status: ExitStatus::Pending,
+            reason: String::new(),
+            message: Vec::new(),
+            pieces_deleted: false,
+        })
+    }
+
+    pub(crate) fn exit_row(&self, satellite_id: &str) -> Result<Option<ExitRow>> {
+        let raw = self.with(|conn| {
+            conn.query_row(
+                "SELECT satellite, live_bytes, status, reason, message, pieces_deleted
+                 FROM graceful_exits WHERE satellite = ?1",
+                params![satellite_id],
+                RawExit::read,
+            )
+            .optional()
+        })?;
+        raw.map(RawExit::into_row).transpose()
+    }
+
+    pub(crate) fn exit_rows(&self) -> Result<Vec<ExitRow>> {
+        let raw = self.with(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT satellite, live_bytes, status, reason, message, pieces_deleted
+                 FROM graceful_exits ORDER BY satellite",
+            )?;
+            let rows = stmt.query_map([], RawExit::read)?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })?;
+        raw.into_iter().map(RawExit::into_row).collect()
+    }
+
+    /// Drops a pending row. A stored failure or receipt is left in place.
+    pub(crate) fn cancel_exit(&self, satellite_id: &str) -> Result<()> {
+        self.with(|conn| {
+            conn.execute(
+                "DELETE FROM graceful_exits WHERE satellite = ?1 AND status = 'pending'",
+                params![satellite_id],
+            )
+            .map(|_| ())
+        })
+    }
+
+    /// Stores the reason name and the encoded `ExitFailed`. Does not delete pieces.
+    pub(crate) fn fail_exit(&self, satellite_id: &str, reason: &str, message: &[u8]) -> Result<()> {
+        let changed = self.with(|conn| {
+            conn.execute(
+                "UPDATE graceful_exits
+                 SET status = 'failed', reason = ?2, message = ?3
+                 WHERE satellite = ?1 AND status = 'pending'",
+                params![satellite_id, reason, message],
+            )
+        })?;
+        if changed == 0 {
+            return Err(Error::Index(format!(
+                "no pending graceful exit for {satellite_id}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Stores the receipt. A row that is already completed keeps its receipt.
+    pub(crate) fn complete_exit(&self, satellite_id: &str, receipt: &[u8]) -> Result<()> {
+        match self.exit_row(satellite_id)? {
+            Some(row) if row.status == ExitStatus::Completed => Ok(()),
+            Some(row) if row.status == ExitStatus::Pending => {
+                let changed = self.with(|conn| {
+                    conn.execute(
+                        "UPDATE graceful_exits
+                         SET status = 'completed', reason = NULL, message = ?2, pieces_deleted = 0
+                         WHERE satellite = ?1 AND status = 'pending'",
+                        params![satellite_id, receipt],
+                    )
+                })?;
+                if changed == 0 {
+                    return Err(Error::Index(format!(
+                        "no pending graceful exit for {satellite_id}"
+                    )));
+                }
+                Ok(())
+            }
+            _ => Err(Error::Index(format!(
+                "no pending graceful exit for {satellite_id}"
+            ))),
+        }
+    }
+
+    /// The delete finished. The receipt column is not touched.
+    pub(crate) fn mark_exit_deleted(&self, satellite_id: &str) -> Result<()> {
+        let changed = self.with(|conn| {
+            conn.execute(
+                "UPDATE graceful_exits SET pieces_deleted = 1
+                 WHERE satellite = ?1 AND status = 'completed'",
+                params![satellite_id],
+            )
+        })?;
+        if changed == 0 {
+            return Err(Error::Index(format!(
+                "no completed graceful exit for {satellite_id}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Every piece id for one satellite, including `writing` and `trash`.
+    pub(crate) fn piece_ids(&self, satellite_id: &str) -> Result<Vec<String>> {
+        self.with(|conn| {
+            let mut stmt = conn.prepare("SELECT piece_id FROM pieces WHERE satellite = ?1")?;
+            let rows = stmt.query_map(params![satellite_id], |row| row.get::<_, String>(0))?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+    }
 }
 
 fn with_conn<T>(
@@ -686,6 +911,41 @@ impl OrderRows {
 
     fn with<T>(&self, f: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> Result<T> {
         with_conn(&self.conn, f)
+    }
+}
+
+struct RawExit {
+    satellite: String,
+    live_bytes: i64,
+    status: String,
+    reason: Option<String>,
+    message: Option<Vec<u8>>,
+    pieces_deleted: i64,
+}
+
+impl RawExit {
+    fn read(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            satellite: row.get(0)?,
+            live_bytes: row.get(1)?,
+            status: row.get(2)?,
+            reason: row.get(3)?,
+            message: row.get(4)?,
+            pieces_deleted: row.get(5)?,
+        })
+    }
+
+    fn into_row(self) -> Result<ExitRow> {
+        let live_bytes = u64::try_from(self.live_bytes)
+            .map_err(|_| Error::Index("negative exit size".into()))?;
+        Ok(ExitRow {
+            satellite_id: self.satellite,
+            live_bytes,
+            status: ExitStatus::parse(&self.status)?,
+            reason: self.reason.unwrap_or_default(),
+            message: self.message.unwrap_or_default(),
+            pieces_deleted: self.pieces_deleted != 0,
+        })
     }
 }
 

@@ -1,8 +1,8 @@
 //! Storage node process: identity on the volume, DRPC, pieces in S3.
 //!
 //! This crate serves `Upload`, `Download`, `Exists`, `Retain`, and `RetainBig`
-//! over TLS, Noise, and QUIC, settles closed bandwidth-order hours, and
-//! checks in with each trusted satellite.
+//! over TLS, Noise, and QUIC, settles closed bandwidth-order hours, checks in
+//! with each trusted satellite, and dials graceful exit for a pending satellite.
 
 #![deny(clippy::undocumented_unsafe_blocks)]
 
@@ -14,16 +14,22 @@ mod contact {
 mod node {
     include!(concat!(env!("OUT_DIR"), "/node.rs"));
 }
+#[allow(clippy::all, dead_code, unused_imports)]
+mod gracefulexit {
+    include!(concat!(env!("OUT_DIR"), "/gracefulexit.rs"));
+}
 
 mod bloom;
 mod checkin;
 mod config;
+mod exit;
 mod identity;
 mod noise_key;
 mod orders;
 mod server;
 
 pub use config::Config;
+pub use exit::{format_exit_row, format_exit_status};
 pub use identity::{IDENTITY_PEM, load_or_create};
 pub use server::{
     Node, PIECESTORE_EXISTS, PIECESTORE_RETAIN, PIECESTORE_RETAIN_BIG, TrustedSatellite,
@@ -32,7 +38,50 @@ pub use server::{
 use std::path::Path;
 use std::sync::Arc;
 
-use storj_rpc::NodeUrl;
+use storj_rpc::{NodeId, NodeUrl};
+
+/// What the binary should do. No arguments serves the node.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Command {
+    /// Serve DRPC, settlement, check-in, and the graceful-exit chore.
+    Run,
+    /// Record a pending exit for one trusted satellite id.
+    ExitSatellite(String),
+    /// Print the stored exit rows.
+    ExitStatus,
+}
+
+/// `storagenode`, `storagenode exit-satellite <id>`, or `storagenode exit-status`.
+pub fn command<I, S>(args: I) -> Result<Command, String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut args = args.into_iter();
+    match args.next().as_ref().map(|arg| arg.as_ref()) {
+        None => Ok(Command::Run),
+        Some("exit-satellite") => {
+            let Some(id) = args.next() else {
+                return Err("exit-satellite requires a satellite id".into());
+            };
+            if args.next().is_some() {
+                return Err("exit-satellite takes one satellite id".into());
+            }
+            let id = id.as_ref().trim();
+            if id.is_empty() {
+                return Err("exit-satellite requires a satellite id".into());
+            }
+            Ok(Command::ExitSatellite(id.to_owned()))
+        }
+        Some("exit-status") => {
+            if args.next().is_some() {
+                return Err("exit-status takes no arguments".into());
+            }
+            Ok(Command::ExitStatus)
+        }
+        Some(other) => Err(format!("unknown command {other}")),
+    }
+}
 
 /// Failure while starting or serving the node.
 #[derive(Debug, thiserror::Error)]
@@ -134,6 +183,60 @@ pub async fn run(config: Config) -> Result<(), Error> {
     tokio::spawn(async move {
         checkin::serve(checking, operator).await;
     });
+    let exiting = Arc::clone(&node);
+    tokio::spawn(async move {
+        exit::serve(exiting).await;
+    });
     node.serve(listener).await?;
     Ok(())
+}
+
+/// Records a pending exit for a trusted satellite and the bytes live for it.
+///
+/// The satellite must be in the configured set and its leaf must be signed by
+/// the CA that hashes to that id. This does not dial the satellite and does
+/// not delete pieces.
+pub fn request_exit(config: &Config, satellite_id: &str) -> Result<s3store::ExitRow, Error> {
+    let id = NodeId::from_string(satellite_id.trim())
+        .map_err(|_| Error::Satellite(format!("satellite id {satellite_id:?} is not a node id")))?;
+    if id.is_zero() {
+        return Err(Error::Satellite(
+            "satellite id is not a trusted satellite".into(),
+        ));
+    }
+    let trusted = load_satellites(&config.s3.volume, &config.satellites)?;
+    let Some(satellite) = trusted.iter().find(|sat| sat.id == id) else {
+        return Err(Error::Satellite(format!(
+            "satellite {id} is not a trusted satellite"
+        )));
+    };
+    server::accept_satellite(satellite)?;
+    let store = s3store::Store::new(config.s3.clone())?;
+    Ok(store.begin_exit(&id.to_string())?)
+}
+
+/// Prints every stored exit row. Completion is the stored receipt, not a file.
+pub fn exit_status(config: &Config) -> Result<String, Error> {
+    let store = s3store::Store::new(config.s3.clone())?;
+    Ok(exit::format_exit_status(&store.exit_rows()?))
+}
+
+#[cfg(test)]
+mod command_tests {
+    use super::*;
+
+    #[test]
+    fn commands_are_run_exit_satellite_and_exit_status() {
+        assert_eq!(command(std::iter::empty::<&str>()).unwrap(), Command::Run);
+        assert_eq!(
+            command(["exit-satellite", "  abc  "]).unwrap(),
+            Command::ExitSatellite("abc".into())
+        );
+        assert!(command(["exit-satellite"]).is_err());
+        assert!(command(["exit-satellite", "a", "b"]).is_err());
+        assert_eq!(command(["exit-status"]).unwrap(), Command::ExitStatus);
+        assert!(command(["exit-status", "x"]).is_err());
+        let err = command(["dashboard"]).unwrap_err();
+        assert!(err.contains("unknown command"), "{err}");
+    }
 }
