@@ -7,7 +7,7 @@
 //! has no mux header. The server reads with [`Conn::read_packet`]. `invoke`
 //! and `open_stream` are client calls and are not used here.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -125,7 +125,7 @@ pub struct Node {
     /// Satellite id to the leaf that verifies order limits, and its dial address.
     satellites: HashMap<NodeId, KnownSatellite>,
     /// Replay window for this process. Settlement orders are in `pieces.db`.
-    serials: Mutex<HashMap<(NodeId, Vec<u8>), SystemTime>>,
+    serials: Mutex<Serials>,
     orders: Orders,
     acceptor: tokio_rustls::TlsAcceptor,
     /// One X25519 key. Check-in attests the public half.
@@ -181,7 +181,7 @@ impl Node {
             identity,
             store,
             satellites,
-            serials: Mutex::new(HashMap::new()),
+            serials: Mutex::new(Serials::default()),
             orders: Orders::new(),
             acceptor: tokio_rustls::TlsAcceptor::from(Arc::new(config)),
             noise,
@@ -1056,13 +1056,9 @@ impl Node {
         deadline: SystemTime,
     ) -> Result<(), Fail> {
         let mut used = self.serials.lock().unwrap_or_else(|err| err.into_inner());
-        let now = SystemTime::now();
-        used.retain(|_, exp| *exp > now);
-        let key = (satellite, serial.to_vec());
-        if used.contains_key(&key) {
+        if !used.reserve(satellite, serial, deadline, SystemTime::now()) {
             return Err(Fail::proto(RPC_UNAUTHENTICATED, "duplicate serial number"));
         }
-        used.insert(key, deadline);
         Ok(())
     }
 
@@ -1124,6 +1120,45 @@ impl Node {
             self.settle_orders(SystemTime::now()).await;
             tokio::time::sleep(orders::SEND_INTERVAL).await;
         }
+    }
+}
+
+/// Order-limit serials this process has accepted, kept until the order expires.
+///
+/// `by_deadline` holds the same keys in expiry order. Every upload and
+/// download reserves a serial under one lock, so dropping the expired ones
+/// must cost their number, not a scan of every serial still valid.
+#[derive(Default)]
+struct Serials {
+    used: HashSet<([u8; 32], Vec<u8>)>,
+    by_deadline: BTreeSet<(SystemTime, [u8; 32], Vec<u8>)>,
+}
+
+impl Serials {
+    /// False when this satellite's serial is already reserved and its
+    /// deadline is still after `now`.
+    fn reserve(
+        &mut self,
+        satellite: NodeId,
+        serial: &[u8],
+        deadline: SystemTime,
+        now: SystemTime,
+    ) -> bool {
+        while let Some(first) = self.by_deadline.first()
+            && first.0 <= now
+        {
+            let Some((_, satellite, serial)) = self.by_deadline.pop_first() else {
+                break;
+            };
+            self.used.remove(&(satellite, serial));
+        }
+        let satellite = *satellite.as_bytes();
+        if !self.used.insert((satellite, serial.to_vec())) {
+            return false;
+        }
+        self.by_deadline
+            .insert((deadline, satellite, serial.to_vec()));
+        true
     }
 }
 
@@ -1630,8 +1665,8 @@ fn serial_deadline(limit: &OrderLimit, now: SystemTime) -> SystemTime {
 mod tests {
     use super::{
         GO_ZERO_TIME_UNIX, Node, PIECESTORE_EXISTS, PIECESTORE_RESTORE_TRASH, PIECESTORE_RETAIN,
-        PIECESTORE_RETAIN_BIG, RETAIN_MAX_TIME_SKEW, TrustedSatellite, creation_ok, encode_hex,
-        expired, system_to_timestamp,
+        PIECESTORE_RETAIN_BIG, RETAIN_MAX_TIME_SKEW, Serials, TrustedSatellite, creation_ok,
+        encode_hex, expired, system_to_timestamp,
     };
     use std::future::Future;
     use std::net::SocketAddr;
@@ -1911,6 +1946,33 @@ mod tests {
         };
         sign_order(&mut order, key).expect("sign order");
         order
+    }
+
+    #[test]
+    fn serial_is_refused_until_its_deadline_and_then_forgotten() {
+        let sat = Identity::generate().unwrap().node_id();
+        let other = Identity::generate().unwrap().node_id();
+        let t0 = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let soon = t0 + Duration::from_secs(10);
+        let late = t0 + Duration::from_secs(100);
+        let mut serials = Serials::default();
+        assert!(serials.reserve(sat, b"a", soon, t0));
+        assert!(serials.reserve(sat, b"b", late, t0));
+        assert!(!serials.reserve(sat, b"a", late, t0), "replay");
+        // The serial is per satellite.
+        assert!(serials.reserve(other, b"a", late, t0));
+        assert_eq!(serials.used.len(), 3);
+
+        // At its deadline `a` is dropped. `b` and the other satellite stay.
+        assert!(!serials.reserve(sat, b"b", late, soon), "still reserved");
+        assert_eq!(serials.used.len(), 2);
+        assert_eq!(serials.by_deadline.len(), 2);
+        assert!(serials.reserve(sat, b"a", late, soon));
+
+        let end = late + Duration::from_secs(1);
+        assert!(serials.reserve(sat, b"c", end + Duration::from_secs(1), end));
+        assert_eq!(serials.used.len(), 1);
+        assert_eq!(serials.by_deadline.len(), 1);
     }
 
     #[test]
