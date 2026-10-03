@@ -750,8 +750,18 @@ async fn trash_restore_and_chore() {
         .trash("sat-a", "piece-1", trashed_at)
         .await
         .expect("trash");
+    // Trash is kept until the UTC day it was trashed on is TRASH_KEEP old.
+    let day = Duration::from_secs(24 * 60 * 60);
+    let since_epoch = trashed_at.duration_since(UNIX_EPOCH).expect("clock");
+    let day_end = trashed_at + day
+        - Duration::from_secs(since_epoch.as_secs() % day.as_secs())
+        - Duration::from_nanos(u64::from(since_epoch.subsec_nanos()));
     store
-        .run_chore(trashed_at + TRASH_KEEP - Duration::from_secs(1))
+        .run_chore(trashed_at + TRASH_KEEP)
+        .await
+        .expect("seven days after trashing is still too soon");
+    store
+        .run_chore(day_end + TRASH_KEEP - Duration::from_secs(1))
         .await
         .expect("too soon");
     assert!(
@@ -762,7 +772,7 @@ async fn trash_restore_and_chore() {
             .restored_from_trash
     );
     store
-        .run_chore(trashed_at + TRASH_KEEP)
+        .run_chore(day_end + TRASH_KEEP)
         .await
         .expect("empty trash");
     let err = store
