@@ -16,8 +16,15 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::{Error, Result};
 
-/// How long a trashed piece keeps its object before the chore deletes it.
+/// How long a trashed piece keeps its object, counted from the end of the
+/// UTC day it was trashed on.
+///
+/// That is the Go trash: one directory per day, emptied once the whole day
+/// is this old. A piece therefore lives seven to eight days in trash, and
+/// the satellite has at least seven to call `RestoreTrash`.
 pub const TRASH_KEEP: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+const DAY: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// How long an expired piece keeps its object before the chore deletes it.
 ///
@@ -838,7 +845,7 @@ impl Index {
         };
         self.keys(
             "SELECT satellite, piece_id FROM pieces
-             WHERE state = 'trash' AND trashed_at IS NOT NULL AND trashed_at <= ?1",
+             WHERE state = 'trash' AND trashed_at IS NOT NULL AND trashed_at < ?1",
             cutoff,
         )
     }
@@ -856,7 +863,7 @@ impl Index {
             conn.query_row(
                 "SELECT 1 FROM pieces
                  WHERE satellite = ?1 AND piece_id = ?2
-                   AND state = 'trash' AND trashed_at IS NOT NULL AND trashed_at <= ?3",
+                   AND state = 'trash' AND trashed_at IS NOT NULL AND trashed_at < ?3",
                 params![satellite_id, piece_id, cutoff],
                 |_| Ok(()),
             )
@@ -1991,9 +1998,14 @@ fn millis_to_system(millis: i64) -> Result<SystemTime> {
         .ok_or_else(|| Error::Index("timestamp overflow".into()))
 }
 
+/// Start of the UTC day that contains `now - TRASH_KEEP`. Trash from before
+/// that instant was trashed on a day that ended at least [`TRASH_KEEP`] ago.
 fn trash_cutoff(now: SystemTime) -> Option<i64> {
     let cutoff = now.checked_sub(TRASH_KEEP).unwrap_or(UNIX_EPOCH);
-    system_to_millis(cutoff).ok()
+    let since_epoch = cutoff.duration_since(UNIX_EPOCH).ok()?;
+    let into_day = Duration::from_secs(since_epoch.as_secs() % DAY.as_secs())
+        + Duration::from_nanos(u64::from(since_epoch.subsec_nanos()));
+    system_to_millis(cutoff.checked_sub(into_day)?).ok()
 }
 
 #[cfg(test)]
