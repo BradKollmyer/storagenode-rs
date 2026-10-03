@@ -57,6 +57,11 @@ const GO_ZERO_TIME_UNIX: i64 = -62_135_596_800;
 /// After the invoke, [`Conn`] bounds each read and write on its own.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Go `retain.Config.MaxTimeSkew`. Retain keeps a piece stored within this
+/// long before the filter's creation date, in the filter or not. The filter
+/// is built from a database snapshot, and the two clocks are not the same.
+const RETAIN_MAX_TIME_SKEW: Duration = Duration::from_secs(72 * 60 * 60);
+
 /// Pause after a failed `accept`, so a full descriptor table is not a busy loop.
 const ACCEPT_RETRY: Duration = Duration::from_millis(250);
 
@@ -539,11 +544,10 @@ impl Node {
         let meta = PieceMeta {
             hash,
             algorithm: store_algo(algo),
-            created: done
-                .timestamp
-                .as_ref()
-                .and_then(timestamp_to_system)
-                .unwrap_or_else(SystemTime::now),
+            // This node's clock, not the uplink's `done.timestamp`. Retain
+            // compares it with the satellite's filter date, and an uplink
+            // must not be able to date a piece out of, or into, that check.
+            created: SystemTime::now(),
             expires: limit
                 .piece_expiration
                 .as_ref()
@@ -875,16 +879,18 @@ impl Node {
         }
     }
 
-    /// Trashes this satellite's live rows created before `creation_date` when
-    /// the filter does not contain them. The object stays; the 7-day chore
-    /// deletes trash.
+    /// Trashes this satellite's live rows created more than
+    /// [`RETAIN_MAX_TIME_SKEW`] before `creation_date` when the filter does
+    /// not contain them. The object stays; the 7-day chore deletes trash.
     async fn apply_retain(&self, peer: NodeId, req: &RetainRequest) -> Result<(), Fail> {
         check_retain_hash(req.hash_algorithm, &req.filter, &req.hash)?;
         let created_before = req
             .creation_date
             .as_ref()
             .and_then(timestamp_to_system)
-            .ok_or_else(|| Fail::proto(RPC_INVALID_ARGUMENT, "missing creation date"))?;
+            .ok_or_else(|| Fail::proto(RPC_INVALID_ARGUMENT, "missing creation date"))?
+            .checked_sub(RETAIN_MAX_TIME_SKEW)
+            .unwrap_or(UNIX_EPOCH);
         let filter = crate::bloom::Filter::from_bytes(&req.filter)
             .map_err(|err| Fail::proto(RPC_INVALID_ARGUMENT, err.to_string()))?;
         let sat = peer.to_string();
@@ -1565,7 +1571,8 @@ fn serial_deadline(limit: &OrderLimit, now: SystemTime) -> SystemTime {
 mod tests {
     use super::{
         GO_ZERO_TIME_UNIX, Node, PIECESTORE_EXISTS, PIECESTORE_RETAIN, PIECESTORE_RETAIN_BIG,
-        TrustedSatellite, creation_ok, encode_hex, expired, system_to_timestamp,
+        RETAIN_MAX_TIME_SKEW, TrustedSatellite, creation_ok, encode_hex, expired,
+        system_to_timestamp,
     };
     use std::future::Future;
     use std::net::SocketAddr;
@@ -2663,7 +2670,9 @@ mod tests {
         let sat = satellite.node_id().to_string();
         let other_id = other.node_id().to_string();
         let cutoff = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
-        let old = cutoff - Duration::from_secs(60);
+        // The filter date minus the skew margin is the real boundary.
+        let edge = cutoff - RETAIN_MAX_TIME_SKEW;
+        let old = edge - Duration::from_secs(60);
         // seed 0, one hash, 8-byte table: 0x01 is in the set and 0x02 is not.
         let keep_id = [0x01; 32];
         let drop_id = [0x02; 32];
@@ -2679,8 +2688,10 @@ mod tests {
 
         put_piece_at(&harness.node.store, &sat, &keep_id, old, b"keep").await;
         put_piece_at(&harness.node.store, &sat, &drop_id, old, b"drop-me").await;
-        put_piece_at(&harness.node.store, &sat, &fresh_id, cutoff, b"fresh").await;
-        put_piece_at(&harness.node.store, &sat, &boundary_id, cutoff, b"edge").await;
+        // Before the filter date, but inside the margin. Not in the filter.
+        let fresh = cutoff - Duration::from_secs(60);
+        put_piece_at(&harness.node.store, &sat, &fresh_id, fresh, b"fresh").await;
+        put_piece_at(&harness.node.store, &sat, &boundary_id, edge, b"edge").await;
         put_piece_at(&harness.node.store, &other_id, &other_piece, old, b"other").await;
         put_piece_at(&harness.node.store, &sat, &already_id, old, b"gone").await;
         let trashed_at = old + Duration::from_secs(5);
