@@ -98,7 +98,7 @@ async fn delete_finished(node: &Node) -> Result<(), String> {
 ///
 /// The receipt is already committed. A delete error leaves it in place.
 /// [`Store::delete_satellite`] sets `pieces_deleted` while it still holds
-/// `commit` and the index is empty.
+/// every commit lock and the index is empty.
 pub(crate) async fn delete_pieces(store: &Store, satellite_id: &str) -> Result<(), String> {
     store
         .delete_satellite(satellite_id)
