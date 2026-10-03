@@ -698,6 +698,26 @@ impl Store {
         }
     }
 
+    /// Flags many pieces of one satellite as trash in one index transaction,
+    /// and returns how many changed. This is retain's write.
+    ///
+    /// Only a row that is still live and was created before `created_before`
+    /// changes, so a piece rewritten since [`Self::live_created_before`]
+    /// listed it is left alone. No commit lock is taken: each row changes in
+    /// one statement, a `writing` row is skipped, and a chore delete that
+    /// already holds the key removes the row whichever state it is in.
+    pub fn trash_created_before(
+        &self,
+        satellite_id: &str,
+        piece_ids: &[String],
+        created_before: SystemTime,
+        at: SystemTime,
+    ) -> Result<u64> {
+        check_id("satellite id", satellite_id)?;
+        self.index
+            .trash_created_before(satellite_id, piece_ids, created_before, at)
+    }
+
     /// Clears trash for one piece. False when the row is not trash, which
     /// includes a row the chore already deleted.
     ///

@@ -719,6 +719,40 @@ impl Index {
         Ok(changed > 0)
     }
 
+    /// Marks rows of one satellite trash in one transaction, and returns how
+    /// many changed.
+    ///
+    /// A row changes only while it is live and created before
+    /// `created_before`. A piece rewritten after the caller listed it has a
+    /// later `created_at` and is left alone. Trash keeps its `trashed_at`.
+    pub(crate) fn trash_created_before(
+        &self,
+        satellite_id: &str,
+        piece_ids: &[String],
+        created_before: SystemTime,
+        at: SystemTime,
+    ) -> Result<u64> {
+        let before = system_to_millis(created_before)?;
+        let at = system_to_millis(at)?;
+        let changed = self.with(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let mut changed = 0usize;
+            {
+                let mut stmt = tx.prepare(
+                    "UPDATE pieces SET state = 'trash', trashed_at = ?3
+                     WHERE satellite = ?1 AND piece_id = ?2 AND state = 'live'
+                       AND created_at < ?4",
+                )?;
+                for piece_id in piece_ids {
+                    changed += stmt.execute(params![satellite_id, piece_id, at, before])?;
+                }
+            }
+            tx.commit()?;
+            Ok(changed)
+        })?;
+        u64::try_from(changed).map_err(|_| Error::Index("trash count overflow".into()))
+    }
+
     /// Marks one trash row live. False when the row is not trash.
     pub(crate) fn restore_piece(&self, satellite_id: &str, piece_id: &str) -> Result<bool> {
         let changed = self.with(|conn| {
@@ -2055,6 +2089,50 @@ mod tests {
         let index = Index::open(&path).unwrap();
         assert!(index.rebuild_done().unwrap());
         assert!(index.is_expired("sat", "old", expires).unwrap());
+    }
+
+    #[test]
+    fn batch_trash_takes_only_live_rows_older_than_the_cutoff() {
+        let (_dir, path) = temp_db();
+        let index = Index::open(&path).unwrap();
+        let created = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        for piece in ["old", "already", "writing", "rewritten"] {
+            let info = PieceInfo::from_meta("sat", piece, 1, &meta(None), PieceState::Live);
+            index.upsert(&info).unwrap();
+        }
+        index
+            .upsert(&PieceInfo::from_meta(
+                "other",
+                "old",
+                1,
+                &meta(None),
+                PieceState::Live,
+            ))
+            .unwrap();
+        let first = created + Duration::from_secs(5);
+        assert!(index.trash("sat", "already", first).unwrap());
+        let writing = PieceInfo::from_meta("sat", "writing", 1, &meta(None), PieceState::Writing);
+        index.upsert(&writing).unwrap();
+        // Rewritten after the caller listed it: created at the cutoff, not before.
+        let cutoff = created + Duration::from_secs(60);
+        let mut later = meta(None);
+        later.created = cutoff;
+        let rewritten = PieceInfo::from_meta("sat", "rewritten", 1, &later, PieceState::Live);
+        index.upsert(&rewritten).unwrap();
+
+        let ids: Vec<String> = ["old", "already", "writing", "rewritten", "absent"]
+            .map(str::to_owned)
+            .into();
+        let at = cutoff + Duration::from_secs(1);
+        let changed = index.trash_created_before("sat", &ids, cutoff, at).unwrap();
+        assert_eq!(changed, 1);
+        let state = |sat: &str, piece: &str| index.get(sat, piece).unwrap().unwrap();
+        assert_eq!(state("sat", "old").state, PieceState::Trash);
+        assert_eq!(state("sat", "old").trashed_at, Some(at));
+        assert_eq!(state("sat", "already").trashed_at, Some(first));
+        assert_eq!(state("sat", "writing").state, PieceState::Writing);
+        assert_eq!(state("sat", "rewritten").state, PieceState::Live);
+        assert_eq!(state("other", "old").state, PieceState::Live);
     }
 
     #[test]

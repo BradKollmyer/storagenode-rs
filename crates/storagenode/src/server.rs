@@ -69,6 +69,9 @@ const RETAIN_MAX_TIME_SKEW: Duration = Duration::from_secs(72 * 60 * 60);
 /// this often.
 const CHORE_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
+/// Rows retain trashes per sqlite transaction. Other RPCs run in between.
+const RETAIN_BATCH: usize = 1000;
+
 /// Pause after a failed `accept`, so a full descriptor table is not a busy loop.
 const ACCEPT_RETRY: Duration = Duration::from_millis(250);
 
@@ -918,18 +921,20 @@ impl Node {
             .store
             .live_created_before(&sat, created_before)
             .map_err(store_err)?;
-        let now = SystemTime::now();
+        let mut rejected = Vec::new();
         for piece_id in pieces {
-            let raw = decode_piece_id(&piece_id)?;
-            if filter.contains(&raw) {
-                continue;
+            if !filter.contains(&decode_piece_id(&piece_id)?) {
+                rejected.push(piece_id);
             }
-            match self.store.trash(&sat, &piece_id, now).await {
-                Ok(()) => {}
-                // Gone, or no longer live, between the list and the flag.
-                Err(s3store::Error::NotFound) => {}
-                Err(err) => return Err(store_err(err)),
-            }
+        }
+        // One transaction per batch, not one commit per piece. A row that is
+        // gone, or no longer live, between the list and the flag is skipped.
+        let now = SystemTime::now();
+        for batch in rejected.chunks(RETAIN_BATCH) {
+            self.store
+                .trash_created_before(&sat, batch, created_before, now)
+                .map_err(store_err)?;
+            tokio::task::yield_now().await;
         }
         Ok(())
     }
