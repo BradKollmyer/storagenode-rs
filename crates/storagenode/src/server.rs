@@ -12,7 +12,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -144,7 +144,10 @@ pub enum BuildError {
 }
 
 struct KnownSatellite {
-    leaf: Vec<u8>,
+    /// The certificate that signs this satellite's order limits. It starts
+    /// as the leaf in `satellites/{id}.pem` and follows the satellite when
+    /// it rotates: see [`Node::observe_satellite_leaf`].
+    leaf: RwLock<Vec<u8>>,
     address: String,
 }
 
@@ -205,7 +208,7 @@ impl Node {
             satellites.insert(
                 satellite.id,
                 KnownSatellite {
-                    leaf,
+                    leaf: RwLock::new(leaf),
                     address: satellite.address,
                 },
             );
@@ -264,6 +267,43 @@ impl Node {
             .iter()
             .map(|(id, sat)| (*id, sat.address.clone()))
             .collect()
+    }
+
+    /// Takes the leaf a satellite presented on a connection this node dialed.
+    ///
+    /// The dial is pinned to the satellite's node id, so TLS has already
+    /// checked that the leaf is signed by the CA that hashes to `id`. When
+    /// it differs from the leaf this node holds, the satellite has rotated
+    /// its certificate, and its order limits are signed by the new one. The
+    /// Go node gets the same result by resolving the identity over a dial.
+    /// Without this every upload, download, and audit from that satellite is
+    /// refused until the operator replaces the PEM file.
+    pub(crate) fn observe_satellite_leaf(&self, id: NodeId, leaf: &[u8]) {
+        let Some(known) = self.satellites.get(&id) else {
+            return;
+        };
+        if leaf.is_empty() {
+            return;
+        }
+        let mut held = known.leaf.write().unwrap_or_else(|err| err.into_inner());
+        if held.as_slice() != leaf {
+            eprintln!(
+                "storagenode: satellite {id} presented a new certificate; its order limits are now verified with it"
+            );
+            *held = leaf.to_vec();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn satellite_leaf(&self, id: NodeId) -> Option<Vec<u8>> {
+        let known = self.satellites.get(&id)?;
+        Some(
+            known
+                .leaf
+                .read()
+                .unwrap_or_else(|err| err.into_inner())
+                .clone(),
+        )
     }
 
     /// Resolves when an upload next finds the node low on space.
@@ -1180,13 +1220,18 @@ impl Node {
         let Some(known) = self.satellites.get(&satellite_id) else {
             return Err(Fail::proto(RPC_PERMISSION_DENIED, "untrusted satellite"));
         };
-        if known.leaf.is_empty() {
+        let leaf = known
+            .leaf
+            .read()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone();
+        if leaf.is_empty() {
             return Err(Fail::proto(
                 RPC_UNAUTHENTICATED,
                 "satellite certificate is not known",
             ));
         }
-        verify_order_limit(limit, &known.leaf)
+        verify_order_limit(limit, &leaf)
             .map_err(|_| Fail::proto(RPC_UNAUTHENTICATED, "invalid order limit signature"))?;
         self.reserve_serial(
             satellite_id,
@@ -3619,6 +3664,75 @@ mod tests {
                 waiting.abort();
             }
         }
+    }
+
+    #[tokio::test]
+    async fn order_limits_follow_a_rotated_satellite_leaf() {
+        let satellite = Identity::generate().unwrap();
+        // Stands in for the satellite's new leaf. In the node the TLS dial
+        // has checked it against the satellite's CA before it gets here.
+        let rotated = Identity::generate().unwrap();
+        let uplink = Identity::generate().unwrap();
+        let harness = Harness::start(std::slice::from_ref(&satellite)).await;
+        let piece_key = PiecePrivateKey::generate();
+        let limit_signed_by = |signer: &Identity, piece_id: [u8; 32]| {
+            let mut limit = signed_limit(
+                &satellite,
+                &harness.identity,
+                &piece_key,
+                &piece_id,
+                PieceAction::Put,
+                4,
+            );
+            sign_order_limit(&mut limit, signer).expect("sign limit");
+            limit
+        };
+
+        let mut client = harness.client(&uplink, &rotated).await;
+        let err = client
+            .upload(&limit_signed_by(&rotated, [0x81; 32]), &piece_key, b"abcd")
+            .await
+            .expect_err("signed by a leaf the node does not hold");
+        assert!(
+            err.to_string().contains("invalid order limit signature"),
+            "{err}"
+        );
+
+        harness
+            .node
+            .observe_satellite_leaf(satellite.node_id(), rotated.leaf_der().as_ref());
+        let mut client = harness.client(&uplink, &rotated).await;
+        client
+            .upload(&limit_signed_by(&rotated, [0x82; 32]), &piece_key, b"abcd")
+            .await
+            .expect("the new leaf signs limits now");
+
+        let mut client = harness.client(&uplink, &satellite).await;
+        let err = client
+            .upload(
+                &limit_signed_by(&satellite, [0x83; 32]),
+                &piece_key,
+                b"abcd",
+            )
+            .await
+            .expect_err("the old leaf no longer signs limits");
+        assert!(
+            err.to_string().contains("invalid order limit signature"),
+            "{err}"
+        );
+
+        // An id this node does not trust, and an empty leaf, change nothing.
+        harness
+            .node
+            .observe_satellite_leaf(rotated.node_id(), rotated.leaf_der().as_ref());
+        harness
+            .node
+            .observe_satellite_leaf(satellite.node_id(), &[]);
+        assert_eq!(
+            harness.node.satellite_leaf(satellite.node_id()).unwrap(),
+            rotated.leaf_der().as_ref()
+        );
+        assert!(harness.node.satellite_leaf(rotated.node_id()).is_none());
     }
 
     #[tokio::test]
