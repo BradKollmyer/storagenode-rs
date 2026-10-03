@@ -181,12 +181,7 @@ impl Orders {
                     }
                     match settle_window(identity, &address, satellite, &good).await {
                         Ok(status) => self.archive(db, &good, status, now),
-                        Err(SettleError::Decode(err)) => {
-                            eprintln!(
-                                "storagenode: undecodable order for {satellite} hour {window} left unsent: {err}"
-                            );
-                        }
-                        Err(SettleError::Remote(err)) => {
+                        Err(err) => {
                             eprintln!(
                                 "storagenode: settlement for {satellite} hour {window} left unsent: {err}"
                             );
@@ -301,19 +296,12 @@ fn window_closed(window_start: i64, now: SystemTime) -> bool {
     now > deadline
 }
 
-enum SettleError {
-    /// The stored protobuf cannot be read. The satellite was not dialed.
-    Decode(String),
-    /// Dial or RPC failed. The hour stays unsent.
-    Remote(String),
-}
-
 async fn settle_window(
     identity: &Identity,
     address: &str,
     satellite: NodeId,
     orders: &[StoredOrder],
-) -> Result<i32, SettleError> {
+) -> Result<i32, String> {
     let requests = decode_orders(orders)?;
     let transport = transport::dial(
         identity,
@@ -324,31 +312,29 @@ async fn settle_window(
         None,
     )
     .await
-    .map_err(|err| SettleError::Remote(err.to_string()))?;
+    .map_err(|err| err.to_string())?;
     let mut conn = Conn::new(transport);
     let mut stream = conn
         .open_stream(SETTLEMENT_WITH_WINDOW)
         .await
-        .map_err(|err| SettleError::Remote(err.to_string()))?;
+        .map_err(|err| err.to_string())?;
     for request in &requests {
         conn.send_msg(&mut stream, &request.encode_to_vec())
             .await
-            .map_err(|err| SettleError::Remote(err.to_string()))?;
+            .map_err(|err| err.to_string())?;
     }
     conn.close_send(&mut stream)
         .await
-        .map_err(|err| SettleError::Remote(err.to_string()))?;
+        .map_err(|err| err.to_string())?;
     let bytes = conn
         .recv_msg(&stream)
         .await
-        .map_err(|err| SettleError::Remote(err.to_string()))?;
-    let response = SettlementWithWindowResponse::decode(bytes.as_slice())
-        .map_err(|err| SettleError::Remote(err.to_string()))?;
+        .map_err(|err| err.to_string())?;
+    let response =
+        SettlementWithWindowResponse::decode(bytes.as_slice()).map_err(|err| err.to_string())?;
     match response.status {
         ACCEPTED | REJECTED => Ok(response.status),
-        other => Err(SettleError::Remote(format!(
-            "unexpected settlement status {other}"
-        ))),
+        other => Err(format!("unexpected settlement status {other}")),
     }
 }
 
@@ -368,13 +354,11 @@ fn split_decodable(orders: Vec<StoredOrder>) -> (Vec<StoredOrder>, Vec<StoredOrd
     (good, bad)
 }
 
-fn decode_orders(orders: &[StoredOrder]) -> Result<Vec<SettlementRequest>, SettleError> {
+fn decode_orders(orders: &[StoredOrder]) -> Result<Vec<SettlementRequest>, String> {
     let mut requests = Vec::with_capacity(orders.len());
     for order in orders {
-        let limit = OrderLimit::decode(order.limit.as_slice())
-            .map_err(|err| SettleError::Decode(err.to_string()))?;
-        let signed = Order::decode(order.order.as_slice())
-            .map_err(|err| SettleError::Decode(err.to_string()))?;
+        let limit = OrderLimit::decode(order.limit.as_slice()).map_err(|err| err.to_string())?;
+        let signed = Order::decode(order.order.as_slice()).map_err(|err| err.to_string())?;
         requests.push(SettlementRequest {
             limit: Some(limit),
             order: Some(signed),
