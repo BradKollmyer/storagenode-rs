@@ -33,9 +33,6 @@ pub(crate) const GET_ALL_PAYMENTS: &str = "/heldamount.HeldAmount/GetAllPayments
 /// `/nodestats.NodeStats/GetStats`.
 pub(crate) const GET_STATS: &str = "/nodestats.NodeStats/GetStats";
 
-/// `/nodestats.NodeStats/DailyStorageUsage`.
-pub(crate) const DAILY_STORAGE_USAGE: &str = "/nodestats.NodeStats/DailyStorageUsage";
-
 /// `/nodestats.NodeStats/PricingModel`.
 pub(crate) const PRICING_MODEL: &str = "/nodestats.NodeStats/PricingModel";
 
@@ -100,9 +97,6 @@ async fn poll_one(node: &Node, id: NodeId, address: &str, timeout: Duration) -> 
         errors.push(err);
     }
     if let Err(err) = fetch_stats(node, id, address, timeout).await {
-        errors.push(err);
-    }
-    if let Err(err) = fetch_daily_storage(node, id, address, timeout).await {
         errors.push(err);
     }
     if let Err(err) = fetch_pricing(node, id, address, timeout).await {
@@ -282,30 +276,6 @@ async fn fetch_stats(
     node.piece_store()
         .upsert_stats(&row)
         .map_err(|err| err.to_string())
-}
-
-async fn fetch_daily_storage(
-    node: &Node,
-    id: NodeId,
-    address: &str,
-    timeout: Duration,
-) -> Result<(), String> {
-    let (start, end) = month_bounds(SystemTime::now());
-    // The estimate uses local bytes, not this reply. There is no second usage table.
-    let _: crate::nodestats::DailyStorageUsageResponse = invoke(
-        node,
-        id,
-        address,
-        DAILY_STORAGE_USAGE,
-        &crate::nodestats::DailyStorageUsageRequest {
-            from: Some(Timestamp::from(start)),
-            to: Some(Timestamp::from(end)),
-        },
-        timeout,
-    )
-    .await
-    .map_err(rpc_message)?;
-    Ok(())
 }
 
 async fn fetch_pricing(
@@ -595,16 +565,6 @@ pub(crate) fn previous_month(now: SystemTime) -> SystemTime {
     SystemTime::from(prev)
 }
 
-fn month_bounds(now: SystemTime) -> (SystemTime, SystemTime) {
-    let Some(dt) = utc(now) else {
-        return (UNIX_EPOCH, UNIX_EPOCH);
-    };
-    (
-        SystemTime::from(month_begin_dt(dt)),
-        SystemTime::from(month_end_dt(dt)),
-    )
-}
-
 fn period_of(ts: Option<&Timestamp>) -> Result<String, String> {
     let Some(ts) = ts else {
         return Err("paystub period is missing".into());
@@ -843,7 +803,6 @@ mod tests {
                 GET_ALL_PAYMENTS,
                 GET_PAYMENT,
                 GET_STATS,
-                DAILY_STORAGE_USAGE,
                 PRICING_MODEL,
             ]
         );
@@ -1350,9 +1309,6 @@ mod tests {
             .encode_to_vec()),
             GET_PAYMENT => Ok(sample_payment(period, created).encode_to_vec()),
             GET_STATS => Ok(sample_stats(period).encode_to_vec()),
-            DAILY_STORAGE_USAGE => {
-                Ok(crate::nodestats::DailyStorageUsageResponse::default().encode_to_vec())
-            }
             PRICING_MODEL => Ok(crate::nodestats::PricingModelResponse {
                 egress_bandwidth_price: 20,
                 repair_bandwidth_price: 10,
