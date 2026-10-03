@@ -53,7 +53,7 @@ Pieces under 5 MiB use one `PutObject` (a normal share is about 2 MiB). Larger p
 - Region defaults to `us-east-1`.
 - Static access key and secret. The secret is not logged.
 
-`Exists` sees `live` rows only. Trash is an index flag, not a second key. A chore deletes the S3 object once `trashed_at` is older than 7 days, and deletes rows past `expires_at`. `RestoreTrash` clears `trashed_at` for that satellite while the object is still there. A download of a trashed piece during that window still succeeds and reports restored-from-trash.
+`Exists` sees `live` rows only. Trash is an index flag, not a second key. A chore deletes the S3 object once `trashed_at` is older than 7 days, and deletes rows past `expires_at`. `RestoreTrash` clears `trashed_at` for that satellite while the object is still there. A download of a trashed piece during that window still succeeds, puts that piece back to `live`, and reports restored-from-trash.
 
 Space is not `statfs`. Configured allocation minus the sum of live sizes is the free space reported at check-in.
 

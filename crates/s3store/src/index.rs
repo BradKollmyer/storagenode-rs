@@ -719,6 +719,18 @@ impl Index {
         Ok(changed > 0)
     }
 
+    /// Marks one trash row live. False when the row is not trash.
+    pub(crate) fn restore_piece(&self, satellite_id: &str, piece_id: &str) -> Result<bool> {
+        let changed = self.with(|conn| {
+            conn.execute(
+                "UPDATE pieces SET state = 'live', trashed_at = NULL
+                 WHERE satellite = ?1 AND piece_id = ?2 AND state = 'trash'",
+                params![satellite_id, piece_id],
+            )
+        })?;
+        Ok(changed > 0)
+    }
+
     pub(crate) fn restore_trash(&self, satellite_id: &str) -> Result<u64> {
         let changed = self.with(|conn| {
             conn.execute(
@@ -2016,6 +2028,7 @@ mod tests {
         assert_eq!(index.sums().unwrap(), (0, 10));
         assert!(!index.exists_live("sat", "piece").unwrap());
 
+        assert!(!index.restore_piece("sat", "missing").unwrap());
         assert_eq!(index.restore_trash("other").unwrap(), 0);
         assert_eq!(index.restore_trash("sat").unwrap(), 1);
         assert!(index.exists_live("sat", "piece").unwrap());

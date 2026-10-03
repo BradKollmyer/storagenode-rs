@@ -161,7 +161,8 @@ pub struct Download {
     pub bytes: Vec<u8>,
     /// The row was trash and the object is still in the bucket.
     ///
-    /// The download does not clear the flag. [`Store::restore_trash`] does.
+    /// The download does not clear the flag. [`Store::restore_piece`] and
+    /// [`Store::restore_trash`] do.
     pub restored_from_trash: bool,
 }
 
@@ -563,6 +564,17 @@ impl Store {
             Some(info) if info.state == PieceState::Trash => Ok(()),
             _ => Err(Error::NotFound),
         }
+    }
+
+    /// Clears trash for one piece. False when the row is not trash, which
+    /// includes a row the chore already deleted.
+    ///
+    /// The piecestore download calls this once the object has opened: a
+    /// piece somebody still reads was trashed by mistake.
+    pub async fn restore_piece(&self, satellite_id: &str, piece_id: &str) -> Result<bool> {
+        check_piece(satellite_id, piece_id)?;
+        let _guard = self.commit.lock().await;
+        self.index.restore_piece(satellite_id, piece_id)
     }
 
     /// Clears trash for one satellite. Rows whose objects were already

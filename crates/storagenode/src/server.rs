@@ -690,7 +690,6 @@ impl Node {
                 "requested more data than available",
             ));
         }
-        let restored = info.state == PieceState::Trash;
         let mut body = if size == 0 {
             None
         } else {
@@ -701,6 +700,17 @@ impl Node {
                     .map_err(store_err)?,
             )
         };
+        // A trashed piece that is still wanted goes back to live, as in the
+        // Go node. Telling the peer it was restored and leaving the row trash
+        // would let the chore delete it a week after it was trashed. Only an
+        // opened object is restored: a zero-length read proves nothing.
+        let restored = info.state == PieceState::Trash
+            && body.is_some()
+            && self
+                .store
+                .restore_piece(&sat, &piece)
+                .await
+                .map_err(store_err)?;
         // A later failure can still save the largest order. Nothing before
         // this point transferred a byte, so those orders are discarded.
         if let Some(tracked) = tracked.as_mut() {
@@ -2891,6 +2901,42 @@ mod tests {
         assert!(store.exists(&sat, &encode_hex(&mine)).unwrap());
         // Another satellite's trash is not this caller's to restore.
         assert_eq!(piece_state(&harness, &other_id, &theirs), PieceState::Trash);
+    }
+
+    #[tokio::test]
+    async fn download_restores_a_trashed_piece() {
+        let satellite = Identity::generate().unwrap();
+        let uplink = Identity::generate().unwrap();
+        let harness = Harness::start(std::slice::from_ref(&satellite)).await;
+        let sat = satellite.node_id().to_string();
+        let piece_id = [0x31; 32];
+        let body = b"still wanted";
+        let store = &harness.node.store;
+        put_piece_at(store, &sat, &piece_id, SystemTime::now(), body).await;
+        store
+            .trash(&sat, &encode_hex(&piece_id), SystemTime::now())
+            .await
+            .unwrap();
+        assert!(!store.exists(&sat, &encode_hex(&piece_id)).unwrap());
+
+        let piece_key = PiecePrivateKey::generate();
+        let limit = signed_limit(
+            &satellite,
+            &harness.identity,
+            &piece_key,
+            &piece_id,
+            PieceAction::Get,
+            body.len() as i64,
+        );
+        let (first, got) =
+            read_download(&harness, &uplink, &piece_key, &limit, 0, body.len() as i64).await;
+        assert!(first.restored_from_trash);
+        assert_eq!(got, body);
+
+        let info = store.info(&sat, &encode_hex(&piece_id)).unwrap().unwrap();
+        assert_eq!(info.state, PieceState::Live);
+        assert_eq!(info.trashed_at, None);
+        assert!(store.exists(&sat, &encode_hex(&piece_id)).unwrap());
     }
 
     async fn put_piece_at(
