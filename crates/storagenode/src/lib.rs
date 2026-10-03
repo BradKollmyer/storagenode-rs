@@ -180,6 +180,11 @@ fn load_satellites(volume: &Path, urls: &[NodeUrl]) -> Result<Vec<TrustedSatelli
 /// Starts the node and serves DRPC until the process is killed.
 pub async fn run(config: Config) -> Result<(), Error> {
     let node = start(&config).await?;
+    if config.s3.allocated_bytes == 0 {
+        eprintln!(
+            "storagenode: STORJ_ALLOCATED_BYTES is 0: the node reports no free space and refuses uploads"
+        );
+    }
     let dashboard = Arc::new(dashboard::Dashboard::new(Arc::clone(&node), &config));
     let (dashboard_listener, dashboard_addr) = dashboard::listen().await?;
     let listener = Node::listen(config.listen).await?;

@@ -72,7 +72,7 @@ Optional:
 | `STORJ_S3_REGION` | `us-east-1` |
 | `STORJ_S3_PREFIX` | `pieces` |
 | `STORJ_S3_PATH_STYLE` | path-style unless the host is `amazonaws.com` |
-| `STORJ_ALLOCATED_BYTES` | `0` |
+| `STORJ_ALLOCATED_BYTES` | `0`: no free space, uploads are refused |
 | `STORJ_VOLUME` | `/var/lib/storj` |
 | `STORJ_OPERATOR_WALLET_FEATURES` | empty; comma-separated |
 

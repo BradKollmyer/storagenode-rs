@@ -14,7 +14,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use prost::Message;
 use s3store::{BandwidthKind, HashAlgorithm, PieceBody, PieceMeta, PieceState, Store, Upload};
@@ -72,6 +72,11 @@ const CHORE_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// Rows retain trashes per sqlite transaction. Other RPCs run in between.
 const RETAIN_BATCH: usize = 1000;
 
+/// How long an upload trusts the last free-space read. The read sums the
+/// index, so it is not repeated per upload; finished uploads are subtracted
+/// from the cached figure in between.
+const SPACE_REFRESH: Duration = Duration::from_secs(60);
+
 /// Pause after a failed `accept`, so a full descriptor table is not a busy loop.
 const ACCEPT_RETRY: Duration = Duration::from_millis(250);
 
@@ -79,6 +84,7 @@ const RPC_CANCELED: u64 = 1;
 const RPC_INVALID_ARGUMENT: u64 = 3;
 const RPC_NOT_FOUND: u64 = 5;
 const RPC_PERMISSION_DENIED: u64 = 7;
+const RPC_ABORTED: u64 = 10;
 const RPC_UNIMPLEMENTED: u64 = 12;
 const RPC_INTERNAL: u64 = 13;
 const RPC_UNAUTHENTICATED: u64 = 16;
@@ -129,6 +135,8 @@ pub struct Node {
     satellites: HashMap<NodeId, KnownSatellite>,
     /// Replay window for this process. Settlement orders are in `pieces.db`.
     serials: Mutex<Serials>,
+    /// Free allocation as of the last index read, less uploads stored since.
+    free_space: Mutex<Option<(Instant, u64)>>,
     orders: Orders,
     acceptor: tokio_rustls::TlsAcceptor,
     /// One X25519 key. Check-in attests the public half.
@@ -185,6 +193,7 @@ impl Node {
             store,
             satellites,
             serials: Mutex::new(Serials::default()),
+            free_space: Mutex::new(None),
             orders: Orders::new(),
             acceptor: tokio_rustls::TlsAcceptor::from(Arc::new(config)),
             noise,
@@ -461,6 +470,7 @@ impl Node {
                 // the field at the protobuf zero (SHA-256) even for BLAKE3.
                 hasher = algo.hasher();
                 self.check_limit(&next, true)?;
+                self.check_space(&next)?;
                 tracked = Some(self.track_order(&next)?);
                 limit = Some(next);
             } else if limit.is_none() {
@@ -605,6 +615,7 @@ impl Node {
             // TLS and QUIC take the leaf from the connection. Noise cannot.
             node_certchain: out.node_certchain.clone(),
         };
+        self.note_stored(u64::try_from(piece_size).unwrap_or(0));
         out.message(&response.encode_to_vec()).await?;
         // Count before the next await. The uplink returns as soon as it
         // reads this hash, and a counter error must not fail the commit.
@@ -1052,6 +1063,45 @@ impl Node {
             &limit.serial_number,
             serial_deadline(limit, now),
         )
+    }
+
+    /// Refuses an upload whose order limit does not fit in the free
+    /// allocation, as the Go node does. Without this the allocation is only
+    /// what check-in advertises, and the bucket fills past it.
+    fn check_space(&self, limit: &OrderLimit) -> Result<(), Fail> {
+        let free = {
+            let mut cached = self
+                .free_space
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
+            match *cached {
+                Some((read_at, free)) if read_at.elapsed() < SPACE_REFRESH => free,
+                _ => {
+                    let free = self.store.space().map_err(store_err)?.free;
+                    *cached = Some((Instant::now(), free));
+                    free
+                }
+            }
+        };
+        let need = u64::try_from(limit.limit).unwrap_or(u64::MAX);
+        if need > free {
+            return Err(Fail::proto(
+                RPC_ABORTED,
+                format!("not enough available disk space, have: {free}, need: {need}"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Takes a stored piece out of the cached free space until the next read.
+    fn note_stored(&self, bytes: u64) {
+        let mut cached = self
+            .free_space
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        if let Some((_, free)) = cached.as_mut() {
+            *free = free.saturating_sub(bytes);
+        }
     }
 
     fn reserve_serial(
@@ -1749,7 +1799,7 @@ mod tests {
     }
 
     impl TestBucket {
-        async fn start() -> Self {
+        async fn start(allocated_bytes: u64) -> Self {
             let root = TempRoot::new();
             std::fs::create_dir(root.path().join(BUCKET)).expect("bucket dir");
             let addr = spawn_s3(root.path());
@@ -1759,7 +1809,7 @@ mod tests {
                 access_key_id: ACCESS_KEY.to_owned(),
                 secret_access_key: SECRET.to_owned(),
                 volume: root.path().join("volume"),
-                allocated_bytes: 1 << 40,
+                allocated_bytes,
                 ..s3store::Config::default()
             };
             let store = Store::new(config).expect("store");
@@ -1815,7 +1865,16 @@ mod tests {
             addresses: &[&str],
             noise: Option<(i32, crate::noise_key::Key)>,
         ) -> Self {
-            let bucket = TestBucket::start().await;
+            Self::open_allocated(satellites, addresses, noise, 1 << 40).await
+        }
+
+        async fn open_allocated(
+            satellites: &[Identity],
+            addresses: &[&str],
+            noise: Option<(i32, crate::noise_key::Key)>,
+            allocated_bytes: u64,
+        ) -> Self {
+            let bucket = TestBucket::start(allocated_bytes).await;
             let identity = Identity::generate().expect("node identity");
             let trusted = satellites
                 .iter()
@@ -2923,6 +2982,53 @@ mod tests {
             .unwrap();
         assert_eq!(later.bytes, b"later");
         assert!(later.restored_from_trash);
+    }
+
+    #[tokio::test]
+    async fn upload_that_does_not_fit_in_the_allocation_is_refused() {
+        let satellite = Identity::generate().unwrap();
+        let uplink = Identity::generate().unwrap();
+        let harness =
+            Harness::open_allocated(std::slice::from_ref(&satellite), &[], None, 10).await;
+        let piece_key = PiecePrivateKey::generate();
+        let put = |piece_id: [u8; 32], limit: i64| {
+            signed_limit(
+                &satellite,
+                &harness.identity,
+                &piece_key,
+                &piece_id,
+                PieceAction::Put,
+                limit,
+            )
+        };
+
+        // 4 of 10 bytes. The stored piece comes off the cached free space.
+        let mut client = harness.client(&uplink, &satellite).await;
+        client
+            .upload(&put([0x41; 32], 4), &piece_key, b"abcd")
+            .await
+            .expect("fits");
+
+        let mut client = harness.client(&uplink, &satellite).await;
+        let err = client
+            .upload(&put([0x42; 32], 7), &piece_key, b"abcdefg")
+            .await
+            .expect_err("7 bytes do not fit in the 6 left");
+        assert!(err.to_string().contains("not enough available"), "{err}");
+        assert!(
+            harness
+                .node
+                .store
+                .info(&satellite.node_id().to_string(), &encode_hex(&[0x42; 32]))
+                .unwrap()
+                .is_none()
+        );
+
+        let mut client = harness.client(&uplink, &satellite).await;
+        client
+            .upload(&put([0x43; 32], 6), &piece_key, b"abcdef")
+            .await
+            .expect("exactly the space left");
     }
 
     #[tokio::test]

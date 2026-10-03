@@ -172,7 +172,7 @@ Publish 28967/tcp, 28967/udp, and 14002/tcp.
 ## Risks
 
 - Losing `pieces.db` is not worse than the file node losing its piece disk. Hashstore keeps its index on that same disk, so a dead disk takes the pieces with it. Here the bytes, the hash, and the repair order limit are on the object, and startup rebuilds the index from them. Unsent orders still live only in sqlite, same as the Go orders directory. Losing the identity is fatal for both nodes: the id cannot be regenerated.
-- Advertised free space is the configured allocation. A full bucket fails uploads; the node does not see the bucket quota.
+- Advertised free space is the configured allocation minus live bytes, and an upload whose order limit does not fit in it is refused. The node does not see the bucket quota: a bucket that fills first fails uploads.
 - A difficulty-0 identity will not be accepted by the public satellites.
 - A public satellite will not pay a difficulty-0 identity, a disqualified node, or a node that fails audits or retain. New nodes also have a portion of earnings held. The paystub, not this process, is the record of what is owed.
 - Port 14002 has no authentication. Publishing it past localhost exposes the wallet address, node id, and usage.
