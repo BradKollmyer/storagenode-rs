@@ -98,6 +98,12 @@ const EXPIRATION_GRACE: Duration = Duration::from_secs(48 * 60 * 60);
 /// How long a refused RPC waits for the peer to hang up before this side does.
 const ERROR_LINGER: Duration = Duration::from_secs(5);
 
+/// How long a finished RPC waits for the client's close packet. The Go
+/// client writes it right after reading the response. Without this bound a
+/// peer that says nothing more holds the connection for the whole per-read
+/// deadline.
+const CLOSE_LINGER: Duration = Duration::from_secs(10);
+
 /// Pause after a failed `accept`, so a full descriptor table is not a busy loop.
 const ACCEPT_RETRY: Duration = Duration::from_millis(250);
 
@@ -489,8 +495,9 @@ impl Node {
             Ok(()) => {
                 // The client writes Close only after reading the response.
                 // Dropping the socket first turns that write into EPIPE and
-                // fails an RPC that already succeeded.
-                let _ = out.conn.read_packet().await;
+                // fails an RPC that already succeeded. A client that never
+                // writes it gives up the connection after the linger budget.
+                let _ = tokio::time::timeout(CLOSE_LINGER, out.conn.read_packet()).await;
                 Ok(out.conn.into_inner())
             }
             Err(Fail::Proto { code, message }) => {
@@ -2071,10 +2078,10 @@ fn serial_deadline(limit: &OrderLimit, now: SystemTime) -> SystemTime {
 #[cfg(test)]
 mod tests {
     use super::{
-        CONTACT_PING_NODE, EXPIRATION_GRACE, GO_ZERO_TIME_UNIX, Node, PIECESTORE_EXISTS,
-        PIECESTORE_RESTORE_TRASH, PIECESTORE_RETAIN, PIECESTORE_RETAIN_BIG, RETAIN_MAX_TIME_SKEW,
-        Serials, TrustedSatellite, creation_ok, encode_hex, expired, serial_deadline,
-        system_to_timestamp,
+        CLOSE_LINGER, CONTACT_PING_NODE, EXPIRATION_GRACE, GO_ZERO_TIME_UNIX, Node,
+        PIECESTORE_EXISTS, PIECESTORE_RESTORE_TRASH, PIECESTORE_RETAIN, PIECESTORE_RETAIN_BIG,
+        RETAIN_MAX_TIME_SKEW, Serials, TrustedSatellite, creation_ok, encode_hex, expired,
+        serial_deadline, system_to_timestamp,
     };
     use std::future::Future;
     use std::net::SocketAddr;
@@ -3581,6 +3588,40 @@ mod tests {
             .upload(&put([0x43; 32], 6), &piece_key, b"abcdef")
             .await
             .expect("exactly the space left");
+    }
+
+    #[tokio::test]
+    async fn a_finished_rpc_does_not_wait_forever_for_the_client_close() {
+        let satellite = Identity::generate().unwrap();
+        let harness = Harness::start(std::slice::from_ref(&satellite)).await;
+        let request = ExistsRequest {
+            piece_ids: vec![vec![0x11; 32]],
+        };
+        // open_stream + send, not invoke: this client never writes its close.
+        let mut conn = harness.conn(&satellite).await;
+        let mut stream = conn.open_stream(PIECESTORE_EXISTS).await.unwrap();
+        conn.send_msg(&mut stream, &request.encode_to_vec())
+            .await
+            .unwrap();
+        let reply = conn.recv_msg(&stream).await.expect("reply");
+        ExistsResponse::decode(reply.as_slice()).unwrap();
+
+        // The response is here and the stream's close frame arrives next.
+        // What must not arrive until the linger budget passes is the end of
+        // the connection itself.
+        let started = std::time::Instant::now();
+        tokio::time::timeout(CLOSE_LINGER + Duration::from_secs(5), async {
+            loop {
+                match conn.read_packet().await {
+                    Ok(pkt) if matches!(pkt.kind, Kind::CLOSE | Kind::CANCEL | Kind::ERROR) => {}
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+        })
+        .await
+        .expect("the server lingers for the close, then hangs up");
+        assert!(started.elapsed() >= CLOSE_LINGER, "hung up too early");
     }
 
     #[tokio::test]
