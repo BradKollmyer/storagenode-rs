@@ -768,7 +768,10 @@ impl Node {
         // The guard holds the hour shut for this RPC. The order is noted only
         // after the piece is readable, so a missing piece is not settled.
         let mut tracked = None;
-        let mut early_orders = Vec::new();
+        // Orders are cumulative and checked to be nondecreasing. Only the
+        // latest one can matter for settlement, even when the peer repeats
+        // an order indefinitely before sending its range.
+        let mut early_order = None;
         loop {
             let Some(bytes) = out.recv().await? else {
                 return Err(Fail::proto(
@@ -795,7 +798,7 @@ impl Node {
                     return Err(Fail::proto(RPC_INVALID_ARGUMENT, "order before limit"));
                 };
                 authorized = check_order(limit_ref, &order, authorized).map_err(as_internal)?;
-                early_orders.push(order);
+                early_order = Some(order);
             }
             if let Some(next) = req.chunk {
                 chunk = Some(next);
@@ -861,10 +864,8 @@ impl Node {
                 .map_err(store_err)?;
         // A later failure can still save the largest order. Nothing before
         // this point transferred a byte, so those orders are discarded.
-        if let Some(tracked) = tracked.as_mut() {
-            for order in &early_orders {
-                tracked.note(order);
-            }
+        if let (Some(tracked), Some(order)) = (tracked.as_mut(), early_order.as_ref()) {
+            tracked.note(order);
         }
         usage.satellite = sat.clone();
         usage.action = limit.action;
@@ -2993,6 +2994,89 @@ mod tests {
         .expect("download did not deadlock")
         .expect("download");
         assert_eq!(got, body[10..910]);
+    }
+
+    #[tokio::test]
+    async fn repeated_early_download_orders_keep_only_the_largest_for_settlement() {
+        let satellite = Identity::generate().unwrap();
+        let uplink = Identity::generate().unwrap();
+        let harness = Harness::start(std::slice::from_ref(&satellite)).await;
+        let key = PiecePrivateKey::generate();
+        let piece = [0xbb; 32];
+        let body = b"12345678";
+        let put = signed_limit(
+            &satellite,
+            &harness.identity,
+            &key,
+            &piece,
+            PieceAction::Put,
+            8,
+        );
+        harness
+            .client(&uplink, &satellite)
+            .await
+            .upload(&put, &key, body)
+            .await
+            .unwrap();
+        let get = signed_limit(
+            &satellite,
+            &harness.identity,
+            &key,
+            &piece,
+            PieceAction::Get,
+            8,
+        );
+        let mut conn = harness.conn(&uplink).await;
+        let mut stream = conn.open_stream(PIECESTORE_DOWNLOAD).await.unwrap();
+        conn.send_msg(
+            &mut stream,
+            &PieceDownloadRequest {
+                limit: Some(get.clone()),
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        )
+        .await
+        .unwrap();
+        // No range yet: duplicates and a larger cumulative order must not
+        // accumulate a history, or lose the amount eventually settled.
+        for amount in [1, 8] {
+            let request = PieceDownloadRequest {
+                order: Some(order_for(&get, &key, amount)),
+                ..Default::default()
+            }
+            .encode_to_vec();
+            for _ in 0..1024 {
+                conn.send_msg(&mut stream, &request).await.unwrap();
+            }
+        }
+        conn.send_msg(
+            &mut stream,
+            &PieceDownloadRequest {
+                chunk: Some(piece_download_request::Chunk {
+                    offset: 0,
+                    chunk_size: 8,
+                }),
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        )
+        .await
+        .unwrap();
+        let response =
+            PieceDownloadResponse::decode(conn.recv_msg(&stream).await.unwrap().as_slice())
+                .unwrap();
+        assert_eq!(response.chunk.unwrap().data, body);
+        conn.close_send(&mut stream).await.unwrap();
+        wait_idle(&harness.node).await;
+        let saved = harness
+            .node
+            .store
+            .orders()
+            .status(&satellite.node_id().to_string(), &get.serial_number)
+            .unwrap()
+            .expect("download order saved");
+        assert_eq!(saved.amount, 8);
     }
 
     #[tokio::test]
