@@ -182,6 +182,9 @@ pub(crate) async fn process_satellite(node: &Node, satellite_id: &str) -> Result
     )
     .await
     .map_err(|err| err.to_string())?;
+    // TLS pinned this connection to the satellite's id, so this is its
+    // current leaf. Order limits are verified with it from now on.
+    node.observe_satellite_leaf(id, &transport.peer_cert);
     let mut conn = Conn::new(transport);
     let mut stream = conn
         .open_stream(PROCESS)
@@ -607,6 +610,9 @@ mod tests {
         let volume = bucket.root.path().join("volume");
         let node = node_for(bucket.store, &[(&satellite, &address), (&other, "")]);
         node.piece_store().begin_exit(&sat).unwrap();
+        // The exit dial also learns the leaf a rotated satellite now uses.
+        let stale = Identity::generate().unwrap();
+        node.observe_satellite_leaf(satellite.node_id(), stale.leaf_der().as_ref());
         assert_eq!(
             node.piece_store()
                 .exit_row(&sat)
@@ -617,6 +623,10 @@ mod tests {
         );
 
         dial(&node, &sat).await.unwrap();
+        assert_eq!(
+            node.satellite_leaf(satellite.node_id()).unwrap(),
+            satellite.leaf_der().as_ref()
+        );
 
         assert_eq!(seen.lock().unwrap().as_deref(), Some(PROCESS));
         assert!(node.piece_store().info(&sat, "live").unwrap().is_none());

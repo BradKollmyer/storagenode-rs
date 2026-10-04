@@ -1380,6 +1380,7 @@ impl Node {
                 &self.identity,
                 &db,
                 |id| self.satellites.get(&id).map(|sat| sat.address.clone()),
+                &|id, leaf| self.observe_satellite_leaf(id, leaf),
                 now,
             )
             .await;
@@ -4348,6 +4349,54 @@ mod tests {
 
         harness.node.settle_orders(closed_now()).await;
         assert_eq!(log.windows().len(), 1, "accepted window is not sent again");
+    }
+
+    #[tokio::test]
+    async fn settlement_dial_follows_a_rotated_satellite_leaf() {
+        let satellite = Identity::generate().unwrap();
+        let uplink = Identity::generate().unwrap();
+        let log = SettlementLog::new();
+        let sat_addr = spawn_settlement_satellite(satellite.clone(), Arc::clone(&log));
+        let harness = Harness::start_with(
+            std::slice::from_ref(&satellite),
+            &[&format!("127.0.0.1:{}", sat_addr.port())],
+        )
+        .await;
+        let piece_key = PiecePrivateKey::generate();
+        let put = signed_limit(
+            &satellite,
+            &harness.identity,
+            &piece_key,
+            &[0x53; 32],
+            PieceAction::Put,
+            3,
+        );
+        let mut client = harness
+            .client(&uplink, &satellite)
+            .await
+            .with_hash_algo(PieceHashAlgo::Sha256);
+        client.upload(&put, &piece_key, b"abc").await.expect("upload");
+        wait_idle(&harness.node).await;
+
+        // The certificate rotated and no check-in has seen the new leaf yet:
+        // order limits signed by it are refused.
+        let rotated = Identity::generate().unwrap();
+        harness
+            .node
+            .observe_satellite_leaf(satellite.node_id(), rotated.leaf_der().as_ref());
+        assert_eq!(
+            harness.node.satellite_leaf(satellite.node_id()).unwrap(),
+            rotated.leaf_der().as_ref()
+        );
+
+        // The settlement dial is pinned to the satellite id, so its current
+        // leaf is trusted the moment it answers.
+        harness.node.settle_orders(closed_now()).await;
+        assert_eq!(
+            harness.node.satellite_leaf(satellite.node_id()).unwrap(),
+            satellite.leaf_der().as_ref()
+        );
+        assert_eq!(log.windows().len(), 1);
     }
 
     #[tokio::test]
