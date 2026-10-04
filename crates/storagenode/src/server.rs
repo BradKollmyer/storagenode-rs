@@ -170,8 +170,8 @@ pub struct Node {
     satellites: HashMap<NodeId, KnownSatellite>,
     /// Replay window for this process. Settlement orders are in `pieces.db`.
     serials: Mutex<Serials>,
-    /// Free allocation as of the last index read, less uploads stored since.
-    free_space: Mutex<Option<(Instant, u64)>>,
+    /// Committed free allocation and space reserved by unfinished uploads.
+    free_space: Mutex<FreeSpace>,
     /// Wakes the check-in loops when an upload finds the node low on space.
     low_space: tokio::sync::Notify,
     orders: Orders,
@@ -182,6 +182,47 @@ pub struct Node {
     noise_protocol: i32,
     /// Leaf then CA, concatenated DER. Sent on Noise uploads, which have no TLS cert.
     noise_certchain: Vec<u8>,
+}
+
+#[derive(Default)]
+struct FreeSpace {
+    cached: Option<(Instant, u64)>,
+    reserved: u64,
+    uploads: usize,
+}
+
+/// Holds the entire order limit until publication succeeds or the RPC fails.
+/// Drop also releases it when the upload future is cancelled.
+struct SpaceReservation<'a> {
+    node: &'a Node,
+    bytes: u64,
+}
+
+impl SpaceReservation<'_> {
+    /// Charge the committed bytes and release any unused part of the limit
+    /// before writing the reply, which can fail after the piece is live.
+    fn commit(self, bytes: u64) {
+        let mut space = self
+            .node
+            .free_space
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        if let Some((_, free)) = space.cached.as_mut() {
+            *free = free.saturating_sub(bytes);
+        }
+    }
+}
+
+impl Drop for SpaceReservation<'_> {
+    fn drop(&mut self) {
+        let mut space = self
+            .node
+            .free_space
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        space.reserved -= self.bytes;
+        space.uploads -= 1;
+    }
 }
 
 impl Node {
@@ -230,7 +271,7 @@ impl Node {
             store,
             satellites,
             serials: Mutex::new(Serials::default()),
-            free_space: Mutex::new(None),
+            free_space: Mutex::new(FreeSpace::default()),
             low_space: tokio::sync::Notify::new(),
             orders: Orders::new(),
             acceptor: tokio_rustls::TlsAcceptor::from(Arc::new(config)),
@@ -560,6 +601,7 @@ impl Node {
         let mut limit_bytes = Vec::new();
         let mut algo = PieceHashAlgo::Sha256;
         let mut hasher = PieceHashAlgo::Sha256.hasher();
+        let mut space = None;
         let mut staging: Option<(Upload, String)> = None;
         let mut staged: i64 = 0;
         let mut authorized: i64 = 0;
@@ -589,7 +631,7 @@ impl Node {
                 hasher = algo.hasher();
                 let unknown = limit_unknown(&bytes);
                 self.check_limit(&next, true, &unknown)?;
-                self.check_space(&next)?;
+                space = Some(self.reserve_space(&next)?);
                 limit_bytes = encode_limit(&next, &unknown);
                 tracked = Some(self.track_order(&next, limit_bytes.clone())?);
                 usage.satellite = parse_node_id(&next.satellite_id)?.to_string();
@@ -640,7 +682,11 @@ impl Node {
                         out,
                         (&limit, limit_bytes),
                         algo,
-                        (staging, staged),
+                        (
+                            staging,
+                            staged,
+                            space.take().expect("accepted limit reserved space"),
+                        ),
                         &digest,
                         &done,
                     )
@@ -654,7 +700,7 @@ impl Node {
         out: &mut Out<T>,
         limit: (&OrderLimit, Vec<u8>),
         algo: PieceHashAlgo,
-        spill: (Option<(Upload, String)>, i64),
+        spill: (Option<(Upload, String)>, i64, SpaceReservation<'_>),
         digest: &[u8],
         done: &PieceHash,
     ) -> Result<(), Fail>
@@ -670,7 +716,7 @@ impl Node {
         if done.hash_algorithm != algo.to_i32() {
             return Err(Fail::proto(RPC_INTERNAL, "hash algorithm mismatch"));
         }
-        let (staging, staged) = spill;
+        let (staging, staged, space) = spill;
         if done.piece_size != staged {
             return Err(Fail::proto(RPC_INVALID_ARGUMENT, "piece size mismatch"));
         }
@@ -730,6 +776,7 @@ impl Node {
                 .map_err(store_err)?;
         }
         let piece_size = staged;
+        space.commit(u64::try_from(piece_size).unwrap_or(0));
 
         let mut sn_hash = PieceHash {
             piece_id: limit.piece_id.clone(),
@@ -746,7 +793,6 @@ impl Node {
             // TLS and QUIC take the leaf from the connection. Noise cannot.
             node_certchain: out.node_certchain.clone(),
         };
-        self.note_stored(u64::try_from(piece_size).unwrap_or(0));
         out.message(&response.encode_to_vec()).await?;
         out.close().await?;
         Ok(())
@@ -1308,46 +1354,48 @@ impl Node {
         )
     }
 
-    /// Refuses an upload whose order limit does not fit in the free
-    /// allocation, as the Go node does. Without this the allocation is only
-    /// what check-in advertises, and the bucket fills past it.
-    fn check_space(&self, limit: &OrderLimit) -> Result<(), Fail> {
+    /// Reserve capacity under the same lock as the free-space check, so
+    /// concurrent uploads cannot each claim the same bytes.
+    fn reserve_space(&self, limit: &OrderLimit) -> Result<SpaceReservation<'_>, Fail> {
+        let need = u64::try_from(limit.limit).unwrap_or(u64::MAX);
         let free = {
-            let mut cached = self
+            let mut space = self
                 .free_space
                 .lock()
                 .unwrap_or_else(|err| err.into_inner());
-            match *cached {
-                Some((read_at, free)) if read_at.elapsed() < SPACE_REFRESH => free,
-                _ => {
-                    let free = self.store.space().map_err(store_err)?.free;
-                    *cached = Some((Instant::now(), free));
+            let committed_free = match space.cached {
+                // Do not sample the index while an upload may have replaced
+                // a live row with `writing`. That temporarily omits its old
+                // size. Commits charge the cache until every upload releases.
+                Some((read_at, free)) if read_at.elapsed() < SPACE_REFRESH || space.uploads > 0 => {
                     free
                 }
+                _ => {
+                    let free = self.store.space().map_err(store_err)?.free;
+                    space.cached = Some((Instant::now(), free));
+                    free
+                }
+            };
+            let free = committed_free.saturating_sub(space.reserved);
+            if need <= free {
+                space.reserved += need;
+                space.uploads += 1;
             }
+            free
         };
-        if free < REPORT_CAPACITY_THRESHOLD {
+        if free.saturating_sub(need) < REPORT_CAPACITY_THRESHOLD {
             self.low_space.notify_waiters();
         }
-        let need = u64::try_from(limit.limit).unwrap_or(u64::MAX);
         if need > free {
             return Err(Fail::proto(
                 RPC_ABORTED,
                 format!("not enough available disk space, have: {free}, need: {need}"),
             ));
         }
-        Ok(())
-    }
-
-    /// Takes a stored piece out of the cached free space until the next read.
-    fn note_stored(&self, bytes: u64) {
-        let mut cached = self
-            .free_space
-            .lock()
-            .unwrap_or_else(|err| err.into_inner());
-        if let Some((_, free)) = cached.as_mut() {
-            *free = free.saturating_sub(bytes);
-        }
+        Ok(SpaceReservation {
+            node: self,
+            bytes: need,
+        })
     }
 
     fn reserve_serial(
@@ -2147,7 +2195,7 @@ mod tests {
     use std::process;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use hyper_util::rt::{TokioExecutor, TokioIo};
     use hyper_util::server::conn::auto::Builder as ConnBuilder;
@@ -3768,6 +3816,160 @@ mod tests {
             .upload(&put([0x43; 32], 6), &piece_key, b"abcdef")
             .await
             .expect("exactly the space left");
+    }
+
+    #[tokio::test]
+    async fn concurrent_upload_reserves_capacity_and_cancel_releases_it() {
+        let satellite = Identity::generate().unwrap();
+        let uplink = Identity::generate().unwrap();
+        let harness =
+            Harness::open_allocated(std::slice::from_ref(&satellite), &[], None, 10).await;
+        let key = PiecePrivateKey::generate();
+        let limit = |piece, bytes| {
+            signed_limit(
+                &satellite,
+                &harness.identity,
+                &key,
+                &[piece; 32],
+                PieceAction::Put,
+                bytes,
+            )
+        };
+        let pending = limit(0xa1, 8);
+        let mut conn = harness.conn(&uplink).await;
+        let mut stream = conn.open_stream(PIECESTORE_UPLOAD).await.unwrap();
+        conn.send_msg(
+            &mut stream,
+            &PieceUploadRequest {
+                limit: Some(pending.clone()),
+                order: Some(order_for(&pending, &key, 8)),
+                chunk: Some(piece_upload_request::Chunk {
+                    offset: 0,
+                    data: b"12345678".to_vec(),
+                }),
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while harness.node.orders.in_flight() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let err = harness
+            .client(&uplink, &satellite)
+            .await
+            .upload(&limit(0xa2, 8), &key, b"12345678")
+            .await
+            .expect_err("the pending upload owns eight of the ten bytes");
+        assert!(err.to_string().contains("not enough available"), "{err}");
+        conn.close_send(&mut stream).await.unwrap();
+        conn.recv_msg(&stream)
+            .await
+            .expect_err("incomplete upload cancelled");
+        wait_idle(&harness.node).await;
+        assert_eq!(harness.node.free_space.lock().unwrap().reserved, 0);
+
+        // A short successful upload releases the unused portion of its limit.
+        harness
+            .client(&uplink, &satellite)
+            .await
+            .upload(&limit(0xa3, 10), &key, b"1234")
+            .await
+            .unwrap();
+        harness
+            .client(&uplink, &satellite)
+            .await
+            .upload(&limit(0xa4, 6), &key, b"123456")
+            .await
+            .unwrap();
+        let space = harness.node.store.space().unwrap();
+        assert_eq!(space.used, space.allocated);
+        assert_eq!(space.used, 10);
+    }
+
+    #[tokio::test]
+    async fn failed_upload_releases_its_capacity_reservation() {
+        let satellite = Identity::generate().unwrap();
+        let uplink = Identity::generate().unwrap();
+        let harness =
+            Harness::open_allocated(std::slice::from_ref(&satellite), &[], None, 10).await;
+        let key = PiecePrivateKey::generate();
+        let put = signed_limit(
+            &satellite,
+            &harness.identity,
+            &key,
+            &[0xb1; 32],
+            PieceAction::Put,
+            10,
+        );
+        let mut conn = harness.conn(&uplink).await;
+        let mut stream = conn.open_stream(PIECESTORE_UPLOAD).await.unwrap();
+        conn.send_msg(
+            &mut stream,
+            &PieceUploadRequest {
+                limit: Some(put.clone()),
+                order: Some(order_for(&put, &key, 10)),
+                chunk: Some(piece_upload_request::Chunk {
+                    offset: 1,
+                    data: vec![1],
+                }),
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        )
+        .await
+        .unwrap();
+        let err = conn
+            .recv_msg(&stream)
+            .await
+            .expect_err("invalid chunk offset");
+        assert!(err.to_string().contains("chunk out of order"), "{err}");
+        let put = signed_limit(
+            &satellite,
+            &harness.identity,
+            &key,
+            &[0xb2; 32],
+            PieceAction::Put,
+            10,
+        );
+        harness
+            .client(&uplink, &satellite)
+            .await
+            .upload(&put, &key, b"1234567890")
+            .await
+            .unwrap();
+        assert_eq!(harness.node.store.space().unwrap().used, 10);
+    }
+
+    #[tokio::test]
+    async fn expired_capacity_cache_preserves_in_flight_reservations() {
+        let harness = Harness::open_allocated(&[], &[], None, 10).await;
+        let limit = |bytes| OrderLimit {
+            limit: bytes,
+            ..Default::default()
+        };
+        let held = harness
+            .node
+            .reserve_space(&limit(8))
+            .unwrap_or_else(|_| panic!("fits"));
+        {
+            let mut space = harness.node.free_space.lock().unwrap();
+            space.cached.as_mut().unwrap().0 = Instant::now() - super::SPACE_REFRESH;
+        }
+        assert!(
+            harness.node.reserve_space(&limit(3)).is_err(),
+            "an expired cache cannot forget reserved bytes"
+        );
+        drop(held);
+        assert!(
+            harness.node.reserve_space(&limit(10)).is_ok(),
+            "dropping the guard returns capacity"
+        );
     }
 
     #[tokio::test]
