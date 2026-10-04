@@ -2458,15 +2458,21 @@ mod tests {
         assert!(!serials.reserve(sat, b"c", at(200), t0));
         // Full: `a`, the nearest deadline, is forgotten so `z` fits.
         assert!(serials.reserve(sat, b"z", at(50), t0));
-        assert!(!serials.reserve(sat, b"z", at(60), t0), "replay of a held serial");
+        assert!(
+            !serials.reserve(sat, b"z", at(60), t0),
+            "replay of a held serial"
+        );
         // Inserting `a` back evicts `z` (deadline 50), not `c` (100).
         assert!(serials.reserve(sat, b"a", at(70), t0), "`a` was evicted");
         let held: std::collections::HashSet<_> = serials.used.iter().cloned().collect();
         assert_eq!(
             held,
-            [(*sat.as_bytes(), b"c".to_vec()), (*sat.as_bytes(), b"a".to_vec())]
-                .into_iter()
-                .collect()
+            [
+                (*sat.as_bytes(), b"c".to_vec()),
+                (*sat.as_bytes(), b"a".to_vec())
+            ]
+            .into_iter()
+            .collect()
         );
         // Expired serials are dropped before any live eviction is needed:
         // at t101 `c` is gone, so the next two inserts evict `a` (t70) only.
@@ -4485,7 +4491,10 @@ mod tests {
             .client(&uplink, &satellite)
             .await
             .with_hash_algo(PieceHashAlgo::Sha256);
-        client.upload(&put, &piece_key, b"abc").await.expect("upload");
+        client
+            .upload(&put, &piece_key, b"abc")
+            .await
+            .expect("upload");
         wait_idle(&harness.node).await;
 
         // The certificate rotated and no check-in has seen the new leaf yet:

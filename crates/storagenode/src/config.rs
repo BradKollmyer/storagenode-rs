@@ -58,6 +58,9 @@ pub enum Error {
     /// `STORJ_ALLOCATED_BYTES` was not an integer.
     #[error("STORJ_ALLOCATED_BYTES: {0}")]
     Allocated(String),
+    /// `STORJ_CONTACT_EXTERNAL_ADDRESS` was not `host:port`.
+    #[error("STORJ_CONTACT_EXTERNAL_ADDRESS must be host:port")]
+    ExternalAddress,
     /// `STORJ_S3_PATH_STYLE` was not `true` or `false`.
     #[error("STORJ_S3_PATH_STYLE must be true or false")]
     PathStyle,
@@ -81,6 +84,9 @@ impl Config {
             return Err(Error::Wallet);
         }
         let contact_external_address = required(&get, "STORJ_CONTACT_EXTERNAL_ADDRESS")?;
+        if !valid_address(&contact_external_address) {
+            return Err(Error::ExternalAddress);
+        }
         let wallet_features = optional(&get, "STORJ_OPERATOR_WALLET_FEATURES")
             .map(|value| {
                 value
@@ -171,6 +177,19 @@ fn valid_wallet(value: &str) -> bool {
     rest.len() == 40 && rest.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+/// A `host:port` satellites can dial back. The host is a name, an IP, or a
+/// bracketed IPv6 literal, so it is checked for presence, not resolution.
+fn valid_address(value: &str) -> bool {
+    let Some((host, port)) = value.rsplit_once(':') else {
+        return false;
+    };
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    !host.is_empty() && port.parse::<u16>().is_ok_and(|port| port > 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,6 +255,23 @@ mod tests {
         assert!(matches!(err, Error::PathStyle));
         let err = sample(&[("STORJ_SATELLITES", "us1.storj.io:7777")]).unwrap_err();
         assert!(matches!(err, Error::Satellite { .. }), "{err}");
+        for bad in [
+            "example.com",
+            "example.com:",
+            "example.com:0",
+            ":28967",
+            "example.com:99999",
+        ] {
+            let err = sample(&[("STORJ_CONTACT_EXTERNAL_ADDRESS", bad)]).unwrap_err();
+            assert!(matches!(err, Error::ExternalAddress), "{bad}: {err}");
+        }
+        for good in [
+            "example.com:28967",
+            "203.0.113.5:28967",
+            "[2001:db8::9]:28967",
+        ] {
+            sample(&[("STORJ_CONTACT_EXTERNAL_ADDRESS", good)]).expect(good);
+        }
     }
 
     #[test]

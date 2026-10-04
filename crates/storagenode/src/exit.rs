@@ -783,11 +783,7 @@ mod tests {
             .expect_err("a silent stream must not hold the worker");
         assert!(err.contains("did not finish"), "{err}");
         assert_eq!(
-            node.piece_store()
-                .exit_row(&sat)
-                .unwrap()
-                .unwrap()
-                .status,
+            node.piece_store().exit_row(&sat).unwrap().unwrap().status,
             ExitStatus::Pending
         );
     }
