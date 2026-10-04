@@ -453,16 +453,21 @@ impl Node {
             .await?;
         // RecvStream::drop sends STOP_SENDING unless the peer finished the
         // stream. The uplink still writes its DRPC close after the response,
-        // then closes the connection instead of finishing the stream.
-        let mut buf = [0u8; 1024];
-        loop {
-            match io.recv.read(&mut buf).await {
-                Ok(Some(0)) | Ok(None) | Err(_) => break,
-                Ok(Some(_)) => {}
+        // then closes the connection instead of finishing the stream. Bound
+        // both waits: keepalive traffic must not retain a finished RPC.
+        let _ = tokio::time::timeout(CLOSE_LINGER, async {
+            let mut buf = [0u8; 1024];
+            loop {
+                match io.recv.read(&mut buf).await {
+                    Ok(Some(0)) | Ok(None) | Err(_) => break,
+                    Ok(Some(_)) => {}
+                }
             }
-        }
+            connection.closed().await;
+        })
+        .await;
+        connection.close(0u32.into(), b"rpc finished");
         drop(io);
-        connection.closed().await;
         Ok(())
     }
 
@@ -3797,6 +3802,56 @@ mod tests {
         .await
         .expect("the server lingers for the close, then hangs up");
         assert!(started.elapsed() >= CLOSE_LINGER, "hung up too early");
+    }
+
+    #[tokio::test]
+    async fn finished_quic_rpc_closes_even_when_the_peer_keeps_the_connection() {
+        let satellite = Identity::generate().unwrap();
+        let harness = Harness::start(std::slice::from_ref(&satellite)).await;
+        for finish_stream in [false, true] {
+            let endpoint = harness
+                .node
+                .quic_endpoint("127.0.0.1:0".parse().unwrap())
+                .unwrap();
+            let addr = endpoint.local_addr().unwrap();
+            let node = Arc::clone(&harness.node);
+            let handler = tokio::spawn(async move {
+                let incoming = endpoint.accept().await.unwrap();
+                node.handle_quic(incoming, Duration::from_secs(5)).await
+            });
+            let transport = transport::dial(
+                &satellite,
+                harness.identity.node_id(),
+                &addr.to_string(),
+                TransportMode::Quic,
+                Duration::from_secs(5),
+                None,
+            )
+            .await
+            .unwrap();
+            let mut conn = Conn::new(transport);
+            let mut stream = conn.open_stream(CONTACT_PING_NODE).await.unwrap();
+            conn.send_msg(
+                &mut stream,
+                &crate::contact::ContactPingRequest {}.encode_to_vec(),
+            )
+            .await
+            .unwrap();
+            conn.recv_msg(&stream).await.unwrap();
+            conn.close_send(&mut stream).await.unwrap();
+            // Keep the QUIC connection alive. One peer leaves its byte
+            // stream open; the other sends FIN but never closes the connection.
+            let mut transport = conn.into_inner();
+            if finish_stream {
+                transport.shutdown().await.unwrap();
+            }
+            tokio::time::timeout(CLOSE_LINGER + Duration::from_secs(3), handler)
+                .await
+                .expect("finished QUIC handler released within cleanup budget")
+                .unwrap()
+                .unwrap();
+            drop(transport);
+        }
     }
 
     #[tokio::test]
