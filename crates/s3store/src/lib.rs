@@ -125,6 +125,10 @@ pub struct Store {
     /// The endpoint replaced the metadata on [`Store::startup`]'s probe copy.
     /// False until then, and false when it did not.
     server_copy: AtomicBool,
+    /// The endpoint answered [`Store::startup`]'s `ListMultipartUploads`.
+    /// False when it did not (that call is how orphaned staging uploads are
+    /// found and aborted).
+    multipart_listing: AtomicBool,
     /// A key's lock is held across a piece commit, including the object put,
     /// and across each chore delete. GC must not delete an object this commit
     /// just replaced, and a download must not drop a row this commit just
@@ -344,6 +348,7 @@ impl Store {
             allocated_bytes: config.allocated_bytes,
             startup: tokio::sync::Mutex::new(()),
             server_copy: AtomicBool::new(false),
+            multipart_listing: AtomicBool::new(true),
             commit: CommitLocks::new(),
         })
     }
@@ -374,11 +379,14 @@ impl Store {
     /// A missing bucket fails this call and leaves the marker unset.
     ///
     /// Staging objects a crashed process left behind are deleted first, and
-    /// the endpoint is probed for [`Self::server_copy`].
+    /// the endpoint is probed for [`Self::server_copy`]. Open multipart
+    /// uploads on staging keys are aborted the same way; an endpoint that
+    /// cannot list them sets [`Self::multipart_listing`] false and keeps them.
     pub async fn startup(&self) -> Result<()> {
         let _guard = self.startup.lock().await;
         self.head_bucket().await?;
         self.sweep_staging().await?;
+        self.abort_orphaned_uploads().await?;
         let server_copy = self.probe_server_copy().await;
         self.server_copy.store(server_copy, Ordering::Relaxed);
         if self.index.rebuild_done()? {
@@ -565,6 +573,15 @@ impl Store {
         self.server_copy.load(Ordering::Relaxed)
     }
 
+    /// True while the endpoint answers `ListMultipartUploads`.
+    ///
+    /// False after [`Self::startup`] saw NotImplemented instead. Without the
+    /// listing, staging multipart uploads abandoned by a crash stay open and
+    /// their parts stay billed. AWS and Ceph RGW implement the call.
+    pub fn multipart_listing(&self) -> bool {
+        self.multipart_listing.load(Ordering::Relaxed)
+    }
+
     /// Puts a small object on a staging key, copies it with new metadata, and
     /// reads the copy's metadata back.
     ///
@@ -644,6 +661,61 @@ impl Store {
             start_after = Some(last.key.clone());
         }
         Ok(())
+    }
+
+    /// Aborts multipart uploads a crashed process left open on staging keys.
+    ///
+    /// An upload abandoned mid-flight is invisible to `ListObjectsV2`, so
+    /// [`Self::sweep_staging`] does not see it; its parts are billed until the
+    /// upload is aborted. Only keys under the staging prefix are touched. An
+    /// endpoint that answers NotImplemented (Ceph and AWS do not) is logged
+    /// through [`Self::multipart_listing`], and its open uploads are kept.
+    async fn abort_orphaned_uploads(&self) -> Result<()> {
+        let prefix = format!("{}.s", list_prefix(&self.prefix));
+        let mut key_marker: Option<String> = None;
+        let mut upload_id_marker: Option<String> = None;
+        loop {
+            let mut req = self
+                .client
+                .list_multipart_uploads()
+                .bucket(&self.bucket)
+                .prefix(&prefix);
+            if let Some(marker) = key_marker.take() {
+                req = req.key_marker(marker);
+            }
+            if let Some(marker) = upload_id_marker.take() {
+                req = req.upload_id_marker(marker);
+            }
+            let out = match req.send().await {
+                Ok(out) => out,
+                Err(err) if err.code() == Some("NotImplemented") => {
+                    self.multipart_listing.store(false, Ordering::Relaxed);
+                    return Ok(());
+                }
+                Err(err) => return Err(map_s3(err)),
+            };
+            for upload in out.uploads() {
+                let (Some(key), Some(upload_id)) = (upload.key(), upload.upload_id()) else {
+                    continue;
+                };
+                self.client
+                    .abort_multipart_upload()
+                    .bucket(&self.bucket)
+                    .key(key)
+                    .upload_id(upload_id)
+                    .send()
+                    .await
+                    .map_err(map_s3)?;
+            }
+            if !out.is_truncated().unwrap_or(false) {
+                return Ok(());
+            }
+            let Some(next_key) = out.next_key_marker() else {
+                return Ok(());
+            };
+            key_marker = Some(next_key.to_owned());
+            upload_id_marker = out.next_upload_id_marker().map(str::to_owned);
+        }
     }
 
     /// Copies a finished staging object onto the piece key, then deletes only

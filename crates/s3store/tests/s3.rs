@@ -59,6 +59,8 @@ struct TestS3 {
     /// `CopyObject` requests the server has received.
     copies: Arc<AtomicU64>,
     hold: Arc<Hold>,
+    /// Multipart uploads open right now: upload id to key.
+    pending_multipart: Arc<std::sync::Mutex<HashMap<String, String>>>,
 }
 
 /// A `PutObject` whose key ends in `/held` reports in, then waits here.
@@ -69,12 +71,14 @@ struct Hold {
 
 impl TestS3 {
     async fn start() -> Self {
-        Self::start_with(false).await
+        Self::start_with(false, true).await
     }
 
     /// `replace_on_copy` makes `CopyObject` honor the REPLACE directive, as
     /// AWS does. s3s-fs alone copies the source metadata whatever it says.
-    async fn start_with(replace_on_copy: bool) -> Self {
+    /// `lists_multipart` false answers ListMultipartUploads NotImplemented,
+    /// like a server without it.
+    async fn start_with(replace_on_copy: bool, lists_multipart: bool) -> Self {
         let root = TempRoot::new();
         // s3s-fs CreateBucket is create_dir on the bucket path.
         std::fs::create_dir(root.path().join(BUCKET)).expect("bucket dir");
@@ -83,11 +87,14 @@ impl TestS3 {
             arrived: tokio::sync::Semaphore::new(0),
             release: tokio::sync::Semaphore::new(0),
         });
+        let pending_multipart = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let addr = spawn_server(TestFs {
             inner: FileSystem::new(root.path()).expect("s3s filesystem"),
             replace_on_copy,
             copies: Arc::clone(&copies),
             hold: Arc::clone(&hold),
+            pending_multipart: Arc::clone(&pending_multipart),
+            lists_multipart,
         });
         let endpoint = format!("http://{addr}");
         let config = Config {
@@ -108,7 +115,13 @@ impl TestS3 {
             config,
             copies,
             hold,
+            pending_multipart,
         }
+    }
+
+    /// How many multipart uploads the server believes are open.
+    fn pending_count(&self) -> usize {
+        self.pending_multipart.lock().expect("pending").len()
     }
 
     /// Drops the open database, deletes it, and opens a new one on the same volume.
@@ -138,6 +151,9 @@ struct TestFs {
     replace_on_copy: bool,
     copies: Arc<AtomicU64>,
     hold: Arc<Hold>,
+    /// s3s-fs has no ListMultipartUploads, so open uploads are tracked here.
+    pending_multipart: Arc<std::sync::Mutex<HashMap<String, String>>>,
+    lists_multipart: bool,
 }
 
 // Everything the store calls goes to s3s-fs unchanged, except CopyObject and
@@ -148,21 +164,41 @@ impl S3 for TestFs {
         &self,
         req: S3Request<AbortMultipartUploadInput>,
     ) -> S3Result<S3Response<AbortMultipartUploadOutput>> {
-        self.inner.abort_multipart_upload(req).await
+        let upload_id = req.input.upload_id.clone();
+        let out = self.inner.abort_multipart_upload(req).await?;
+        self.pending_multipart
+            .lock()
+            .expect("pending")
+            .remove(&upload_id);
+        Ok(out)
     }
 
     async fn complete_multipart_upload(
         &self,
         req: S3Request<CompleteMultipartUploadInput>,
     ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
-        self.inner.complete_multipart_upload(req).await
+        let upload_id = req.input.upload_id.clone();
+        let out = self.inner.complete_multipart_upload(req).await?;
+        self.pending_multipart
+            .lock()
+            .expect("pending")
+            .remove(&upload_id);
+        Ok(out)
     }
 
     async fn create_multipart_upload(
         &self,
         req: S3Request<CreateMultipartUploadInput>,
     ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
-        self.inner.create_multipart_upload(req).await
+        let key = req.input.key.clone();
+        let out = self.inner.create_multipart_upload(req).await?;
+        if let Some(upload_id) = out.output.upload_id.as_ref() {
+            self.pending_multipart
+                .lock()
+                .expect("pending")
+                .insert(upload_id.clone(), key);
+        }
+        Ok(out)
     }
 
     async fn delete_object(
@@ -198,6 +234,37 @@ impl S3 for TestFs {
         req: S3Request<ListObjectsV2Input>,
     ) -> S3Result<S3Response<ListObjectsV2Output>> {
         self.inner.list_objects_v2(req).await
+    }
+
+    async fn list_multipart_uploads(
+        &self,
+        req: S3Request<ListMultipartUploadsInput>,
+    ) -> S3Result<S3Response<ListMultipartUploadsOutput>> {
+        if !self.lists_multipart {
+            return Err(s3_error!(NotImplemented));
+        }
+        let uploads = self
+            .pending_multipart
+            .lock()
+            .expect("pending")
+            .iter()
+            .filter(|(_, key)| {
+                req.input
+                    .prefix
+                    .as_ref()
+                    .is_none_or(|prefix| key.starts_with(prefix))
+            })
+            .map(|(upload_id, key)| MultipartUpload {
+                key: Some(key.clone()),
+                upload_id: Some(upload_id.clone()),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        Ok(S3Response::new(ListMultipartUploadsOutput {
+            uploads: Some(uploads),
+            is_truncated: Some(false),
+            ..Default::default()
+        }))
     }
 
     async fn put_object(
@@ -1100,7 +1167,7 @@ async fn buffered_stage_is_published_without_a_staging_object() {
 
 #[tokio::test]
 async fn multipart_stage_is_copied_by_the_server_when_it_replaces_metadata() {
-    let s3 = TestS3::start_with(true).await;
+    let s3 = TestS3::start_with(true, true).await;
     assert!(s3.store.server_copy(), "the startup probe saw REPLACE work");
     assert_eq!(s3.copies.load(Ordering::Relaxed), 1, "the probe's copy");
     // The probe cleans up after itself.
@@ -1228,6 +1295,49 @@ async fn startup_deletes_staging_objects_a_crash_left_behind() {
     s3.store.startup().await.expect("startup");
     assert!(!stage_object(&s3, "stage-4").exists());
     assert_eq!(read_piece(&s3, "sat-s", "kept").await, b"piece");
+}
+
+/// A multipart upload abandoned mid-flight is invisible to the object
+/// listing. Startup must abort it through the multipart listing instead.
+#[tokio::test]
+async fn startup_aborts_orphaned_staging_uploads() {
+    let s3 = TestS3::start().await;
+    // `forget` skips Drop's abort, so the upload stays open, as after a crash.
+    let mut orphan = s3.store.stage("orphan").expect("stage");
+    orphan
+        .write(&vec![7u8; PART_SIZE + 1])
+        .await
+        .expect("spill");
+    std::mem::forget(orphan);
+    // An open multipart upload on a piece key is not ours to abort.
+    let mut piece = s3.store.upload("sat-s", "piece", None).expect("put");
+    piece.write(&vec![9u8; PART_SIZE + 1]).await.expect("write");
+    std::mem::forget(piece);
+    assert_eq!(s3.pending_count(), 2);
+
+    s3.store.startup().await.expect("startup");
+    assert!(s3.store.multipart_listing());
+    assert_eq!(s3.pending_count(), 1);
+    assert!(
+        s3.pending_multipart
+            .lock()
+            .expect("pending")
+            .values()
+            .all(|key| !key.contains("/.s"))
+    );
+}
+
+#[tokio::test]
+async fn startup_tolerates_an_endpoint_without_multipart_listing() {
+    let s3 = TestS3::start_with(false, false).await;
+    assert!(!s3.store.multipart_listing());
+    // The sweep ran at start: staging puts still work, and a second startup
+    // is still not an error.
+    let mut stage = s3.store.stage("stage-5").expect("stage");
+    stage.write(b"orphan").await.expect("spill");
+    stage.finish().await.expect("finish spill");
+    s3.store.startup().await.expect("startup");
+    assert!(!stage_object(&s3, "stage-5").exists());
 }
 
 #[tokio::test]
