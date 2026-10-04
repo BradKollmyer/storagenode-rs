@@ -1590,7 +1590,9 @@ impl Upload {
             return Err(err);
         }
         let part_number = self.next_part;
-        let body = ByteStream::from(self.buf.clone());
+        // Move the buffer out instead of cloning it: no 5 MiB copy and no
+        // second allocation per part. The next write regrows the buffer.
+        let body = ByteStream::from(std::mem::take(&mut self.buf));
         let upload_id = match self.upload_id.clone() {
             Some(upload_id) => upload_id,
             None => {
@@ -1630,7 +1632,6 @@ impl Upload {
                 .build(),
         );
         self.next_part += 1;
-        self.buf.clear();
         Ok(())
     }
 
