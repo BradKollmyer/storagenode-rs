@@ -33,6 +33,12 @@ const INTERVAL: Duration = Duration::from_secs(60);
 /// One dial. A failure leaves the row pending for the next tick.
 const DIAL_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// The longest one `Process` stream may run. A healthy stream ends in
+/// seconds — the satellite answers `NotReady`, `ExitFailed`, or
+/// `ExitCompleted` and closes. A silent or endless stream is abandoned and
+/// retried on the next tick instead of holding the satellite's worker.
+const STREAM_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+
 /// drpc `FailedPrecondition`. The satellite refused the exit.
 const RPC_FAILED_PRECONDITION: u64 = 9;
 
@@ -155,6 +161,15 @@ pub(crate) async fn delete_pieces(store: &Store, satellite_id: &str) -> Result<(
 
 /// Dials `Process` while the row is pending. Tests call this directly.
 pub(crate) async fn process_satellite(node: &Node, satellite_id: &str) -> Result<(), String> {
+    process_satellite_within(node, satellite_id, STREAM_TIMEOUT).await
+}
+
+/// [`process_satellite`], with `budget` instead of [`STREAM_TIMEOUT`].
+async fn process_satellite_within(
+    node: &Node,
+    satellite_id: &str,
+    budget: Duration,
+) -> Result<(), String> {
     match node
         .piece_store()
         .exit_row(satellite_id)
@@ -182,12 +197,15 @@ pub(crate) async fn process_satellite(node: &Node, satellite_id: &str) -> Result
     )
     .await
     .map_err(|err| err.to_string())?;
+    // TLS pinned this connection to the satellite's id, so this is its
+    // current leaf. Order limits are verified with it from now on.
+    node.observe_satellite_leaf(id, &transport.peer_cert);
     let mut conn = Conn::new(transport);
     let mut stream = conn
         .open_stream(PROCESS)
         .await
         .map_err(|err| err.to_string())?;
-    let result = recv_exit(node, satellite_id, &mut conn, &stream).await;
+    let result = recv_exit(node, satellite_id, &mut conn, &stream, budget).await;
     let _ = conn.close_send(&mut stream).await;
     result
 }
@@ -197,9 +215,19 @@ async fn recv_exit(
     satellite_id: &str,
     conn: &mut Conn<impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>,
     stream: &storj_rpc::RpcStream,
+    budget: Duration,
 ) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + budget;
     loop {
-        let bytes = match conn.recv_msg_opt(stream).await {
+        let received = match tokio::time::timeout_at(deadline, conn.recv_msg_opt(stream)).await {
+            Ok(received) => received,
+            Err(_) => {
+                return Err(format!(
+                    "graceful exit stream for {satellite_id} did not finish in time"
+                ));
+            }
+        };
+        let bytes = match received {
             Ok(Some(bytes)) => bytes,
             Ok(None) => return Ok(()),
             Err(RpcError::Remote { code, message }) if code == RPC_FAILED_PRECONDITION => {
@@ -607,6 +635,9 @@ mod tests {
         let volume = bucket.root.path().join("volume");
         let node = node_for(bucket.store, &[(&satellite, &address), (&other, "")]);
         node.piece_store().begin_exit(&sat).unwrap();
+        // The exit dial also learns the leaf a rotated satellite now uses.
+        let stale = Identity::generate().unwrap();
+        node.observe_satellite_leaf(satellite.node_id(), stale.leaf_der().as_ref());
         assert_eq!(
             node.piece_store()
                 .exit_row(&sat)
@@ -617,6 +648,10 @@ mod tests {
         );
 
         dial(&node, &sat).await.unwrap();
+        assert_eq!(
+            node.satellite_leaf(satellite.node_id()).unwrap(),
+            satellite.leaf_der().as_ref()
+        );
 
         assert_eq!(seen.lock().unwrap().as_deref(), Some(PROCESS));
         assert!(node.piece_store().info(&sat, "live").unwrap().is_none());
@@ -732,6 +767,53 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(got.bytes, b"abcd");
+    }
+
+    #[tokio::test]
+    async fn a_silent_exit_stream_is_abandoned_and_stays_pending() {
+        let bucket = Bucket::start().await;
+        let satellite = Identity::generate().unwrap();
+        let sat = satellite.node_id().to_string();
+        put(&bucket.store, &sat, "live", b"abcd").await;
+        let address = spawn_silent_satellite(satellite.clone(), Duration::from_secs(10));
+        let node = node_for(bucket.store, &[(&satellite, &address)]);
+        node.piece_store().begin_exit(&sat).unwrap();
+        let err = super::process_satellite_within(&node, &sat, Duration::from_millis(250))
+            .await
+            .expect_err("a silent stream must not hold the worker");
+        assert!(err.contains("did not finish"), "{err}");
+        assert_eq!(
+            node.piece_store().exit_row(&sat).unwrap().unwrap().status,
+            ExitStatus::Pending
+        );
+    }
+
+    /// Accepts the dial and the `Process` stream, then says nothing for
+    /// `hold`. A satellite stuck this way must not hold the worker.
+    fn spawn_silent_satellite(identity: Identity, hold: Duration) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let address = format!("127.0.0.1:{}", listener.local_addr().expect("addr").port());
+        let listener = TcpListener::from_std(listener).expect("tokio");
+        tokio::spawn(async move {
+            let acceptor =
+                tokio_rustls::TlsAcceptor::from(Arc::new(server_config(&identity).expect("tls")));
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let _ = sock.set_nodelay(true);
+            let mut prefix = [0u8; 8];
+            if sock.read_exact(&mut prefix).await.is_err() {
+                return;
+            }
+            // Hold the connection open: the rustls stream must live past the
+            // sleep or the node sees an immediate EOF instead of silence.
+            let Ok(_tls) = acceptor.accept(sock).await else {
+                return;
+            };
+            tokio::time::sleep(hold).await;
+        });
+        address
     }
 
     #[tokio::test]

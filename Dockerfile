@@ -40,6 +40,14 @@ RUN apt-get update \
 COPY --from=rust /src/storagenode-rs/target/release/storagenode /usr/local/bin/storagenode
 COPY --from=ui /work/dist/ /usr/share/storagenode/ui/
 
+# Run as a fixed unprivileged uid. A named volume inherits this directory's
+# ownership; a bind-mounted host directory must be writable by uid 1000.
+RUN groupadd --gid 1000 storj \
+    && useradd --uid 1000 --gid storj --home-dir /var/lib/storj --no-create-home storj \
+    && mkdir -p /var/lib/storj \
+    && chown storj:storj /var/lib/storj
+USER storj
+
 # PLAN.md defaults. Secrets and STORJ_SATELLITES stay runtime configuration.
 ENV STORJ_S3_REGION=us-east-1 \
     STORJ_S3_PREFIX=pieces

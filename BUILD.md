@@ -7,7 +7,7 @@ Read [PLAN.md](PLAN.md) for what the node does. This file is how, and the traps.
 | Path | Role |
 |---|---|
 | `/Volumes/SSD/repos/storj/storagenode-rs` | This project. |
-| `/Volumes/SSD/repos/storj/uplink-rs` | Protocol API. Path-depend. Public crate `storj` does not export identity, frames, or order bytes. |
+| `/Volumes/SSD/repos/storj/uplink-rs` | Protocol API. Path-depend. Public crate `storj` does not export identity, frames, or order bytes. CI pins `bb320c05`; bump the workflows' `ref` on purpose. |
 | `/Volumes/SSD/repos/storj/storj` | Go node and `web/storagenode`. Behavior reference and the Vue app. |
 | `/Volumes/SSD/repos/storj/uplink` | Go uplink. Not a dependency. |
 | `/Volumes/SSD/repos/storj-rust` | Early stub. Do not use. |

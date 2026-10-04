@@ -2,11 +2,12 @@
 //!
 //! The bucket is the source of the bytes, the hash, and the order limit.
 //! Trash lives only here. A missing or unfinished database is rebuilt from
-//! object metadata; every rebuilt row is live. `user_version` stays 0 until
-//! that listing finishes, so a restart does not treat a partial file as done.
-//! Bandwidth orders, the daily transfer counter, the last check-in summary,
-//! and the held-amount, pricing, and stats polls live in the same file. A
-//! second database would not survive the volume the pieces already use.
+//! object metadata; every rebuilt row is live. The `meta` table's `rebuild`
+//! key stays unset until that listing finishes, so a restart does not treat
+//! a partial file as done. Bandwidth orders, the daily transfer counter, the
+//! last check-in summary, and the held-amount, pricing, and stats polls live
+//! in the same file. A second database would not survive the volume the
+//! pieces already use.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -150,10 +151,22 @@ CREATE TABLE IF NOT EXISTS satellite_stats (
     vetted_at INTEGER,
     joined_at INTEGER
 );
+
+CREATE TABLE IF NOT EXISTS meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 ";
 
-/// `PRAGMA user_version` written only after a full prefix listing finishes.
-const REBUILD_VERSION: i64 = 1;
+/// The `meta` key that says a full prefix listing has been applied.
+const REBUILD_KEY: &str = "rebuild";
+
+/// [`REBUILD_KEY`]'s value once the listing has finished.
+const REBUILD_DONE: &str = "done";
+
+/// Files rebuilt before the `meta` table existed say so in
+/// `PRAGMA user_version` instead.
+const LEGACY_REBUILD_VERSION: i64 = 1;
 
 /// `sha256` or `blake3`. Both hashes are 32 bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -568,18 +581,41 @@ impl Index {
 
     /// True after a prefix listing has been fully applied.
     ///
-    /// `user_version` is 0 on a new file and on a file whose rebuild was
-    /// interrupted. File existence is not this bit.
+    /// The `meta` table's `rebuild` key is unset on a new file and on a file
+    /// whose rebuild was interrupted. File existence is not this bit. A file
+    /// written before the `meta` table existed keeps its marker in
+    /// `PRAGMA user_version`; it is carried forward here.
     pub(crate) fn rebuild_done(&self) -> Result<bool> {
+        let marked = self.with(|conn| {
+            conn.query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                params![REBUILD_KEY],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+        })?;
+        if marked.as_deref() == Some(REBUILD_DONE) {
+            return Ok(true);
+        }
         let version = self
             .with(|conn| conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)))?;
-        Ok(version >= REBUILD_VERSION)
+        if version >= LEGACY_REBUILD_VERSION {
+            self.mark_rebuild_done()?;
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     /// Records that the listing finished. Not set from the schema itself.
     pub(crate) fn mark_rebuild_done(&self) -> Result<()> {
-        // `user_version` does not accept a bound parameter.
-        self.with(|conn| conn.pragma_update(None, "user_version", REBUILD_VERSION))
+        self.with(|conn| {
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![REBUILD_KEY, REBUILD_DONE],
+            )
+            .map(|_| ())
+        })
     }
 
     pub(crate) fn upsert(&self, info: &PieceInfo) -> Result<()> {
@@ -699,24 +735,52 @@ impl Index {
     ///
     /// `writing` and `trash` are omitted. A row whose `created_at` equals the
     /// cutoff stays: the filter was built at that instant and does not list it.
+    /// Pages through [`Self::live_page_before`] so the list is not built in
+    /// one query.
     pub(crate) fn live_before(
         &self,
         satellite_id: &str,
         before: SystemTime,
     ) -> Result<Vec<String>> {
+        let mut out = Vec::new();
+        let mut after: Option<String> = None;
+        loop {
+            let page = self.live_page_before(satellite_id, before, after.as_deref(), 1000)?;
+            let full = page.len() == 1000;
+            after = page.last().cloned();
+            out.extend(page);
+            if !full {
+                return Ok(out);
+            }
+        }
+    }
+
+    /// One page of live piece ids created strictly before `before`, in id
+    /// order. `after` is the last id of the previous page; `None` starts at
+    /// the beginning. Retain walks a satellite this way instead of reading
+    /// every live id at once.
+    pub(crate) fn live_page_before(
+        &self,
+        satellite_id: &str,
+        before: SystemTime,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<String>> {
         let before = system_to_millis(before)?;
+        let limit = i64::try_from(limit).map_err(|_| Error::Index("page size overflow".into()))?;
+        let after = after.unwrap_or("");
         self.with(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT piece_id FROM pieces
-                 WHERE satellite = ?1 AND state = 'live' AND created_at < ?2",
+                 WHERE satellite = ?1 AND state = 'live' AND created_at < ?2
+                   AND piece_id > ?3
+                 ORDER BY piece_id
+                 LIMIT ?4",
             )?;
-            let rows =
-                stmt.query_map(params![satellite_id, before], |row| row.get::<_, String>(0))?;
-            let mut out = Vec::new();
-            for row in rows {
-                out.push(row?);
-            }
-            Ok(out)
+            let rows = stmt.query_map(params![satellite_id, before, after, limit], |row| {
+                row.get::<_, String>(0)
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
         })
     }
 
@@ -2028,6 +2092,83 @@ mod tests {
             hash_signature: b"sig".to_vec(),
             hash_timestamp: Some((1_700_000_000, 123_456_789)),
         }
+    }
+
+    #[test]
+    fn live_listing_pages_in_id_order() {
+        let (_dir, path) = temp_db();
+        let index = Index::open(&path).unwrap();
+        let created = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        for id in ["aa", "bb", "cc", "dd", "ee"] {
+            let info = PieceInfo::from_meta("sat", id, 1, &meta(None), PieceState::Live);
+            index.upsert(&info).unwrap();
+        }
+        // Trash and another satellite's rows stay out of the walk.
+        index.trash("sat", "ee", created).unwrap();
+        index
+            .upsert(&PieceInfo::from_meta(
+                "other",
+                "ab",
+                1,
+                &meta(None),
+                PieceState::Live,
+            ))
+            .unwrap();
+        let before = created + Duration::from_secs(60);
+
+        let page1 = index.live_page_before("sat", before, None, 2).unwrap();
+        assert_eq!(page1, ["aa", "bb"]);
+        let page2 = index
+            .live_page_before("sat", before, page1.last().map(String::as_str), 2)
+            .unwrap();
+        assert_eq!(page2, ["cc", "dd"]);
+        let page3 = index
+            .live_page_before("sat", before, page2.last().map(String::as_str), 2)
+            .unwrap();
+        assert!(page3.is_empty(), "ee is trash");
+        let all: Vec<String> = ["aa", "bb", "cc", "dd"].map(str::to_owned).into();
+        assert_eq!(index.live_before("sat", before).unwrap(), all);
+    }
+
+    #[test]
+    fn a_legacy_rebuild_marker_moves_into_the_meta_table() {
+        let (_dir, path) = temp_db();
+        // As written before meta existed: the pieces schema, no meta table,
+        // and a finished listing recorded in user_version.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE pieces (
+                    satellite TEXT NOT NULL,
+                    piece_id TEXT NOT NULL,
+                    size INTEGER NOT NULL,
+                    piece_hash BLOB NOT NULL,
+                    hash_algorithm TEXT NOT NULL,
+                    order_limit BLOB NOT NULL,
+                    hash_signature BLOB NOT NULL,
+                    hash_ts_seconds INTEGER,
+                    hash_ts_nanos INTEGER,
+                    created_at INTEGER NOT NULL,
+                    expires_at INTEGER,
+                    trashed_at INTEGER,
+                    state TEXT NOT NULL CHECK (state IN ('writing', 'live', 'trash')),
+                    PRIMARY KEY (satellite, piece_id)
+                );",
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 1).unwrap();
+        }
+        let index = Index::open(&path).unwrap();
+        assert!(index.rebuild_done().unwrap());
+
+        // Unfinished files stay unfinished.
+        let (_dir2, path2) = temp_db();
+        let index = Index::open(&path2).unwrap();
+        assert!(!index.rebuild_done().unwrap());
+        let version: i64 = index
+            .with(|conn| conn.query_row("PRAGMA user_version", [], |row| row.get(0)))
+            .unwrap();
+        assert_eq!(version, 0, "user_version is no longer the marker");
     }
 
     #[test]

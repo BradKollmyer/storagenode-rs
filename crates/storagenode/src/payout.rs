@@ -354,6 +354,9 @@ async fn dial(
         )
         .await
         .map_err(|err| RpcFail::Other(err.to_string()))?;
+        // TLS pinned this connection to the satellite's id, so this is its
+        // current leaf. Order limits are verified with it from now on.
+        node.observe_satellite_leaf(id, &transport.peer_cert);
         let mut conn = Conn::new(transport);
         conn.invoke(path, request).await.map_err(|err| match err {
             storj_rpc::Error::Remote {
@@ -831,6 +834,12 @@ mod tests {
         assert_month_zeros(&body);
 
         script.paths.lock().expect("paths").clear();
+        // A stale leaf (a rotation check-in has not seen) is replaced by the
+        // one the satellite presents on the poll dial.
+        let stale = Identity::generate().expect("stale");
+        fixture
+            .node
+            .observe_satellite_leaf(live.node_id(), stale.leaf_der().as_ref());
         let err = poll(&fixture.node, Duration::from_secs(5))
             .await
             .expect_err("dead satellite");
@@ -838,6 +847,13 @@ mod tests {
         assert!(!err.contains(&live_id), "{err}");
         assert!(!err.contains(&empty_id), "{err}");
         assert!(!err.contains(&untrusted_id), "{err}");
+        assert_eq!(
+            fixture
+                .node
+                .satellite_leaf(live.node_id())
+                .expect("live leaf"),
+            live.leaf_der().as_ref()
+        );
         assert!(
             !fixture
                 .node

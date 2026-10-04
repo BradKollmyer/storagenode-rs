@@ -80,6 +80,10 @@ const CHORE_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// Rows retain trashes per sqlite transaction. Other RPCs run in between.
 const RETAIN_BATCH: usize = 1000;
 
+/// Piece ids read per query while walking a satellite for retain. A
+/// well-filled node holds too many for one list.
+const RETAIN_PAGE: usize = 10_000;
+
 /// Go `piecestore.Config.ReportCapacityThreshold`. An upload that finds less
 /// free space than this asks for a check-in now, so the satellite stops
 /// selecting a node that is about to refuse uploads.
@@ -97,6 +101,12 @@ const EXPIRATION_GRACE: Duration = Duration::from_secs(48 * 60 * 60);
 
 /// How long a refused RPC waits for the peer to hang up before this side does.
 const ERROR_LINGER: Duration = Duration::from_secs(5);
+
+/// How long a finished RPC waits for the client's close packet. The Go
+/// client writes it right after reading the response. Without this bound a
+/// peer that says nothing more holds the connection for the whole per-read
+/// deadline.
+const CLOSE_LINGER: Duration = Duration::from_secs(10);
 
 /// Pause after a failed `accept`, so a full descriptor table is not a busy loop.
 const ACCEPT_RETRY: Duration = Duration::from_millis(250);
@@ -489,8 +499,9 @@ impl Node {
             Ok(()) => {
                 // The client writes Close only after reading the response.
                 // Dropping the socket first turns that write into EPIPE and
-                // fails an RPC that already succeeded.
-                let _ = out.conn.read_packet().await;
+                // fails an RPC that already succeeded. A client that never
+                // writes it gives up the connection after the linger budget.
+                let _ = tokio::time::timeout(CLOSE_LINGER, out.conn.read_packet()).await;
                 Ok(out.conn.into_inner())
             }
             Err(Fail::Proto { code, message }) => {
@@ -1081,26 +1092,38 @@ impl Node {
             return Ok(());
         };
         let sat = peer.to_string();
-        let pieces = self
-            .store
-            .live_created_before(&sat, created_before)
-            .map_err(store_err)?;
-        let mut rejected = Vec::new();
-        for piece_id in pieces {
-            if !filter.contains(&decode_piece_id(&piece_id)?) {
-                rejected.push(piece_id);
+        // Page the walk: the piece list of a well-filled node does not fit
+        // one query's memory. One transaction per batch, not one commit per
+        // piece. A row that is gone, or no longer live, between the list and
+        // the flag is skipped.
+        let now = SystemTime::now();
+        let mut after: Option<String> = None;
+        loop {
+            let page = self
+                .store
+                .live_page_before(&sat, created_before, after.as_deref(), RETAIN_PAGE)
+                .map_err(store_err)?;
+            if page.is_empty() {
+                return Ok(());
+            }
+            after = page.last().cloned();
+            let full = page.len() == RETAIN_PAGE;
+            let mut rejected = Vec::new();
+            for piece_id in page {
+                if !filter.contains(&decode_piece_id(&piece_id)?) {
+                    rejected.push(piece_id);
+                }
+            }
+            for batch in rejected.chunks(RETAIN_BATCH) {
+                self.store
+                    .trash_created_before(&sat, batch, created_before, now)
+                    .map_err(store_err)?;
+                tokio::task::yield_now().await;
+            }
+            if !full {
+                return Ok(());
             }
         }
-        // One transaction per batch, not one commit per piece. A row that is
-        // gone, or no longer live, between the list and the flag is skipped.
-        let now = SystemTime::now();
-        for batch in rejected.chunks(RETAIN_BATCH) {
-            self.store
-                .trash_created_before(&sat, batch, created_before, now)
-                .map_err(store_err)?;
-            tokio::task::yield_now().await;
-        }
-        Ok(())
     }
 
     /// Puts every trashed piece of the calling satellite back to live.
@@ -1380,6 +1403,7 @@ impl Node {
                 &self.identity,
                 &db,
                 |id| self.satellites.get(&id).map(|sat| sat.address.clone()),
+                &|id, leaf| self.observe_satellite_leaf(id, leaf),
                 now,
             )
             .await;
@@ -1412,10 +1436,30 @@ impl Node {
 /// `by_deadline` holds the same keys in expiry order. Every upload and
 /// download reserves a serial under one lock, so dropping the expired ones
 /// must cost their number, not a scan of every serial still valid.
-#[derive(Default)]
+///
+/// Go's table is capped at 1 MiB and drops a random serial once surpassed.
+/// Here the cap is a count of similar size, and the serial with the nearest
+/// deadline goes first: it would have expired soonest, so the replay gap it
+/// opens is the smallest.
 struct Serials {
     used: HashSet<([u8; 32], Vec<u8>)>,
     by_deadline: BTreeSet<(SystemTime, [u8; 32], Vec<u8>)>,
+    /// The most serials held at once. 16-byte serials plus 32-byte satellite
+    /// ids and map overhead are about 100 bytes each, so this is ~1 MiB.
+    max: usize,
+}
+
+/// Go `piecestore.Config.MaxUsedSerialsSize` (1 MiB), as a serial count.
+const MAX_SERIALS: usize = 10_000;
+
+impl Default for Serials {
+    fn default() -> Self {
+        Self {
+            used: HashSet::new(),
+            by_deadline: BTreeSet::new(),
+            max: MAX_SERIALS,
+        }
+    }
 }
 
 impl Serials {
@@ -1428,20 +1472,36 @@ impl Serials {
         deadline: SystemTime,
         now: SystemTime,
     ) -> bool {
+        self.drop_expired(now);
+        let key = (*satellite.as_bytes(), serial.to_vec());
+        if self.used.contains(&key) {
+            return false;
+        }
+        while self.used.len() >= self.max {
+            // Full: forget the serial whose deadline is nearest.
+            if !self.drop_first() {
+                break;
+            }
+        }
+        self.used.insert(key.clone());
+        self.by_deadline.insert((deadline, key.0, key.1));
+        true
+    }
+
+    fn drop_expired(&mut self, now: SystemTime) {
         while let Some(first) = self.by_deadline.first()
             && first.0 <= now
         {
-            let Some((_, satellite, serial)) = self.by_deadline.pop_first() else {
-                break;
-            };
-            self.used.remove(&(satellite, serial));
+            self.drop_first();
         }
-        let satellite = *satellite.as_bytes();
-        if !self.used.insert((satellite, serial.to_vec())) {
+    }
+
+    /// Removes the entry with the nearest deadline. False when empty.
+    fn drop_first(&mut self) -> bool {
+        let Some((_, satellite, serial)) = self.by_deadline.pop_first() else {
             return false;
-        }
-        self.by_deadline
-            .insert((deadline, satellite, serial.to_vec()));
+        };
+        self.used.remove(&(satellite, serial));
         true
     }
 }
@@ -2070,10 +2130,10 @@ fn serial_deadline(limit: &OrderLimit, now: SystemTime) -> SystemTime {
 #[cfg(test)]
 mod tests {
     use super::{
-        CONTACT_PING_NODE, EXPIRATION_GRACE, GO_ZERO_TIME_UNIX, Node, PIECESTORE_EXISTS,
-        PIECESTORE_RESTORE_TRASH, PIECESTORE_RETAIN, PIECESTORE_RETAIN_BIG, RETAIN_MAX_TIME_SKEW,
-        Serials, TrustedSatellite, creation_ok, encode_hex, expired, serial_deadline,
-        system_to_timestamp,
+        CLOSE_LINGER, CONTACT_PING_NODE, EXPIRATION_GRACE, GO_ZERO_TIME_UNIX, Node,
+        PIECESTORE_EXISTS, PIECESTORE_RESTORE_TRASH, PIECESTORE_RETAIN, PIECESTORE_RETAIN_BIG,
+        RETAIN_MAX_TIME_SKEW, Serials, TrustedSatellite, creation_ok, encode_hex, expired,
+        serial_deadline, system_to_timestamp,
     };
     use std::future::Future;
     use std::net::SocketAddr;
@@ -2397,6 +2457,45 @@ mod tests {
         assert!(serials.reserve(sat, b"c", end + Duration::from_secs(1), end));
         assert_eq!(serials.used.len(), 1);
         assert_eq!(serials.by_deadline.len(), 1);
+    }
+
+    #[test]
+    fn a_full_window_evicts_the_serial_that_expires_soonest() {
+        let sat = Identity::generate().unwrap().node_id();
+        let t0 = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let at = |secs: u64| t0 + Duration::from_secs(secs);
+        let mut serials = Serials {
+            max: 2,
+            ..Serials::default()
+        };
+        assert!(serials.reserve(sat, b"a", at(10), t0));
+        assert!(serials.reserve(sat, b"c", at(100), t0));
+        // At the cap a repeat of a held serial is still a replay, not a slot.
+        assert!(!serials.reserve(sat, b"c", at(200), t0));
+        // Full: `a`, the nearest deadline, is forgotten so `z` fits.
+        assert!(serials.reserve(sat, b"z", at(50), t0));
+        assert!(
+            !serials.reserve(sat, b"z", at(60), t0),
+            "replay of a held serial"
+        );
+        // Inserting `a` back evicts `z` (deadline 50), not `c` (100).
+        assert!(serials.reserve(sat, b"a", at(70), t0), "`a` was evicted");
+        let held: std::collections::HashSet<_> = serials.used.iter().cloned().collect();
+        assert_eq!(
+            held,
+            [
+                (*sat.as_bytes(), b"c".to_vec()),
+                (*sat.as_bytes(), b"a".to_vec())
+            ]
+            .into_iter()
+            .collect()
+        );
+        // Expired serials are dropped before any live eviction is needed:
+        // at t101 `c` is gone, so the next two inserts evict `a` (t70) only.
+        let now = at(101);
+        assert!(serials.reserve(sat, b"d", at(200), now));
+        assert!(serials.reserve(sat, b"e", at(300), now));
+        assert!(!serials.reserve(sat, b"d", at(400), now), "replay");
     }
 
     #[test]
@@ -3583,6 +3682,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_finished_rpc_does_not_wait_forever_for_the_client_close() {
+        let satellite = Identity::generate().unwrap();
+        let harness = Harness::start(std::slice::from_ref(&satellite)).await;
+        let request = ExistsRequest {
+            piece_ids: vec![vec![0x11; 32]],
+        };
+        // open_stream + send, not invoke: this client never writes its close.
+        let mut conn = harness.conn(&satellite).await;
+        let mut stream = conn.open_stream(PIECESTORE_EXISTS).await.unwrap();
+        conn.send_msg(&mut stream, &request.encode_to_vec())
+            .await
+            .unwrap();
+        let reply = conn.recv_msg(&stream).await.expect("reply");
+        ExistsResponse::decode(reply.as_slice()).unwrap();
+
+        // The response is here and the stream's close frame arrives next.
+        // What must not arrive until the linger budget passes is the end of
+        // the connection itself.
+        let started = std::time::Instant::now();
+        tokio::time::timeout(CLOSE_LINGER + Duration::from_secs(5), async {
+            loop {
+                match conn.read_packet().await {
+                    Ok(pkt) if matches!(pkt.kind, Kind::CLOSE | Kind::CANCEL | Kind::ERROR) => {}
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+        })
+        .await
+        .expect("the server lingers for the close, then hangs up");
+        assert!(started.elapsed() >= CLOSE_LINGER, "hung up too early");
+    }
+
+    #[tokio::test]
     async fn satellite_ping_back_is_answered_over_tls_and_quic() {
         let satellite = Identity::generate().unwrap();
         let uplink = Identity::generate().unwrap();
@@ -4348,6 +4481,57 @@ mod tests {
 
         harness.node.settle_orders(closed_now()).await;
         assert_eq!(log.windows().len(), 1, "accepted window is not sent again");
+    }
+
+    #[tokio::test]
+    async fn settlement_dial_follows_a_rotated_satellite_leaf() {
+        let satellite = Identity::generate().unwrap();
+        let uplink = Identity::generate().unwrap();
+        let log = SettlementLog::new();
+        let sat_addr = spawn_settlement_satellite(satellite.clone(), Arc::clone(&log));
+        let harness = Harness::start_with(
+            std::slice::from_ref(&satellite),
+            &[&format!("127.0.0.1:{}", sat_addr.port())],
+        )
+        .await;
+        let piece_key = PiecePrivateKey::generate();
+        let put = signed_limit(
+            &satellite,
+            &harness.identity,
+            &piece_key,
+            &[0x53; 32],
+            PieceAction::Put,
+            3,
+        );
+        let mut client = harness
+            .client(&uplink, &satellite)
+            .await
+            .with_hash_algo(PieceHashAlgo::Sha256);
+        client
+            .upload(&put, &piece_key, b"abc")
+            .await
+            .expect("upload");
+        wait_idle(&harness.node).await;
+
+        // The certificate rotated and no check-in has seen the new leaf yet:
+        // order limits signed by it are refused.
+        let rotated = Identity::generate().unwrap();
+        harness
+            .node
+            .observe_satellite_leaf(satellite.node_id(), rotated.leaf_der().as_ref());
+        assert_eq!(
+            harness.node.satellite_leaf(satellite.node_id()).unwrap(),
+            rotated.leaf_der().as_ref()
+        );
+
+        // The settlement dial is pinned to the satellite id, so its current
+        // leaf is trusted the moment it answers.
+        harness.node.settle_orders(closed_now()).await;
+        assert_eq!(
+            harness.node.satellite_leaf(satellite.node_id()).unwrap(),
+            satellite.leaf_der().as_ref()
+        );
+        assert_eq!(log.windows().len(), 1);
     }
 
     #[tokio::test]

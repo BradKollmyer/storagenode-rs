@@ -193,6 +193,11 @@ pub async fn run(config: Config) -> Result<(), Error> {
             "storagenode: the S3 endpoint does not replace metadata on CopyObject: pieces over 5 MiB are copied through this node"
         );
     }
+    if !node.piece_store().multipart_listing() {
+        eprintln!(
+            "storagenode: the S3 endpoint cannot list multipart uploads: staging uploads abandoned by a crash stay open; abort them by hand or with a bucket lifecycle rule"
+        );
+    }
     let dashboard = Arc::new(dashboard::Dashboard::new(Arc::clone(&node), &config));
     let (dashboard_listener, dashboard_addr) = dashboard::listen().await?;
     let listener = Node::listen(config.listen).await?;

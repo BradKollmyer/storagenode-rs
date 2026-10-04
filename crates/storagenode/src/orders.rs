@@ -121,11 +121,16 @@ impl Orders {
     }
 
     /// Sends every closed idle hour. Dial and RPC errors leave the hour unsent.
+    ///
+    /// `on_peer` sees the leaf a satellite presented on its (node-id pinned)
+    /// connection, so limit verification follows a rotated certificate
+    /// without waiting for the next check-in.
     pub(crate) async fn settle(
         &self,
         identity: &Identity,
         db: &OrderRows,
         address_of: impl Fn(NodeId) -> Option<String>,
+        on_peer: &impl Fn(NodeId, &[u8]),
         now: SystemTime,
     ) {
         let cutoff = now.checked_sub(ARCHIVE_KEEP).unwrap_or(UNIX_EPOCH);
@@ -179,7 +184,7 @@ impl Orders {
                     if good.is_empty() {
                         continue;
                     }
-                    match settle_window(identity, &address, satellite, &good).await {
+                    match settle_window(identity, &address, satellite, &good, on_peer).await {
                         Ok(status) => self.archive(db, &good, status, now),
                         Err(err) => {
                             eprintln!(
@@ -303,6 +308,7 @@ async fn settle_window(
     address: &str,
     satellite: NodeId,
     orders: &[StoredOrder],
+    on_peer: &impl Fn(NodeId, &[u8]),
 ) -> Result<i32, String> {
     let requests = settlement_requests(orders)?;
     let transport = transport::dial(
@@ -315,6 +321,9 @@ async fn settle_window(
     )
     .await
     .map_err(|err| err.to_string())?;
+    // TLS pinned this connection to the satellite's id, so this is its
+    // current leaf. Order limits are verified with it from now on.
+    on_peer(satellite, &transport.peer_cert);
     let mut conn = Conn::new(transport);
     let mut stream = conn
         .open_stream(SETTLEMENT_WITH_WINDOW)
