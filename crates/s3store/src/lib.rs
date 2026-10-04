@@ -312,6 +312,10 @@ impl Store {
         } else {
             config.prefix
         };
+        // Fail startup, not the first upload, when STORJ_S3_PREFIX cannot
+        // form a safe key. Trimming matches [`object_key`] and [`stage_key`],
+        // for which a prefix of only slashes is the bucket root.
+        check_prefix(prefix.trim_matches('/'))?;
 
         // Static keys only. Do not fall through to the environment credential chain.
         let credentials = Credentials::new(
@@ -1924,11 +1928,7 @@ fn stage_key(prefix: &str, stage_id: &str) -> Result<String> {
     if prefix.is_empty() {
         return Ok(format!(".s{stage_id}"));
     }
-    for segment in prefix.split('/') {
-        if segment.is_empty() || segment == "." || segment == ".." {
-            return Err(Error::InvalidKey("prefix is not a safe path".into()));
-        }
-    }
+    check_prefix(prefix)?;
     Ok(format!("{prefix}/.s{stage_id}"))
 }
 
@@ -2181,12 +2181,22 @@ fn object_key(prefix: &str, satellite_id: &str, piece_id: &str) -> Result<String
     if prefix.is_empty() {
         return Ok(format!("{satellite_id}/{piece_id}"));
     }
+    check_prefix(prefix)?;
+    Ok(format!("{prefix}/{satellite_id}/{piece_id}"))
+}
+
+/// A prefix is slash-separated path segments. `"."`, `".."`, and empty
+/// segments are not safe in one.
+fn check_prefix(prefix: &str) -> Result<()> {
+    if prefix.is_empty() {
+        return Ok(());
+    }
     for segment in prefix.split('/') {
         if segment.is_empty() || segment == "." || segment == ".." {
             return Err(Error::InvalidKey("prefix is not a safe path".into()));
         }
     }
-    Ok(format!("{prefix}/{satellite_id}/{piece_id}"))
+    Ok(())
 }
 
 fn check_id(what: &str, value: &str) -> Result<()> {
@@ -2297,6 +2307,37 @@ mod tests {
         assert!(object_key("pieces", "sa/t", "piece").is_err());
         assert!(object_key("pieces", "sat", "..").is_err());
         assert!(object_key("a/../b", "sat", "piece").is_err());
+    }
+
+    #[test]
+    fn store_rejects_an_unsafe_prefix_at_open() {
+        let unique = std::env::temp_dir().join(format!(
+            "s3store-prefix-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|dur| dur.as_nanos())
+                .unwrap_or(0)
+        ));
+        let config = |prefix: &str| Config {
+            endpoint: "http://127.0.0.1:1".to_owned(),
+            bucket: "pieces".to_owned(),
+            access_key_id: "ak".to_owned(),
+            secret_access_key: "sk".to_owned(),
+            prefix: prefix.to_owned(),
+            volume: unique.join("volume"),
+            ..Config::default()
+        };
+        for prefix in ["a/../b", "a//b", "..", "."] {
+            let result = Store::new(config(prefix));
+            assert!(
+                matches!(result, Err(Error::InvalidKey(_))),
+                "prefix {prefix:?}: {result:?}"
+            );
+        }
+        for prefix in ["pieces", "a b/c", "/", ""] {
+            Store::new(config(prefix)).unwrap_or_else(|err| panic!("prefix {prefix:?}: {err}"));
+        }
+        let _ = std::fs::remove_dir_all(&unique);
     }
 
     #[test]
