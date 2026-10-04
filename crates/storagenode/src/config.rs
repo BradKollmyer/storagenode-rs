@@ -177,17 +177,31 @@ fn valid_wallet(value: &str) -> bool {
     rest.len() == 40 && rest.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-/// A `host:port` satellites can dial back. The host is a name, an IP, or a
-/// bracketed IPv6 literal, so it is checked for presence, not resolution.
+/// A `host:port` satellites can dial back. The host is a name, an IPv4
+/// address, or a bracketed IPv6 literal. It is checked for shape, not
+/// resolution: an unbracketed colon is read as another port separator, and
+/// the node would advertise an address satellites cannot dial.
 fn valid_address(value: &str) -> bool {
     let Some((host, port)) = value.rsplit_once(':') else {
         return false;
     };
-    let host = host
-        .strip_prefix('[')
-        .and_then(|h| h.strip_suffix(']'))
-        .unwrap_or(host);
-    !host.is_empty() && port.parse::<u16>().is_ok_and(|port| port > 0)
+    if !port.parse::<u16>().is_ok_and(|port| port > 0) {
+        return false;
+    }
+    let host = if let Some(inner) = host.strip_prefix('[') {
+        let Some(inner) = inner.strip_suffix(']') else {
+            return false;
+        };
+        if inner.is_empty() || inner.contains('[') || inner.contains(']') {
+            return false;
+        }
+        inner
+    } else if host.contains(':') || host.contains('[') || host.contains(']') {
+        return false;
+    } else {
+        host
+    };
+    !host.is_empty()
 }
 
 #[cfg(test)]
@@ -261,6 +275,13 @@ mod tests {
             "example.com:0",
             ":28967",
             "example.com:99999",
+            "2001:db8::1",
+            "2001:db8::1:28967",
+            "example.com:28967:1",
+            "[]:28967",
+            "[2001:db8::1",
+            "2001:db8::1]:28967",
+            "[[2001:db8::1]]:28967",
         ] {
             let err = sample(&[("STORJ_CONTACT_EXTERNAL_ADDRESS", bad)]).unwrap_err();
             assert!(matches!(err, Error::ExternalAddress), "{bad}: {err}");
@@ -269,6 +290,7 @@ mod tests {
             "example.com:28967",
             "203.0.113.5:28967",
             "[2001:db8::9]:28967",
+            "[::1]:28967",
         ] {
             sample(&[("STORJ_CONTACT_EXTERNAL_ADDRESS", good)]).expect(good);
         }
