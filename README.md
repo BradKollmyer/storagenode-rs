@@ -8,7 +8,7 @@ The node speaks the storagenode piecestore protocol over TLS, Noise, and QUIC. I
 
 Protocol types and crypto come from a sibling `uplink-rs` checkout (`storj-proto`, `storj-rpc`, `storj-uplink`). The Go node in `storj` is the behavior reference. Neither tree is modified.
 
-License `MIT OR Apache-2.0`. Edition 2024. Rust 1.91.1.
+License `MIT OR Apache-2.0` ([LICENSE-MIT](LICENSE-MIT), [LICENSE-APACHE](LICENSE-APACHE)). Edition 2024. Rust 1.91.1.
 
 ## Layout
 
