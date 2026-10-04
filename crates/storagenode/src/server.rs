@@ -1420,10 +1420,30 @@ impl Node {
 /// `by_deadline` holds the same keys in expiry order. Every upload and
 /// download reserves a serial under one lock, so dropping the expired ones
 /// must cost their number, not a scan of every serial still valid.
-#[derive(Default)]
+///
+/// Go's table is capped at 1 MiB and drops a random serial once surpassed.
+/// Here the cap is a count of similar size, and the serial with the nearest
+/// deadline goes first: it would have expired soonest, so the replay gap it
+/// opens is the smallest.
 struct Serials {
     used: HashSet<([u8; 32], Vec<u8>)>,
     by_deadline: BTreeSet<(SystemTime, [u8; 32], Vec<u8>)>,
+    /// The most serials held at once. 16-byte serials plus 32-byte satellite
+    /// ids and map overhead are about 100 bytes each, so this is ~1 MiB.
+    max: usize,
+}
+
+/// Go `piecestore.Config.MaxUsedSerialsSize` (1 MiB), as a serial count.
+const MAX_SERIALS: usize = 10_000;
+
+impl Default for Serials {
+    fn default() -> Self {
+        Self {
+            used: HashSet::new(),
+            by_deadline: BTreeSet::new(),
+            max: MAX_SERIALS,
+        }
+    }
 }
 
 impl Serials {
@@ -1436,20 +1456,36 @@ impl Serials {
         deadline: SystemTime,
         now: SystemTime,
     ) -> bool {
+        self.drop_expired(now);
+        let key = (*satellite.as_bytes(), serial.to_vec());
+        if self.used.contains(&key) {
+            return false;
+        }
+        while self.used.len() >= self.max {
+            // Full: forget the serial whose deadline is nearest.
+            if !self.drop_first() {
+                break;
+            }
+        }
+        self.used.insert(key.clone());
+        self.by_deadline.insert((deadline, key.0, key.1));
+        true
+    }
+
+    fn drop_expired(&mut self, now: SystemTime) {
         while let Some(first) = self.by_deadline.first()
             && first.0 <= now
         {
-            let Some((_, satellite, serial)) = self.by_deadline.pop_first() else {
-                break;
-            };
-            self.used.remove(&(satellite, serial));
+            self.drop_first();
         }
-        let satellite = *satellite.as_bytes();
-        if !self.used.insert((satellite, serial.to_vec())) {
+    }
+
+    /// Removes the entry with the nearest deadline. False when empty.
+    fn drop_first(&mut self) -> bool {
+        let Some((_, satellite, serial)) = self.by_deadline.pop_first() else {
             return false;
-        }
-        self.by_deadline
-            .insert((deadline, satellite, serial.to_vec()));
+        };
+        self.used.remove(&(satellite, serial));
         true
     }
 }
@@ -2405,6 +2441,39 @@ mod tests {
         assert!(serials.reserve(sat, b"c", end + Duration::from_secs(1), end));
         assert_eq!(serials.used.len(), 1);
         assert_eq!(serials.by_deadline.len(), 1);
+    }
+
+    #[test]
+    fn a_full_window_evicts_the_serial_that_expires_soonest() {
+        let sat = Identity::generate().unwrap().node_id();
+        let t0 = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let at = |secs: u64| t0 + Duration::from_secs(secs);
+        let mut serials = Serials {
+            max: 2,
+            ..Serials::default()
+        };
+        assert!(serials.reserve(sat, b"a", at(10), t0));
+        assert!(serials.reserve(sat, b"c", at(100), t0));
+        // At the cap a repeat of a held serial is still a replay, not a slot.
+        assert!(!serials.reserve(sat, b"c", at(200), t0));
+        // Full: `a`, the nearest deadline, is forgotten so `z` fits.
+        assert!(serials.reserve(sat, b"z", at(50), t0));
+        assert!(!serials.reserve(sat, b"z", at(60), t0), "replay of a held serial");
+        // Inserting `a` back evicts `z` (deadline 50), not `c` (100).
+        assert!(serials.reserve(sat, b"a", at(70), t0), "`a` was evicted");
+        let held: std::collections::HashSet<_> = serials.used.iter().cloned().collect();
+        assert_eq!(
+            held,
+            [(*sat.as_bytes(), b"c".to_vec()), (*sat.as_bytes(), b"a".to_vec())]
+                .into_iter()
+                .collect()
+        );
+        // Expired serials are dropped before any live eviction is needed:
+        // at t101 `c` is gone, so the next two inserts evict `a` (t70) only.
+        let now = at(101);
+        assert!(serials.reserve(sat, b"d", at(200), now));
+        assert!(serials.reserve(sat, b"e", at(300), now));
+        assert!(!serials.reserve(sat, b"d", at(400), now), "replay");
     }
 
     #[test]
