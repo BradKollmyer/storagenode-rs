@@ -99,9 +99,12 @@ pub(crate) async fn serve(node: Arc<Node>, operator: Operator) {
         let node = Arc::clone(&node);
         let operator = operator.clone();
         tokio::spawn(async move {
+            // Subscribed before the dial, so a reservation during it stays
+            // pending for this satellite after the dial returns.
+            let mut low_space = node.subscribe_low_space();
             loop {
                 retry(&node, &operator, id, &address).await;
-                next_check_in(&node, Instant::now(), INTERVAL, LOW_SPACE_COOLDOWN).await;
+                next_check_in(&mut low_space, Instant::now(), INTERVAL, LOW_SPACE_COOLDOWN).await;
             }
         });
     }
@@ -112,18 +115,29 @@ pub(crate) async fn serve(node: Arc<Node>, operator: Operator) {
 ///
 /// The satellite learns the free space only at check-in. Without this a full
 /// node stays selected, and refuses uploads, for up to the whole interval.
+///
+/// `low_space` belongs to one satellite loop. A reservation while that loop is
+/// inside the dial is still waiting here, and the other loops keep their own.
 pub(crate) async fn next_check_in(
-    node: &Node,
+    low_space: &mut tokio::sync::watch::Receiver<u64>,
     last: Instant,
     interval: Duration,
     cooldown: Duration,
 ) {
-    tokio::select! {
-        () = tokio::time::sleep(interval) => {}
-        () = node.low_space() => {
-            let wait = cooldown.saturating_sub(last.elapsed());
-            tokio::time::sleep(wait).await;
+    let signaled = if low_space.has_changed().unwrap_or(false) {
+        true
+    } else {
+        tokio::select! {
+            biased;
+            result = low_space.changed() => result.is_ok(),
+            () = tokio::time::sleep(interval) => false,
         }
+    };
+    if signaled {
+        let wait = cooldown.saturating_sub(last.elapsed());
+        tokio::time::sleep(wait).await;
+        // Reservations during the cooldown are the same full disk.
+        let _ = low_space.borrow_and_update();
     }
 }
 

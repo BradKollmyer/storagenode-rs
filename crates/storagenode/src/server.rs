@@ -172,8 +172,9 @@ pub struct Node {
     serials: Mutex<Serials>,
     /// Committed free allocation and space reserved by unfinished uploads.
     free_space: Mutex<FreeSpace>,
-    /// Wakes the check-in loops when an upload finds the node low on space.
-    low_space: tokio::sync::Notify,
+    /// Bumped when an upload finds the node low on space. Each check-in loop
+    /// keeps its own receiver, so a bump during a dial is still there later.
+    low_space: tokio::sync::watch::Sender<u64>,
     orders: Orders,
     acceptor: tokio_rustls::TlsAcceptor,
     /// One X25519 key. Check-in attests the public half.
@@ -272,7 +273,7 @@ impl Node {
             satellites,
             serials: Mutex::new(Serials::default()),
             free_space: Mutex::new(FreeSpace::default()),
-            low_space: tokio::sync::Notify::new(),
+            low_space: tokio::sync::watch::Sender::new(0),
             orders: Orders::new(),
             acceptor: tokio_rustls::TlsAcceptor::from(Arc::new(config)),
             noise,
@@ -358,9 +359,10 @@ impl Node {
         )
     }
 
-    /// Resolves when an upload next finds the node low on space.
-    pub(crate) async fn low_space(&self) {
-        self.low_space.notified().await;
+    /// This loop's view of the low-space generation. The current value counts
+    /// as already seen, so only a reservation after this call wakes the loop.
+    pub(crate) fn subscribe_low_space(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.low_space.subscribe()
     }
 
     /// Free disk reported at check-in: allocation minus the sum of live sizes.
@@ -1384,7 +1386,8 @@ impl Node {
             free
         };
         if free.saturating_sub(need) < REPORT_CAPACITY_THRESHOLD {
-            self.low_space.notify_waiters();
+            self.low_space
+                .send_modify(|generation| *generation = generation.wrapping_add(1));
         }
         if need > free {
             return Err(Fail::proto(
@@ -4165,10 +4168,10 @@ mod tests {
             let harness =
                 Harness::open_allocated(std::slice::from_ref(&satellite), &[], None, allocated)
                     .await;
-            let node = Arc::clone(&harness.node);
+            let mut low_space = harness.node.subscribe_low_space();
             let last = std::time::Instant::now();
             let waiting = tokio::spawn(async move {
-                crate::checkin::next_check_in(&node, last, hour, cooldown).await;
+                crate::checkin::next_check_in(&mut low_space, last, hour, cooldown).await;
             });
             tokio::time::sleep(Duration::from_millis(50)).await;
             assert!(!waiting.is_finished());
@@ -4199,6 +4202,43 @@ mod tests {
                 waiting.abort();
             }
         }
+    }
+
+    #[tokio::test]
+    async fn low_space_during_a_dial_stays_pending_for_every_satellite() {
+        let satellite = Identity::generate().unwrap();
+        let uplink = Identity::generate().unwrap();
+        let piece_key = PiecePrivateKey::generate();
+        let harness =
+            Harness::open_allocated(std::slice::from_ref(&satellite), &[], None, 1 << 30).await;
+        let mut first = harness.node.subscribe_low_space();
+        let mut second = harness.node.subscribe_low_space();
+        let put = signed_limit(
+            &satellite,
+            &harness.identity,
+            &piece_key,
+            &[0x72; 32],
+            PieceAction::Put,
+            4,
+        );
+        let mut client = harness.client(&uplink, &satellite).await;
+        client
+            .upload(&put, &piece_key, b"abcd")
+            .await
+            .expect("upload");
+
+        let hour = Duration::from_secs(60 * 60);
+        let cooldown = Duration::from_millis(300);
+        let last = std::time::Instant::now();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                crate::checkin::next_check_in(&mut first, last, hour, cooldown),
+                crate::checkin::next_check_in(&mut second, last, hour, cooldown),
+            );
+        })
+        .await
+        .expect("both satellites still have the low-space signal");
+        assert!(last.elapsed() >= cooldown, "the cooldown still applies");
     }
 
     #[tokio::test]
