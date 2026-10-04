@@ -365,9 +365,26 @@ impl Node {
         self.low_space.subscribe()
     }
 
-    /// Free disk reported at check-in: allocation minus the sum of live sizes.
+    /// Free bytes advertised at check-in, minus space an open upload has reserved.
+    ///
+    /// While an upload is reserved, the index may have replaced a live row with
+    /// `writing` and omitted the old size, so this uses the cached committed
+    /// free. With nothing reserved, the index is read again: retain and commits
+    /// change it between check-ins.
     pub(crate) fn free_disk(&self) -> Result<i64, s3store::Error> {
-        let free = self.store.space()?.free;
+        let mut space = self
+            .free_space
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let committed = match space.cached {
+            Some((_, free)) if space.uploads > 0 => free,
+            _ => {
+                let free = self.store.space()?.free;
+                space.cached = Some((Instant::now(), free));
+                free
+            }
+        };
+        let free = committed.saturating_sub(space.reserved);
         Ok(i64::try_from(free).unwrap_or(i64::MAX))
     }
 
@@ -4154,6 +4171,43 @@ mod tests {
             }
             other => panic!("expected a status, got {other}"),
         }
+    }
+
+    #[tokio::test]
+    async fn check_in_free_disk_excludes_an_open_reservation() {
+        let satellite = Identity::generate().unwrap();
+        let harness =
+            Harness::open_allocated(std::slice::from_ref(&satellite), &[], None, 10_000).await;
+        assert_eq!(harness.node.free_disk().unwrap(), 10_000);
+        let limit = signed_limit(
+            &satellite,
+            &harness.identity,
+            &PiecePrivateKey::generate(),
+            &[0x44; 32],
+            PieceAction::Put,
+            3_000,
+        );
+        let held = harness
+            .node
+            .reserve_space(&limit)
+            .unwrap_or_else(|_| panic!("reserve"));
+        assert_eq!(harness.node.free_disk().unwrap(), 7_000);
+        assert_eq!(harness.node.store.space().unwrap().free, 10_000);
+        let too_big = signed_limit(
+            &satellite,
+            &harness.identity,
+            &PiecePrivateKey::generate(),
+            &[0x45; 32],
+            PieceAction::Put,
+            8_000,
+        );
+        assert!(
+            harness.node.reserve_space(&too_big).is_err(),
+            "the open reservation already claimed 3000"
+        );
+        assert_eq!(harness.node.free_disk().unwrap(), 7_000);
+        drop(held);
+        assert_eq!(harness.node.free_disk().unwrap(), 10_000);
     }
 
     #[tokio::test]
