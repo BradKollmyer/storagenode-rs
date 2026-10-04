@@ -22,11 +22,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # crates/storagenode path-depends on ../../../uplink-rs, the sibling
-      # of this checkout: $GITHUB_WORKSPACE/../uplink-rs.
+      # of this checkout: $GITHUB_WORKSPACE/../uplink-rs. The ref is a commit,
+      # not main: a path dependency bypasses Cargo.lock, so it must not move
+      # under a passing build. Bump it on purpose.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: BradKollmyer/uplink-rs
-          ref: main
+          ref: bb320c052fa808bfe60d683de167af47421544e9
           path: uplink-rs
       - name: Place uplink-rs beside this repo
         run: mv uplink-rs "${GITHUB_WORKSPACE}/../uplink-rs"

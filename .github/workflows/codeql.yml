@@ -37,7 +37,8 @@ jobs:
         if: matrix.language == 'rust'
         with:
           repository: BradKollmyer/uplink-rs
-          ref: main
+          # Same pin as ci.yml: a path dependency bypasses Cargo.lock.
+          ref: bb320c052fa808bfe60d683de167af47421544e9
           path: uplink-rs
       - name: Place uplink-rs beside this repo
         if: matrix.language == 'rust'
