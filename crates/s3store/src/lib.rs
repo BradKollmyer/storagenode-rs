@@ -784,6 +784,21 @@ impl Store {
         self.index.live_before(satellite_id, before)
     }
 
+    /// One page of [`Self::live_created_before`], in id order, starting after
+    /// `after`. Retain walks a satellite this way: a well-filled node holds
+    /// too many ids for one list.
+    pub fn live_page_before(
+        &self,
+        satellite_id: &str,
+        before: SystemTime,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        check_id("satellite id", satellite_id)?;
+        self.index
+            .live_page_before(satellite_id, before, after, limit)
+    }
+
     /// Orders table in this store's `pieces.db`.
     pub fn orders(&self) -> OrderRows {
         self.index.orders()

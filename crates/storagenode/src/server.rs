@@ -80,6 +80,10 @@ const CHORE_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// Rows retain trashes per sqlite transaction. Other RPCs run in between.
 const RETAIN_BATCH: usize = 1000;
 
+/// Piece ids read per query while walking a satellite for retain. A
+/// well-filled node holds too many for one list.
+const RETAIN_PAGE: usize = 10_000;
+
 /// Go `piecestore.Config.ReportCapacityThreshold`. An upload that finds less
 /// free space than this asks for a check-in now, so the satellite stops
 /// selecting a node that is about to refuse uploads.
@@ -1088,26 +1092,38 @@ impl Node {
             return Ok(());
         };
         let sat = peer.to_string();
-        let pieces = self
-            .store
-            .live_created_before(&sat, created_before)
-            .map_err(store_err)?;
-        let mut rejected = Vec::new();
-        for piece_id in pieces {
-            if !filter.contains(&decode_piece_id(&piece_id)?) {
-                rejected.push(piece_id);
+        // Page the walk: the piece list of a well-filled node does not fit
+        // one query's memory. One transaction per batch, not one commit per
+        // piece. A row that is gone, or no longer live, between the list and
+        // the flag is skipped.
+        let now = SystemTime::now();
+        let mut after: Option<String> = None;
+        loop {
+            let page = self
+                .store
+                .live_page_before(&sat, created_before, after.as_deref(), RETAIN_PAGE)
+                .map_err(store_err)?;
+            if page.is_empty() {
+                return Ok(());
+            }
+            after = page.last().cloned();
+            let full = page.len() == RETAIN_PAGE;
+            let mut rejected = Vec::new();
+            for piece_id in page {
+                if !filter.contains(&decode_piece_id(&piece_id)?) {
+                    rejected.push(piece_id);
+                }
+            }
+            for batch in rejected.chunks(RETAIN_BATCH) {
+                self.store
+                    .trash_created_before(&sat, batch, created_before, now)
+                    .map_err(store_err)?;
+                tokio::task::yield_now().await;
+            }
+            if !full {
+                return Ok(());
             }
         }
-        // One transaction per batch, not one commit per piece. A row that is
-        // gone, or no longer live, between the list and the flag is skipped.
-        let now = SystemTime::now();
-        for batch in rejected.chunks(RETAIN_BATCH) {
-            self.store
-                .trash_created_before(&sat, batch, created_before, now)
-                .map_err(store_err)?;
-            tokio::task::yield_now().await;
-        }
-        Ok(())
     }
 
     /// Puts every trashed piece of the calling satellite back to live.
