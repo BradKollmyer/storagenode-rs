@@ -80,10 +80,9 @@ pub(crate) async fn check_in(
     operator: &Operator,
     timeout: Duration,
 ) -> Result<(), String> {
-    let free = node.free_disk().map_err(|err| err.to_string())?;
     let mut errors = Vec::new();
     for (id, address) in node.contact_targets() {
-        if let Err(err) = attempt(node, operator, id, &address, free, timeout).await {
+        if let Err(err) = attempt(node, operator, id, &address, timeout).await {
             errors.push(format!("{id}: {err}"));
         }
     }
@@ -101,10 +100,7 @@ pub(crate) async fn serve(node: Arc<Node>, operator: Operator) {
         let operator = operator.clone();
         tokio::spawn(async move {
             loop {
-                match node.free_disk() {
-                    Ok(free) => retry(&node, &operator, id, &address, free).await,
-                    Err(err) => eprintln!("storagenode: check-in {id} disk space: {err}"),
-                }
+                retry(&node, &operator, id, &address).await;
                 next_check_in(&node, Instant::now(), INTERVAL, LOW_SPACE_COOLDOWN).await;
             }
         });
@@ -131,14 +127,14 @@ pub(crate) async fn next_check_in(
     }
 }
 
-async fn retry(node: &Node, operator: &Operator, id: NodeId, address: &str, free_disk: i64) {
+async fn retry(node: &Node, operator: &Operator, id: NodeId, address: &str) {
     if address.is_empty() {
         eprintln!("storagenode: check-in {id} has no dial address");
         return;
     }
     let mut backoff = INITIAL_BACKOFF;
     loop {
-        match attempt(node, operator, id, address, free_disk, TIMEOUT).await {
+        match attempt(node, operator, id, address, TIMEOUT).await {
             Ok(()) => {
                 eprintln!("storagenode: checked in with {id}");
                 return;
@@ -158,12 +154,16 @@ async fn attempt(
     operator: &Operator,
     id: NodeId,
     address: &str,
-    free_disk: i64,
     timeout: Duration,
 ) -> Result<(), String> {
     if address.is_empty() {
         return Err("satellite has no dial address".into());
     }
+    // Uploads and cleanup can change capacity during retry backoff. Sample
+    // it for each request, rather than retaining the first attempt's value.
+    let free_disk = node
+        .free_disk()
+        .map_err(|err| format!("disk space: {err}"))?;
     let request = check_in_request(node, operator, free_disk)?;
     let rpc = async {
         let transport = transport::dial(
@@ -304,11 +304,16 @@ fn attest(
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
 
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use hyper_util::server::conn::auto::Builder as ConnBuilder;
     use prost::Message;
+    use s3s::auth::SimpleAuth;
+    use s3s::service::S3ServiceBuilder;
+    use s3s_fs::FileSystem;
     use storj_rpc::frame::{Kind, Packet};
     use storj_rpc::{Conn, Identity, server_config};
     use tokio::io::AsyncReadExt;
@@ -350,9 +355,13 @@ mod tests {
     }
 
     fn fixture(satellite: &Identity, address: &str) -> Fixture {
+        fixture_at_endpoint(satellite, address, "http://127.0.0.1:1")
+    }
+
+    fn fixture_at_endpoint(satellite: &Identity, address: &str, endpoint: &str) -> Fixture {
         let root = TempDir::new();
         let store = s3store::Store::new(s3store::Config {
-            endpoint: "http://127.0.0.1:1".into(),
+            endpoint: endpoint.into(),
             bucket: "pieces".into(),
             access_key_id: "ak".into(),
             secret_access_key: "sk".into(),
@@ -398,6 +407,14 @@ mod tests {
     }
 
     fn spawn_satellite(identity: Identity, seen: Arc<Mutex<Option<Seen>>>, accept: bool) -> String {
+        spawn_satellite_controlled(identity, seen, Arc::new(AtomicBool::new(accept)))
+    }
+
+    fn spawn_satellite_controlled(
+        identity: Identity,
+        seen: Arc<Mutex<Option<Seen>>>,
+        accept: Arc<AtomicBool>,
+    ) -> String {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         listener.set_nonblocking(true).expect("nonblocking");
         let address = format!("127.0.0.1:{}", listener.local_addr().expect("addr").port());
@@ -411,6 +428,7 @@ mod tests {
                 };
                 let acceptor = acceptor.clone();
                 let seen = Arc::clone(&seen);
+                let accept = accept.load(Ordering::Relaxed);
                 tokio::spawn(async move {
                     if let Err(err) = serve_check_in(acceptor, sock, &seen, accept).await {
                         eprintln!("test satellite: {err}");
@@ -603,6 +621,98 @@ mod tests {
                 .expect("check-ins")
                 .is_empty()
         );
+    }
+
+    fn spawn_bucket(root: &Path) -> String {
+        std::fs::create_dir(root.join("pieces")).unwrap();
+        let fs = FileSystem::new(root).unwrap();
+        let mut builder = S3ServiceBuilder::new(fs);
+        builder.set_auth(SimpleAuth::from_single("ak", "sk"));
+        let service = builder.build();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let listener = TcpListener::from_std(listener).unwrap();
+        tokio::spawn(async move {
+            let http = ConnBuilder::new(TokioExecutor::new());
+            while let Ok((socket, _)) = listener.accept().await {
+                let connection = http
+                    .serve_connection(TokioIo::new(socket), service.clone())
+                    .into_owned();
+                tokio::spawn(async move {
+                    let _ = connection.await;
+                });
+            }
+        });
+        format!("http://{address}")
+    }
+
+    #[tokio::test]
+    async fn check_in_retry_refreshes_capacity_after_a_piece_commits() {
+        let satellite = Identity::generate().unwrap();
+        let seen = Arc::new(Mutex::new(None));
+        let accept = Arc::new(AtomicBool::new(false));
+        let address =
+            spawn_satellite_controlled(satellite.clone(), Arc::clone(&seen), Arc::clone(&accept));
+        let bucket_root = TempDir::new();
+        let endpoint = spawn_bucket(&bucket_root.0);
+        let fixture = fixture_at_endpoint(&satellite, &address, &endpoint);
+        let op = operator();
+        let change_capacity = async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if seen.lock().unwrap().is_some() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("first check-in received");
+            assert_eq!(
+                seen.lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .request
+                    .capacity
+                    .as_ref()
+                    .unwrap()
+                    .free_disk,
+                5_000
+            );
+            fixture
+                .node
+                .piece_store()
+                .put_piece(
+                    &satellite.node_id().to_string(),
+                    "new-piece",
+                    &vec![1; 1_000],
+                    s3store::PieceMeta {
+                        hash: [1; 32],
+                        algorithm: s3store::HashAlgorithm::Sha256,
+                        created: SystemTime::now(),
+                        expires: None,
+                        order_limit: vec![1],
+                        hash_signature: vec![1],
+                        hash_timestamp: None,
+                    },
+                )
+                .await
+                .unwrap();
+            accept.store(true, Ordering::Relaxed);
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                retry(&fixture.node, &op, satellite.node_id(), &address),
+                change_capacity,
+            );
+        })
+        .await
+        .expect("retry accepted");
+        let final_request = seen.lock().unwrap().take().unwrap().request;
+        assert_eq!(final_request.capacity.unwrap().free_disk, 4_000);
+        assert_eq!(fixture.node.piece_store().check_ins().unwrap().len(), 1);
     }
 
     #[tokio::test]
